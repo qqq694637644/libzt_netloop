@@ -29,6 +29,30 @@ include_directories("${CMAKE_CURRENT_SOURCE_DIR}/external/libzt/ext/ZeroTierOne/
 
 add_subdirectory(external/libzt EXCLUDE_FROM_ALL)
 
+# Pylon-inspired fused socket bridge dependencies. libuv supplies a portable
+# socketpair implementation on Windows; libhv owns the ordinary-socket relay
+# and its backpressure/close handling.
+set(LIBUV_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+set(LIBUV_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(LIBUV_BUILD_BENCH OFF CACHE BOOL "" FORCE)
+add_subdirectory(external/libuv EXCLUDE_FROM_ALL)
+
+set(BUILD_SHARED OFF CACHE BOOL "" FORCE)
+set(BUILD_STATIC ON CACHE BOOL "" FORCE)
+set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(BUILD_UNITTEST OFF CACHE BOOL "" FORCE)
+set(BUILD_FOR_MT ON CACHE BOOL "" FORCE)
+set(WITH_PROTOCOL OFF CACHE BOOL "" FORCE)
+set(WITH_EVPP OFF CACHE BOOL "" FORCE)
+set(WITH_HTTP OFF CACHE BOOL "" FORCE)
+set(WITH_HTTP_SERVER OFF CACHE BOOL "" FORCE)
+set(WITH_HTTP_CLIENT OFF CACHE BOOL "" FORCE)
+set(WITH_MQTT OFF CACHE BOOL "" FORCE)
+set(WITH_OPENSSL OFF CACHE BOOL "" FORCE)
+set(WITH_GNUTLS OFF CACHE BOOL "" FORCE)
+set(WITH_MBEDTLS OFF CACHE BOOL "" FORCE)
+add_subdirectory(external/libhv EXCLUDE_FROM_ALL)
+
 # ZeroTierOne's Phy.hpp references Metrics on Windows without including
 # Metrics.hpp. Force-include it only for the vendor C++ targets that compile
 # ZeroTierOne/libzt sources; keep our own targets free of this workaround.
@@ -57,6 +81,7 @@ endif()
 
 add_library(netloop_common STATIC
     src/common.cpp
+    src/fused_socket.cpp
 )
 target_include_directories(netloop_common
     PUBLIC
@@ -66,6 +91,8 @@ target_include_directories(netloop_common
 target_link_libraries(netloop_common
     PUBLIC
         zt-static
+        uv_a
+        hv_static
         ws2_32
 )
 target_compile_definitions(netloop_common PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)

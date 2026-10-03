@@ -124,31 +124,6 @@ std::string assigned_address(std::uint64_t network_id, int family)
     return buffer;
 }
 
-void native_send_all(SOCKET socket, const char* data, std::size_t size)
-{
-    std::size_t offset = 0;
-    while (offset < size) {
-        const int remaining = static_cast<int>(size - offset);
-        const int sent = ::send(socket, data + offset, remaining, 0);
-        if (sent == SOCKET_ERROR || sent == 0) {
-            throw std::runtime_error("native send failed, WSA=" + std::to_string(WSAGetLastError()));
-        }
-        offset += static_cast<std::size_t>(sent);
-    }
-}
-
-void zt_send_all(int socket, const char* data, std::size_t size)
-{
-    std::size_t offset = 0;
-    while (offset < size) {
-        const ssize_t sent = zts_send(socket, data + offset, size - offset, 0);
-        if (sent <= 0) {
-            throw std::runtime_error("libzt send failed, zts_errno=" + std::to_string(zts_errno));
-        }
-        offset += static_cast<std::size_t>(sent);
-    }
-}
-
 } // namespace
 
 Logger::Logger(std::string role, const std::filesystem::path& log_path)
@@ -411,69 +386,6 @@ SOCKET native_connect(const std::string& host, std::uint16_t port)
         throw std::runtime_error("native connect failed, WSA=" + std::to_string(WSAGetLastError()));
     }
     return connected;
-}
-
-void relay_native_and_zt(SOCKET native_socket, int zt_socket, Logger& log, std::uint64_t connection_id)
-{
-    std::atomic_bool failed { false };
-
-    auto native_to_zt = [&]() {
-        std::array<char, 64 * 1024> buffer {};
-        try {
-            for (;;) {
-                const int received =
-                    recv(native_socket, buffer.data(), static_cast<int>(buffer.size()), 0);
-                if (received == 0) {
-                    zts_bsd_shutdown(zt_socket, ZTS_SHUT_WR);
-                    return;
-                }
-                if (received == SOCKET_ERROR) {
-                    throw std::runtime_error(
-                        "native recv failed, WSA=" + std::to_string(WSAGetLastError()));
-                }
-                zt_send_all(zt_socket, buffer.data(), static_cast<std::size_t>(received));
-            }
-        } catch (const std::exception& ex) {
-            if (!failed.exchange(true)) {
-                log.error("conn=" + std::to_string(connection_id) + " native->zt: " + ex.what());
-            }
-            zts_bsd_shutdown(zt_socket, ZTS_SHUT_RDWR);
-            shutdown(native_socket, SD_BOTH);
-        }
-    };
-
-    auto zt_to_native = [&]() {
-        std::array<char, 64 * 1024> buffer {};
-        try {
-            for (;;) {
-                const ssize_t received = zts_recv(zt_socket, buffer.data(), buffer.size(), 0);
-                if (received == 0) {
-                    shutdown(native_socket, SD_SEND);
-                    return;
-                }
-                if (received < 0) {
-                    throw std::runtime_error(
-                        "libzt recv failed, zts_errno=" + std::to_string(zts_errno));
-                }
-                native_send_all(
-                    native_socket, buffer.data(), static_cast<std::size_t>(received));
-            }
-        } catch (const std::exception& ex) {
-            if (!failed.exchange(true)) {
-                log.error("conn=" + std::to_string(connection_id) + " zt->native: " + ex.what());
-            }
-            zts_bsd_shutdown(zt_socket, ZTS_SHUT_RDWR);
-            shutdown(native_socket, SD_BOTH);
-        }
-    };
-
-    std::thread up(native_to_zt);
-    std::thread down(zt_to_native);
-    up.join();
-    down.join();
-    closesocket(native_socket);
-    zts_close(zt_socket);
-    log.info("conn=" + std::to_string(connection_id) + " closed");
 }
 
 std::map<std::string, std::string> parse_cli(int argc, char** argv)

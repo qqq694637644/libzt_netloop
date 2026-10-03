@@ -26,6 +26,11 @@ v2rayN SOCKS5 server
 \`zt_netloop\` does not implement SOCKS5. It transports the TCP byte stream unchanged.
 It does not install a TUN/TAP adapter, modify the Windows routing table, or run a system-wide VPN.
 
+The libzt/Windows socket boundary follows ZeroTier Pylon's fused-socket design: each libzt
+TCP socket is bridged through helper threads into a normal OS socketpair. On Windows the
+socketpair is created by libuv, and libhv owns the ordinary-socket bidirectional proxy so
+queued writes, backpressure, and close propagation are handled by a mature event loop.
+
 ## Build
 
 Requirements:
@@ -127,5 +132,12 @@ No ZIP archive is created. The version is compiled into both executables, so `--
 
 ## Dependency
 
-\`external/libzt\` is pinned as a Git submodule. This project currently tracks libzt commit
-\`a707ea6ae0910efdc1125d04758c411e2e9ea4f9\`.
+Dependencies are pinned as Git submodules:
+
+- \`external/libzt\`: commit \`a707ea6ae0910efdc1125d04758c411e2e9ea4f9\`.
+- \`external/libuv\`: libuv \`v1.53.0\` (\`840404ce8ba7cc0204be52389a6cfff9f2c90fb6\`).
+- \`external/libhv\`: libhv \`v1.3.4\` (\`71770e04becaa149e0ef8ffc4d3900c5466ddddb\`).
+
+The fused adapter in \`src/fused_socket.cpp\` is based directly on ZeroTier Pylon's
+\`zts_fused_socket()\`, \`fused_socket_tx_helper()\`, and \`fused_socket_rx_helper()\` structure,
+adapted for Windows with \`uv_socketpair()\` and libhv upstream relaying.
