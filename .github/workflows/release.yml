@@ -18,6 +18,10 @@ permissions:
 
 env:
   PYTHONUTF8: "1"
+  SCCACHE_GHA_ENABLED: "true"
+  SCCACHE_GHA_VERSION: "libzt-netloop-windows-msvc-v1"
+  SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
+  SCCACHE_BASEDIRS: ${{ github.workspace }}
 
 jobs:
   release:
@@ -36,8 +40,18 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: "v0.18.0"
+
       - name: Build selected version
-        run: python tools/build.py --config Release --version "${{ inputs.version }}"
+        run: python tools/build.py --config Release --generator ninja --use-sccache --version "${{ inputs.version }}"
 
       - name: Smoke test binaries
         run: python ci/smoke.py --runtime dist

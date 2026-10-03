@@ -42,6 +42,11 @@ All build orchestration is Python:
 python tools/build.py --config Release
 \`\`\`
 
+GitHub Actions uses MSVC through Ninja plus Mozilla `sccache`. The normal
+Windows CI workflow and the release workflow share the same GitHub Actions
+compiler-cache namespace. Local builds keep the existing Visual Studio generator
+unless `--generator ninja --use-sccache` is requested explicitly.
+
 The executables are staged in \`dist/\`.
 
 ## Server
