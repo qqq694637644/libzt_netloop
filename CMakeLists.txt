@@ -18,6 +18,10 @@ set(BUILD_HOST_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(ALLOW_INSTALL_TARGET OFF CACHE BOOL "" FORCE)
 set(ZTS_DISABLE_CENTRAL_API ON CACHE BOOL "" FORCE)
 
+# libzt's Windows CMake does not add ZeroTierOne/ext even though ZeroTierOne
+# headers include bundled dependencies such as <nlohmann/json.hpp> from there.
+include_directories("${CMAKE_CURRENT_SOURCE_DIR}/external/libzt/ext/ZeroTierOne/ext")
+
 add_subdirectory(external/libzt EXCLUDE_FROM_ALL)
 
 # Current libzt CMake files still reference an old Windows SDK directory in
