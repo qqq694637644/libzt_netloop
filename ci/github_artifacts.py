@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import time
+import urllib.parse
 import urllib.request
 import zipfile
 
@@ -26,6 +27,24 @@ def _request(url: str) -> urllib.request.Request:
             "User-Agent": "libzt-netloop-ci/1",
         },
     )
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is None:
+            return None
+
+        # GitHub's artifact API returns a signed object-storage URL.  The
+        # GITHUB_TOKEN is valid only for api.github.com and must not be
+        # forwarded to the storage host, otherwise Azure returns HTTP 401.
+        old_host = urllib.parse.urlparse(req.full_url).hostname
+        new_host = urllib.parse.urlparse(newurl).hostname
+        if old_host != new_host:
+            redirected.remove_header("Authorization")
+            redirected.remove_header("X-GitHub-Api-Version")
+            redirected.remove_header("Accept")
+        return redirected
 
 
 def list_current_run_artifacts() -> list[dict]:
@@ -52,7 +71,8 @@ def wait_for_artifact(name: str, timeout: float = 600.0) -> dict:
 def download_artifact(artifact: dict, destination: Path) -> Path:
     destination.mkdir(parents=True, exist_ok=True)
     url = artifact["archive_download_url"]
-    with urllib.request.urlopen(_request(url), timeout=60) as response:
+    opener = urllib.request.build_opener(_SafeRedirectHandler())
+    with opener.open(_request(url), timeout=60) as response:
         payload = response.read()
     destination_resolved = destination.resolve()
     with zipfile.ZipFile(io.BytesIO(payload)) as archive:
