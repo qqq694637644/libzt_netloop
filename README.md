@@ -31,7 +31,7 @@ It does not install a TUN/TAP adapter, modify the Windows routing table, or run 
 Requirements:
 
 - Windows x64
-- Visual Studio 2022 C++ toolchain
+- Visual Studio C++ toolchain supported by the installed CMake
 - CMake
 - Python 3.11+
 - Git
