@@ -78,6 +78,7 @@ def main() -> int:
                     str(build_dir),
                     "-A",
                     "x64",
+                    "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
                 ],
                 log,
             )
