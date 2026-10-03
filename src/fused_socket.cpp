@@ -25,6 +25,7 @@ struct FusedSocketContext {
     std::atomic_bool should_stop { false };
     std::atomic_bool fused_closed { false };
     std::atomic_bool logged_zt_to_os { false };
+    std::atomic_bool logged_zt_to_os_delivered { false };
     std::atomic_bool logged_os_to_zt { false };
     SOCKET fd_zan = INVALID_SOCKET; // OS socket exposed to libhv
     SOCKET fd_int = INVALID_SOCKET; // helper side of the socketpair
@@ -187,6 +188,11 @@ void fused_socket_tx_helper(FusedSocketContext* conn)
         if (!native_send_all(*conn, buffer.data(), static_cast<std::size_t>(received))) {
             break;
         }
+        if (!conn->logged_zt_to_os_delivered.exchange(true) && conn->log != nullptr) {
+            conn->log->info(
+                conn_prefix(*conn) + "fused zt->os delivered_bytes="
+                + std::to_string(received));
+        }
     }
 }
 
@@ -303,6 +309,13 @@ bool run_libhv_relay(
     hio_set_context(native_io, &native_context);
     hio_set_context(fused_io, &fused_context);
 
+    log.info(
+        "conn=" + std::to_string(connection_id) + " libhv engine=" + hio_engine()
+        + ", native_fd=" + std::to_string(native_fd)
+        + ", fused_fd=" + std::to_string(fused_fd)
+        + ", native_type=" + std::to_string(static_cast<int>(hio_type(native_io)))
+        + ", fused_type=" + std::to_string(static_cast<int>(hio_type(fused_io))));
+
     // This is libhv's own tcp-proxy wiring: both sides use its queued writes,
     // backpressure and close propagation instead of our previous hand-written
     // pair of blocking recv/send loops.
@@ -311,7 +324,15 @@ bool run_libhv_relay(
     hio_setcb_read(fused_io, hio_write_upstream_logged);
     hio_setcb_close(native_io, hio_close_upstream);
     hio_setcb_close(fused_io, hio_close_upstream);
-    hio_read_upstream(native_io);
+    const int native_read_rc = hio_read(native_io);
+    const int fused_read_rc = hio_read(fused_io);
+    if (native_read_rc != 0 || fused_read_rc != 0) {
+        log.error(
+            "conn=" + std::to_string(connection_id)
+            + " libhv read registration failed, native_rc="
+            + std::to_string(native_read_rc) + ", fused_rc="
+            + std::to_string(fused_read_rc));
+    }
 
     hloop_run(loop);
     hloop_free(&loop);
