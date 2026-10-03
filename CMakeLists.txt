@@ -24,6 +24,22 @@ include_directories("${CMAKE_CURRENT_SOURCE_DIR}/external/libzt/ext/ZeroTierOne/
 
 add_subdirectory(external/libzt EXCLUDE_FROM_ALL)
 
+# ZeroTierOne's Phy.hpp references Metrics on Windows without including
+# Metrics.hpp. Force-include it only for the vendor C++ targets that compile
+# ZeroTierOne/libzt sources; keep our own targets free of this workaround.
+if(MSVC)
+    set(LIBZT_METRICS_HEADER
+        "${CMAKE_CURRENT_SOURCE_DIR}/external/libzt/ext/ZeroTierOne/node/Metrics.hpp")
+    foreach(LIBZT_TARGET zto_obj libzt_obj zto_pic zt_pic zt-static)
+        if(TARGET ${LIBZT_TARGET})
+            target_compile_options(
+                ${LIBZT_TARGET}
+                PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/FI${LIBZT_METRICS_HEADER}>"
+            )
+        endif()
+    endforeach()
+endif()
+
 # Current libzt CMake files still reference an old Windows SDK directory in
 # their transitive link interface. Use SDK library names so MSVC resolves them
 # from the active Windows SDK selected by the runner/developer environment.
