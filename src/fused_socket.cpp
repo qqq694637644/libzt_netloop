@@ -24,11 +24,20 @@ constexpr std::size_t kBufferSize = 16 * 1024;
 struct FusedSocketContext {
     std::atomic_bool should_stop { false };
     std::atomic_bool fused_closed { false };
+    std::atomic_bool logged_zt_to_os { false };
+    std::atomic_bool logged_os_to_zt { false };
     SOCKET fd_zan = INVALID_SOCKET; // OS socket exposed to libhv
     SOCKET fd_int = INVALID_SOCKET; // helper side of the socketpair
     int fd_zts = -1;                // libzt socket
     Logger* log = nullptr;
     std::uint64_t connection_id = 0;
+};
+
+struct HvIoContext {
+    Logger* log = nullptr;
+    std::uint64_t connection_id = 0;
+    const char* direction = nullptr;
+    std::atomic_bool logged { false };
 };
 
 std::string conn_prefix(const FusedSocketContext& conn)
@@ -79,6 +88,18 @@ bool native_send_all(FusedSocketContext& conn, const char* data, std::size_t siz
         offset += static_cast<std::size_t>(sent);
     }
     return offset == size;
+}
+
+void hio_write_upstream_logged(hio_t* io, void* buf, int bytes)
+{
+    auto* context = static_cast<HvIoContext*>(hio_context(io));
+    if (context != nullptr && bytes > 0 && !context->logged.exchange(true)
+        && context->log != nullptr) {
+        context->log->info(
+            "conn=" + std::to_string(context->connection_id) + " libhv "
+            + context->direction + " first_bytes=" + std::to_string(bytes));
+    }
+    hio_write_upstream(io, buf, bytes);
 }
 
 bool zt_write_all(FusedSocketContext& conn, const char* data, std::size_t size)
@@ -157,6 +178,12 @@ void fused_socket_tx_helper(FusedSocketContext* conn)
             break;
         }
 
+        if (!conn->logged_zt_to_os.exchange(true) && conn->log != nullptr) {
+            conn->log->info(
+                conn_prefix(*conn) + "fused zt->os first_bytes="
+                + std::to_string(received));
+        }
+
         if (!native_send_all(*conn, buffer.data(), static_cast<std::size_t>(received))) {
             break;
         }
@@ -185,6 +212,12 @@ void fused_socket_rx_helper(FusedSocketContext* conn)
                     "fused os recv failed, WSA=" + std::to_string(WSAGetLastError()));
             }
             break;
+        }
+
+        if (!conn->logged_os_to_zt.exchange(true) && conn->log != nullptr) {
+            conn->log->info(
+                conn_prefix(*conn) + "fused os->zt first_bytes="
+                + std::to_string(received));
         }
 
         if (!zt_write_all(*conn, buffer.data(), static_cast<std::size_t>(received))) {
@@ -265,12 +298,17 @@ bool run_libhv_relay(
         return false;
     }
 
+    HvIoContext native_context { &log, connection_id, "native->fused" };
+    HvIoContext fused_context { &log, connection_id, "fused->native" };
+    hio_set_context(native_io, &native_context);
+    hio_set_context(fused_io, &fused_context);
+
     // This is libhv's own tcp-proxy wiring: both sides use its queued writes,
     // backpressure and close propagation instead of our previous hand-written
     // pair of blocking recv/send loops.
     hio_setup_upstream(native_io, fused_io);
-    hio_setcb_read(native_io, hio_write_upstream);
-    hio_setcb_read(fused_io, hio_write_upstream);
+    hio_setcb_read(native_io, hio_write_upstream_logged);
+    hio_setcb_read(fused_io, hio_write_upstream_logged);
     hio_setcb_close(native_io, hio_close_upstream);
     hio_setcb_close(fused_io, hio_close_upstream);
     hio_read_upstream(native_io);
