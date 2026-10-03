@@ -1,0 +1,74 @@
+from __future__ import annotations
+
+import io
+import json
+import os
+from pathlib import Path
+import time
+import urllib.request
+import zipfile
+
+
+def _env(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f"missing required environment variable {name}")
+    return value
+
+
+def _request(url: str) -> urllib.request.Request:
+    return urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {_env('GITHUB_TOKEN')}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "libzt-netloop-ci/1",
+        },
+    )
+
+
+def list_current_run_artifacts() -> list[dict]:
+    repository = _env("GITHUB_REPOSITORY")
+    run_id = _env("GITHUB_RUN_ID")
+    url = (
+        f"https://api.github.com/repos/{repository}/actions/runs/{run_id}"
+        "/artifacts?per_page=100"
+    )
+    with urllib.request.urlopen(_request(url), timeout=30) as response:
+        return json.load(response).get("artifacts", [])
+
+
+def wait_for_artifact(name: str, timeout: float = 600.0) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for artifact in list_current_run_artifacts():
+            if artifact.get("name") == name and not artifact.get("expired", False):
+                return artifact
+        time.sleep(5)
+    raise TimeoutError(f"timed out waiting for Actions artifact {name!r}")
+
+
+def download_artifact(artifact: dict, destination: Path) -> Path:
+    destination.mkdir(parents=True, exist_ok=True)
+    url = artifact["archive_download_url"]
+    with urllib.request.urlopen(_request(url), timeout=60) as response:
+        payload = response.read()
+    destination_resolved = destination.resolve()
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        for member in archive.infolist():
+            target = (destination / member.filename).resolve()
+            if (
+                destination_resolved not in target.parents
+                and target != destination_resolved
+            ):
+                raise RuntimeError(f"unsafe artifact member path: {member.filename}")
+        archive.extractall(destination)
+    return destination
+
+
+def wait_and_download(
+    name: str, destination: Path, timeout: float = 600.0
+) -> Path:
+    artifact = wait_for_artifact(name, timeout=timeout)
+    return download_artifact(artifact, destination)

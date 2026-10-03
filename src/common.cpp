@@ -1,0 +1,456 @@
+#include "common.hpp"
+
+#include "ZeroTierSockets.h"
+
+#include <WS2tcpip.h>
+
+#include <array>
+#include <atomic>
+#include <ctime>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
+#include <stdexcept>
+#include <thread>
+
+namespace netloop {
+namespace {
+
+std::string timestamp()
+{
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t now_time = std::chrono::system_clock::to_time_t(now);
+    std::tm local_tm {};
+    localtime_s(&local_tm, &now_time);
+    std::ostringstream out;
+    out << std::put_time(&local_tm, "%Y-%m-%d %H:%M:%S");
+    return out.str();
+}
+
+std::string json_escape(const std::string& input)
+{
+    std::ostringstream out;
+    for (const unsigned char ch : input) {
+        switch (ch) {
+        case '\\':
+            out << "\\\\";
+            break;
+        case '"':
+            out << "\\\"";
+            break;
+        case '\n':
+            out << "\\n";
+            break;
+        case '\r':
+            out << "\\r";
+            break;
+        case '\t':
+            out << "\\t";
+            break;
+        default:
+            if (ch < 0x20) {
+                out << "\\u" << std::hex << std::setw(4) << std::setfill('0')
+                    << static_cast<int>(ch) << std::dec;
+            } else {
+                out << static_cast<char>(ch);
+            }
+        }
+    }
+    return out.str();
+}
+
+bool deadline_expired(const std::chrono::steady_clock::time_point& deadline)
+{
+    return std::chrono::steady_clock::now() >= deadline;
+}
+
+std::string assigned_address(std::uint64_t network_id, int family)
+{
+    if (!zts_addr_is_assigned(network_id, family)) {
+        return {};
+    }
+    char buffer[ZTS_IP_MAX_STR_LEN] = {};
+    if (zts_addr_get_str(network_id, family, buffer, sizeof(buffer)) != ZTS_ERR_OK) {
+        return {};
+    }
+    return buffer;
+}
+
+void native_send_all(SOCKET socket, const char* data, std::size_t size)
+{
+    std::size_t offset = 0;
+    while (offset < size) {
+        const int remaining = static_cast<int>(size - offset);
+        const int sent = ::send(socket, data + offset, remaining, 0);
+        if (sent == SOCKET_ERROR || sent == 0) {
+            throw std::runtime_error("native send failed, WSA=" + std::to_string(WSAGetLastError()));
+        }
+        offset += static_cast<std::size_t>(sent);
+    }
+}
+
+void zt_send_all(int socket, const char* data, std::size_t size)
+{
+    std::size_t offset = 0;
+    while (offset < size) {
+        const ssize_t sent = zts_send(socket, data + offset, size - offset, 0);
+        if (sent <= 0) {
+            throw std::runtime_error("libzt send failed, zts_errno=" + std::to_string(zts_errno));
+        }
+        offset += static_cast<std::size_t>(sent);
+    }
+}
+
+} // namespace
+
+Logger::Logger(std::string role, const std::filesystem::path& log_path)
+    : role_(std::move(role))
+{
+    if (!log_path.empty()) {
+        if (log_path.has_parent_path()) {
+            std::filesystem::create_directories(log_path.parent_path());
+        }
+        file_.open(log_path, std::ios::out | std::ios::app);
+    }
+}
+
+void Logger::info(const std::string& message)
+{
+    write("INFO", message);
+}
+
+void Logger::error(const std::string& message)
+{
+    write("ERROR", message);
+}
+
+void Logger::write(const char* level, const std::string& message)
+{
+    const std::string line =
+        "[" + timestamp() + "] [" + level + "] [" + role_ + "] " + message;
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::cout << line << std::endl;
+    if (file_) {
+        file_ << line << std::endl;
+        file_.flush();
+    }
+}
+
+WinsockRuntime::WinsockRuntime()
+{
+    WSADATA data {};
+    const int rc = WSAStartup(MAKEWORD(2, 2), &data);
+    if (rc != 0) {
+        throw std::runtime_error("WSAStartup failed: " + std::to_string(rc));
+    }
+}
+
+WinsockRuntime::~WinsockRuntime()
+{
+    WSACleanup();
+}
+
+std::uint64_t parse_hex_u64(const std::string& value)
+{
+    std::size_t consumed = 0;
+    const std::uint64_t result = std::stoull(value, &consumed, 16);
+    if (consumed != value.size()) {
+        throw std::invalid_argument("invalid hexadecimal value: " + value);
+    }
+    return result;
+}
+
+std::string hex_u64(std::uint64_t value)
+{
+    std::ostringstream out;
+    out << std::hex << std::setfill('0') << std::setw(16) << value;
+    return out.str();
+}
+
+NetworkStatus start_libzt_network(
+    std::uint64_t network_id,
+    const std::filesystem::path& state_dir,
+    std::chrono::seconds timeout,
+    Logger& log)
+{
+    std::filesystem::create_directories(state_dir);
+    const std::string storage = state_dir.string();
+    int rc = zts_init_from_storage(storage.c_str());
+    if (rc != ZTS_ERR_OK) {
+        throw std::runtime_error("zts_init_from_storage failed: " + std::to_string(rc));
+    }
+
+    rc = zts_node_start();
+    if (rc != ZTS_ERR_OK) {
+        throw std::runtime_error("zts_node_start failed: " + std::to_string(rc));
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    log.info("waiting for ZeroTier node to become online");
+    while (!zts_node_is_online()) {
+        if (deadline_expired(deadline)) {
+            throw std::runtime_error("timeout waiting for ZeroTier node online");
+        }
+        zts_util_delay(100);
+    }
+
+    const std::uint64_t node_id = zts_node_get_id();
+    log.info("ZeroTier node online, node_id=" + hex_u64(node_id));
+    rc = zts_net_join(network_id);
+    if (rc != ZTS_ERR_OK) {
+        throw std::runtime_error("zts_net_join failed: " + std::to_string(rc));
+    }
+    log.info("joining network=" + hex_u64(network_id));
+
+    while (!zts_net_transport_is_ready(network_id)) {
+        if (deadline_expired(deadline)) {
+            throw std::runtime_error("timeout waiting for ZeroTier network transport");
+        }
+        zts_util_delay(100);
+    }
+
+    NetworkStatus status;
+    status.network_id = network_id;
+    status.node_id = node_id;
+
+    while (status.ipv4.empty() && status.ipv6.empty()) {
+        status.ipv4 = assigned_address(network_id, ZTS_AF_INET);
+        status.ipv6 = assigned_address(network_id, ZTS_AF_INET6);
+        if (!status.ipv4.empty() || !status.ipv6.empty()) {
+            break;
+        }
+        if (deadline_expired(deadline)) {
+            throw std::runtime_error("timeout waiting for ZeroTier address assignment");
+        }
+        zts_util_delay(100);
+    }
+
+    log.info(
+        "network ready, ipv4=" + (status.ipv4.empty() ? "-" : status.ipv4)
+        + ", ipv6=" + (status.ipv6.empty() ? "-" : status.ipv6));
+    return status;
+}
+
+void write_status_json(
+    const std::filesystem::path& path,
+    const std::map<std::string, std::string>& string_values,
+    const std::map<std::string, std::uint64_t>& number_values)
+{
+    if (path.empty()) {
+        return;
+    }
+    if (path.has_parent_path()) {
+        std::filesystem::create_directories(path.parent_path());
+    }
+    const std::filesystem::path temp = path.string() + ".tmp";
+    std::ofstream out(temp, std::ios::out | std::ios::trunc);
+    if (!out) {
+        throw std::runtime_error("unable to open status file: " + temp.string());
+    }
+    out << "{\n";
+    bool first = true;
+    for (const auto& [key, value] : string_values) {
+        if (!first) {
+            out << ",\n";
+        }
+        out << "  \"" << json_escape(key) << "\": \"" << json_escape(value) << "\"";
+        first = false;
+    }
+    for (const auto& [key, value] : number_values) {
+        if (!first) {
+            out << ",\n";
+        }
+        out << "  \"" << json_escape(key) << "\": " << value;
+        first = false;
+    }
+    out << "\n}\n";
+    out.close();
+
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    std::filesystem::rename(temp, path);
+}
+
+SOCKET native_listen(const std::string& host, std::uint16_t port)
+{
+    addrinfo hints {};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    hints.ai_flags = AI_PASSIVE;
+
+    addrinfo* result = nullptr;
+    const std::string port_string = std::to_string(port);
+    const int gai =
+        getaddrinfo(host.empty() ? nullptr : host.c_str(), port_string.c_str(), &hints, &result);
+    if (gai != 0) {
+        throw std::runtime_error("getaddrinfo(listen) failed: " + std::to_string(gai));
+    }
+
+    SOCKET listener = INVALID_SOCKET;
+    for (addrinfo* current = result; current != nullptr; current = current->ai_next) {
+        listener = socket(current->ai_family, current->ai_socktype, current->ai_protocol);
+        if (listener == INVALID_SOCKET) {
+            continue;
+        }
+        if (bind(listener, current->ai_addr, static_cast<int>(current->ai_addrlen)) == 0
+            && listen(listener, SOMAXCONN) == 0) {
+            break;
+        }
+        closesocket(listener);
+        listener = INVALID_SOCKET;
+    }
+    freeaddrinfo(result);
+
+    if (listener == INVALID_SOCKET) {
+        throw std::runtime_error(
+            "unable to bind/listen native socket, WSA=" + std::to_string(WSAGetLastError()));
+    }
+    return listener;
+}
+
+SOCKET native_connect(const std::string& host, std::uint16_t port)
+{
+    addrinfo hints {};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    addrinfo* result = nullptr;
+    const std::string port_string = std::to_string(port);
+    const int gai = getaddrinfo(host.c_str(), port_string.c_str(), &hints, &result);
+    if (gai != 0) {
+        throw std::runtime_error("getaddrinfo(connect) failed: " + std::to_string(gai));
+    }
+
+    SOCKET connected = INVALID_SOCKET;
+    for (addrinfo* current = result; current != nullptr; current = current->ai_next) {
+        connected = socket(current->ai_family, current->ai_socktype, current->ai_protocol);
+        if (connected == INVALID_SOCKET) {
+            continue;
+        }
+        if (connect(connected, current->ai_addr, static_cast<int>(current->ai_addrlen)) == 0) {
+            break;
+        }
+        closesocket(connected);
+        connected = INVALID_SOCKET;
+    }
+    freeaddrinfo(result);
+
+    if (connected == INVALID_SOCKET) {
+        throw std::runtime_error("native connect failed, WSA=" + std::to_string(WSAGetLastError()));
+    }
+    return connected;
+}
+
+void relay_native_and_zt(SOCKET native_socket, int zt_socket, Logger& log, std::uint64_t connection_id)
+{
+    std::atomic_bool failed { false };
+
+    auto native_to_zt = [&]() {
+        std::array<char, 64 * 1024> buffer {};
+        try {
+            for (;;) {
+                const int received =
+                    recv(native_socket, buffer.data(), static_cast<int>(buffer.size()), 0);
+                if (received == 0) {
+                    zts_bsd_shutdown(zt_socket, ZTS_SHUT_WR);
+                    return;
+                }
+                if (received == SOCKET_ERROR) {
+                    throw std::runtime_error(
+                        "native recv failed, WSA=" + std::to_string(WSAGetLastError()));
+                }
+                zt_send_all(zt_socket, buffer.data(), static_cast<std::size_t>(received));
+            }
+        } catch (const std::exception& ex) {
+            if (!failed.exchange(true)) {
+                log.error("conn=" + std::to_string(connection_id) + " native->zt: " + ex.what());
+            }
+            zts_bsd_shutdown(zt_socket, ZTS_SHUT_RDWR);
+            shutdown(native_socket, SD_BOTH);
+        }
+    };
+
+    auto zt_to_native = [&]() {
+        std::array<char, 64 * 1024> buffer {};
+        try {
+            for (;;) {
+                const ssize_t received = zts_recv(zt_socket, buffer.data(), buffer.size(), 0);
+                if (received == 0) {
+                    shutdown(native_socket, SD_SEND);
+                    return;
+                }
+                if (received < 0) {
+                    throw std::runtime_error(
+                        "libzt recv failed, zts_errno=" + std::to_string(zts_errno));
+                }
+                native_send_all(
+                    native_socket, buffer.data(), static_cast<std::size_t>(received));
+            }
+        } catch (const std::exception& ex) {
+            if (!failed.exchange(true)) {
+                log.error("conn=" + std::to_string(connection_id) + " zt->native: " + ex.what());
+            }
+            zts_bsd_shutdown(zt_socket, ZTS_SHUT_RDWR);
+            shutdown(native_socket, SD_BOTH);
+        }
+    };
+
+    std::thread up(native_to_zt);
+    std::thread down(zt_to_native);
+    up.join();
+    down.join();
+    closesocket(native_socket);
+    zts_close(zt_socket);
+    log.info("conn=" + std::to_string(connection_id) + " closed");
+}
+
+std::map<std::string, std::string> parse_cli(int argc, char** argv)
+{
+    std::map<std::string, std::string> result;
+    for (int index = 1; index < argc; ++index) {
+        const std::string key = argv[index];
+        if (!key.starts_with("--")) {
+            throw std::invalid_argument("unexpected argument: " + key);
+        }
+        if (key == "--help" || key == "--version") {
+            result[key] = "1";
+            continue;
+        }
+        if (index + 1 >= argc) {
+            throw std::invalid_argument("missing value for " + key);
+        }
+        result[key] = argv[++index];
+    }
+    return result;
+}
+
+std::string require_arg(const std::map<std::string, std::string>& args, const std::string& name)
+{
+    const auto it = args.find(name);
+    if (it == args.end() || it->second.empty()) {
+        throw std::invalid_argument("missing required argument " + name);
+    }
+    return it->second;
+}
+
+std::string optional_arg(
+    const std::map<std::string, std::string>& args,
+    const std::string& name,
+    const std::string& default_value)
+{
+    const auto it = args.find(name);
+    return it == args.end() ? default_value : it->second;
+}
+
+std::uint16_t parse_port(const std::string& value, const std::string& field_name)
+{
+    const unsigned long parsed = std::stoul(value);
+    if (parsed == 0 || parsed > 65535) {
+        throw std::invalid_argument("invalid " + field_name + ": " + value);
+    }
+    return static_cast<std::uint16_t>(parsed);
+}
+
+} // namespace netloop
