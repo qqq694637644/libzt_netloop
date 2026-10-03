@@ -49,9 +49,6 @@ void stop_fused_socket(FusedSocketContext& conn)
     if (conn.fd_int != INVALID_SOCKET) {
         shutdown(conn.fd_int, SD_BOTH);
     }
-    if (conn.fd_zts >= 0) {
-        zts_bsd_shutdown(conn.fd_zts, ZTS_SHUT_RDWR);
-    }
 }
 
 void fail_fused_socket(FusedSocketContext& conn, const std::string& message)
