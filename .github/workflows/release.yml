@@ -1,0 +1,50 @@
+name: Release Windows EXEs
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Branch or ref to build
+        required: true
+        default: main
+        type: string
+      version:
+        description: Release version, for example 0.2.0 or v0.2.0
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  PYTHONUTF8: "1"
+
+jobs:
+  release:
+    name: Build and publish Windows EXEs
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout selected branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build selected version
+        run: python tools/build.py --config Release --version "${{ inputs.version }}"
+
+      - name: Smoke test binaries
+        run: python ci/smoke.py --runtime dist
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          RELEASE_BRANCH: ${{ inputs.branch }}
+        run: python tools/release.py --version "${{ inputs.version }}" --dist-dir dist

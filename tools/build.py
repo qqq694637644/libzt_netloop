@@ -7,9 +7,19 @@ import shutil
 import subprocess
 import sys
 import time
+import re
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def normalize_version(value: str) -> str:
+    version = value.strip()
+    if version.startswith("v"):
+        version = version[1:]
+    if not version or not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z._+-]*", version):
+        raise ValueError(f"invalid version: {value!r}")
+    return version
 
 
 def run_logged(command: list[str], log, cwd: Path = ROOT) -> None:
@@ -48,8 +58,10 @@ def main() -> int:
     parser.add_argument("--config", default="Release", choices=["Release", "Debug"])
     parser.add_argument("--build-dir", default=str(ROOT / "build"))
     parser.add_argument("--dist-dir", default=str(ROOT / "dist"))
+    parser.add_argument("--version", default="0.1.0")
     parser.add_argument("--skip-submodules", action="store_true")
     args = parser.parse_args()
+    version = normalize_version(args.version)
 
     evidence = ROOT / "evidence" / "build"
     evidence.mkdir(parents=True, exist_ok=True)
@@ -79,6 +91,7 @@ def main() -> int:
                     "-A",
                     "x64",
                     "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
+                    f"-DNETLOOP_VERSION={version}",
                 ],
                 log,
             )
@@ -111,6 +124,7 @@ def main() -> int:
 
         manifest = {
             "config": args.config,
+            "version": version,
             "duration_seconds": round(time.time() - started, 3),
             "binaries": binaries,
         }

@@ -9,6 +9,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+set(NETLOOP_VERSION "0.1.0" CACHE STRING "libzt_netloop version")
 
 set(BUILD_STATIC_LIB ON CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIB OFF CACHE BOOL "" FORCE)
@@ -69,10 +70,12 @@ target_compile_options(netloop_common PRIVATE /W4 /permissive-)
 add_executable(zt_netloop_client src/client.cpp)
 target_link_libraries(zt_netloop_client PRIVATE netloop_common)
 target_compile_options(zt_netloop_client PRIVATE /W4 /permissive-)
+target_compile_definitions(zt_netloop_client PRIVATE NETLOOP_VERSION="${NETLOOP_VERSION}")
 
 add_executable(zt_netloop_server src/server.cpp)
 target_link_libraries(zt_netloop_server PRIVATE netloop_common)
 target_compile_options(zt_netloop_server PRIVATE /W4 /permissive-)
+target_compile_definitions(zt_netloop_server PRIVATE NETLOOP_VERSION="${NETLOOP_VERSION}")
 
 set_target_properties(
     zt_netloop_client

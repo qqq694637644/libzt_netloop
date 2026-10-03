@@ -36,7 +36,7 @@ int main(int argc, char** argv)
             return 0;
         }
         if (args.contains("--version")) {
-            std::cout << "zt_netloop_server 0.1.0\n";
+            std::cout << "zt_netloop_server " << NETLOOP_VERSION << "\n";
             return 0;
         }
 

@@ -79,6 +79,8 @@ zt_netloop_client.exe ^
 Point the laptop application at \`127.0.0.1:1080\` as SOCKS5. The SOCKS5 handshake and
 subsequent traffic are transported to the v2rayN SOCKS5 listener unchanged.
 
+During ZeroTier network join, the process logs the actual libzt network status every five seconds. Failures such as `ACCESS_DENIED`, `NOT_FOUND`, `PORT_ERROR`, and `CLIENT_TOO_OLD` fail immediately. A timeout includes the network status plus whether IPv4/IPv6 addresses were actually assigned inside libzt.
+
 ## CI
 
 \`.github/workflows/windows-ci.yml\` has three Windows jobs:
@@ -101,6 +103,22 @@ with machine A's directly observed public IP.
 Build logs, process logs, status JSON, test results, \`ipconfig\`, route table, \`netstat\`,
 and IPv6-interface information are uploaded as evidence artifacts. Evidence is uploaded
 with \`if: always()\` so a failed join/tunnel/egress test keeps the material needed to diagnose it.
+
+## Release
+
+Run the `Release Windows EXEs` workflow manually and provide:
+
+- `branch`: the branch or ref to build, for example `main`.
+- `version`: the release version, for example `0.2.0` or `v0.2.0`.
+
+The workflow builds Windows x64 and publishes exactly two release assets:
+
+```text
+zt_netloop_client.exe
+zt_netloop_server.exe
+```
+
+No ZIP archive is created. The version is compiled into both executables, so `--version` reports the selected release version.
 
 ## Dependency
 

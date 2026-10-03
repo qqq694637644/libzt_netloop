@@ -64,6 +64,54 @@ bool deadline_expired(const std::chrono::steady_clock::time_point& deadline)
     return std::chrono::steady_clock::now() >= deadline;
 }
 
+std::string network_status_name(int status)
+{
+    switch (status) {
+    case ZTS_NETWORK_STATUS_REQUESTING_CONFIGURATION:
+        return "REQUESTING_CONFIGURATION";
+    case ZTS_NETWORK_STATUS_OK:
+        return "OK";
+    case ZTS_NETWORK_STATUS_ACCESS_DENIED:
+        return "ACCESS_DENIED";
+    case ZTS_NETWORK_STATUS_NOT_FOUND:
+        return "NOT_FOUND";
+    case ZTS_NETWORK_STATUS_PORT_ERROR:
+        return "PORT_ERROR";
+    case ZTS_NETWORK_STATUS_CLIENT_TOO_OLD:
+        return "CLIENT_TOO_OLD";
+    case ZTS_ERR_SOCKET:
+        return "ERR_SOCKET";
+    case ZTS_ERR_SERVICE:
+        return "ERR_SERVICE";
+    case ZTS_ERR_ARG:
+        return "ERR_ARG";
+    case ZTS_ERR_NO_RESULT:
+        return "NO_RESULT";
+    case ZTS_ERR_GENERAL:
+        return "ERR_GENERAL";
+    default:
+        return "UNKNOWN(" + std::to_string(status) + ")";
+    }
+}
+
+bool network_status_is_terminal_error(int status)
+{
+    return status == ZTS_NETWORK_STATUS_ACCESS_DENIED
+        || status == ZTS_NETWORK_STATUS_NOT_FOUND
+        || status == ZTS_NETWORK_STATUS_PORT_ERROR
+        || status == ZTS_NETWORK_STATUS_CLIENT_TOO_OLD;
+}
+
+std::string network_wait_detail(std::uint64_t network_id, int status)
+{
+    const bool ipv4_assigned = zts_addr_is_assigned(network_id, ZTS_AF_INET) == 1;
+    const bool ipv6_assigned = zts_addr_is_assigned(network_id, ZTS_AF_INET6) == 1;
+    return "status=" + network_status_name(status)
+        + ", transport_ready=false"
+        + ", ipv4_assigned=" + (ipv4_assigned ? "true" : "false")
+        + ", ipv6_assigned=" + (ipv6_assigned ? "true" : "false");
+}
+
 std::string assigned_address(std::uint64_t network_id, int family)
 {
     if (!zts_addr_is_assigned(network_id, family)) {
@@ -202,12 +250,34 @@ NetworkStatus start_libzt_network(
     }
     log.info("joining network=" + hex_u64(network_id));
 
+    int last_network_status = ZTS_ERR_NO_RESULT;
+    auto next_progress_log = std::chrono::steady_clock::now();
     while (!zts_net_transport_is_ready(network_id)) {
-        if (deadline_expired(deadline)) {
-            throw std::runtime_error("timeout waiting for ZeroTier network transport");
+        const int network_status = zts_net_get_status(network_id);
+        const auto now = std::chrono::steady_clock::now();
+        if (network_status != last_network_status || now >= next_progress_log) {
+            log.info("waiting for network transport, " + network_wait_detail(network_id, network_status));
+            last_network_status = network_status;
+            next_progress_log = now + std::chrono::seconds(5);
         }
-        zts_util_delay(100);
+
+        if (network_status_is_terminal_error(network_status)) {
+            throw std::runtime_error(
+                "ZeroTier network join failed: " + network_status_name(network_status)
+                + ", network=" + hex_u64(network_id));
+        }
+
+        if (deadline_expired(deadline)) {
+            throw std::runtime_error(
+                "timeout waiting for ZeroTier network transport: "
+                + network_wait_detail(network_id, network_status)
+                + ", network=" + hex_u64(network_id));
+        }
+        zts_util_delay(250);
     }
+
+    log.info(
+        "network transport ready, status=" + network_status_name(zts_net_get_status(network_id)));
 
     NetworkStatus status;
     status.network_id = network_id;
