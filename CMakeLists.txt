@@ -85,6 +85,7 @@ endif()
 add_library(netloop_common STATIC
     src/common.cpp
     src/fused_socket.cpp
+    src/socket_pair.cpp
 )
 target_include_directories(netloop_common
     PUBLIC

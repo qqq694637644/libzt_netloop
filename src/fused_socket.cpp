@@ -2,7 +2,6 @@
 
 #include "ZeroTierSockets.h"
 #include "hv/hloop.h"
-#include "uv.h"
 
 #include <array>
 #include <atomic>
@@ -196,12 +195,12 @@ void fused_socket_rx_helper(FusedSocketContext* conn)
 
 bool zts_fused_socket(FusedSocketContext& conn)
 {
-    uv_os_sock_t sockets[2] = { INVALID_SOCKET, INVALID_SOCKET };
-    const int rc = uv_socketpair(SOCK_STREAM, 0, sockets, 0, 0);
-    if (rc != 0) {
+    SOCKET sockets[2] = { INVALID_SOCKET, INVALID_SOCKET };
+    std::string error;
+    if (!create_native_socket_pair(sockets, error)) {
         if (conn.log != nullptr) {
             conn.log->error(
-                conn_prefix(conn) + "uv_socketpair failed: " + uv_strerror(rc));
+                conn_prefix(conn) + "uv_socketpair failed: " + error);
         }
         return false;
     }
