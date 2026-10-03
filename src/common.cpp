@@ -6,6 +6,7 @@
 
 #include <array>
 #include <atomic>
+#include <algorithm>
 #include <ctime>
 #include <iomanip>
 #include <iostream>
@@ -15,6 +16,8 @@
 
 namespace netloop {
 namespace {
+
+Logger* g_zt_event_log = nullptr;
 
 std::string timestamp()
 {
@@ -124,6 +127,94 @@ std::string assigned_address(std::uint64_t network_id, int family)
     return buffer;
 }
 
+std::string peer_role_name(zts_peer_role_t role)
+{
+    switch (role) {
+    case ZTS_PEER_ROLE_LEAF:
+        return "LEAF";
+    case ZTS_PEER_ROLE_MOON:
+        return "MOON";
+    case ZTS_PEER_ROLE_PLANET:
+        return "PLANET";
+    default:
+        return "UNKNOWN(" + std::to_string(static_cast<int>(role)) + ")";
+    }
+}
+
+std::string peer_event_name(int event_code)
+{
+    switch (event_code) {
+    case ZTS_EVENT_PEER_DIRECT:
+        return "DIRECT";
+    case ZTS_EVENT_PEER_RELAY:
+        return "RELAY";
+    case ZTS_EVENT_PEER_UNREACHABLE:
+        return "UNREACHABLE";
+    case ZTS_EVENT_PEER_PATH_DISCOVERED:
+        return "PATH_DISCOVERED";
+    case ZTS_EVENT_PEER_PATH_DEAD:
+        return "PATH_DEAD";
+    default:
+        return "UNKNOWN(" + std::to_string(event_code) + ")";
+    }
+}
+
+std::string peer_path_endpoint(zts_path_t& path)
+{
+    char address[ZTS_INET6_ADDRSTRLEN] = {};
+    unsigned short port = 0;
+    auto* socket_address = reinterpret_cast<zts_sockaddr*>(&path.address);
+    if (zts_util_ntop(
+            socket_address,
+            sizeof(path.address),
+            address,
+            sizeof(address),
+            &port)
+        != ZTS_ERR_OK) {
+        return "?";
+    }
+
+    if (socket_address->sa_family == ZTS_AF_INET6) {
+        return "[" + std::string(address) + "]:" + std::to_string(port);
+    }
+    return std::string(address) + ":" + std::to_string(port);
+}
+
+void on_zts_event(void* message_ptr)
+{
+    if (g_zt_event_log == nullptr || message_ptr == nullptr) {
+        return;
+    }
+
+    auto* message = static_cast<zts_event_msg_t*>(message_ptr);
+    if (message->event_code < ZTS_EVENT_PEER_DIRECT
+        || message->event_code > ZTS_EVENT_PEER_PATH_DEAD
+        || message->peer == nullptr) {
+        return;
+    }
+
+    zts_peer_info_t& peer = *message->peer;
+    g_zt_event_log->info(
+        "peer=" + hex_u64(peer.peer_id)
+        + " transport=" + peer_event_name(message->event_code)
+        + " role=" + peer_role_name(peer.role)
+        + " latency_ms=" + std::to_string(peer.latency)
+        + " path_count=" + std::to_string(peer.path_count));
+
+    const unsigned int path_count =
+        std::min(peer.path_count, static_cast<unsigned int>(ZTS_MAX_PEER_NETWORK_PATHS));
+    for (unsigned int index = 0; index < path_count; ++index) {
+        zts_path_t& path = peer.paths[index];
+        std::ostringstream detail;
+        detail << "peer=" << hex_u64(peer.peer_id)
+               << " path[" << index << "]=" << peer_path_endpoint(path)
+               << " latency_ms=" << std::fixed << std::setprecision(1) << path.latency
+               << " preferred=" << (path.preferred ? "true" : "false")
+               << " expired=" << (path.expired ? "true" : "false");
+        g_zt_event_log->info(detail.str());
+    }
+}
+
 } // namespace
 
 Logger::Logger(std::string role, const std::filesystem::path& log_path)
@@ -202,6 +293,13 @@ NetworkStatus start_libzt_network(
     if (rc != ZTS_ERR_OK) {
         throw std::runtime_error("zts_init_from_storage failed: " + std::to_string(rc));
     }
+
+    g_zt_event_log = &log;
+    rc = zts_init_set_event_handler(&on_zts_event);
+    if (rc != ZTS_ERR_OK) {
+        throw std::runtime_error("zts_init_set_event_handler failed: " + std::to_string(rc));
+    }
+    log.info("peer diagnostics enabled: DIRECT=P2P, RELAY=ZeroTier relay");
 
     rc = zts_node_start();
     if (rc != ZTS_ERR_OK) {
