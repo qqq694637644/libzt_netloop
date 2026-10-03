@@ -37,7 +37,10 @@ set(LIBUV_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(LIBUV_BUILD_BENCH OFF CACHE BOOL "" FORCE)
 add_subdirectory(external/libuv EXCLUDE_FROM_ALL)
 
-set(BUILD_SHARED OFF CACHE BOOL "" FORCE)
+# libhv v1.3.4 has an unconditional Windows install() generator expression
+# referring to its `hv` shared target. Keep that target defined so CMake can
+# generate successfully; netloop still links only `hv_static` below.
+set(BUILD_SHARED ON CACHE BOOL "" FORCE)
 set(BUILD_STATIC ON CACHE BOOL "" FORCE)
 set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(BUILD_UNITTEST OFF CACHE BOOL "" FORCE)
