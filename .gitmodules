@@ -1,9 +1,6 @@
 [submodule "external/libzt"]
 	path = external/libzt
 	url = https://github.com/zerotier/libzt.git
-[submodule "external/libuv"]
-	path = external/libuv
-	url = https://github.com/libuv/libuv.git
-[submodule "external/libhv"]
-	path = external/libhv
-	url = https://github.com/ithewei/libhv.git
+[submodule "external/asio"]
+	path = external/asio
+	url = https://github.com/chriskohlhoff/asio.git

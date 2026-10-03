@@ -57,7 +57,6 @@ void write_status_json(
 
 SOCKET native_listen(const std::string& host, std::uint16_t port);
 SOCKET native_connect(const std::string& host, std::uint16_t port);
-bool create_native_socket_pair(SOCKET sockets[2], std::string& error);
 void relay_native_and_zt(SOCKET native_socket, int zt_socket, Logger& log, std::uint64_t connection_id);
 
 std::map<std::string, std::string> parse_cli(int argc, char** argv);
