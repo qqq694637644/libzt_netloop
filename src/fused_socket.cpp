@@ -203,6 +203,40 @@ void fused_socket_rx_helper(FusedSocketContext* conn)
     std::array<char, kBufferSize> buffer {};
 
     while (!conn->should_stop.load() && !conn->fused_closed.load()) {
+        // Match Pylon's helper structure: poll the OS-side socketpair endpoint
+        // before reading it. In particular, do not leave one thread blocked in
+        // recv() on fd_int while the tx helper is trying to send() on that same
+        // Winsock socket. Some Windows providers serialize blocking operations
+        // on a socket, which can stall the reverse direction indefinitely.
+        WSAPOLLFD fd {};
+        fd.fd = conn->fd_int;
+        fd.events = POLLIN;
+
+        const int rc = WSAPoll(&fd, 1, kPollTimeoutMs);
+        if (rc == SOCKET_ERROR) {
+            if (!conn->should_stop.load()) {
+                fail_fused_socket(
+                    *conn,
+                    "fused os poll failed, WSA=" + std::to_string(WSAGetLastError()));
+            }
+            break;
+        }
+        if (rc == 0) {
+            continue;
+        }
+        if ((fd.revents & (POLLERR | POLLNVAL)) != 0) {
+            if (!conn->should_stop.load()) {
+                fail_fused_socket(
+                    *conn,
+                    "fused os poll error, revents=" + std::to_string(fd.revents)
+                        + ", WSA=" + std::to_string(WSAGetLastError()));
+            }
+            break;
+        }
+        if ((fd.revents & (POLLIN | POLLHUP)) == 0) {
+            continue;
+        }
+
         const int received =
             recv(conn->fd_int, buffer.data(), static_cast<int>(buffer.size()), 0);
         if (received == 0) {
