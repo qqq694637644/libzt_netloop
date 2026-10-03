@@ -5,6 +5,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <exception>
 #include <limits>
 #include <string>
@@ -20,6 +21,7 @@ namespace {
 // owns the ordinary-socket bidirectional relay and write backpressure.
 constexpr int kPollTimeoutMs = 500;
 constexpr std::size_t kBufferSize = 16 * 1024;
+constexpr auto kSlowIoThreshold = std::chrono::milliseconds(20);
 
 struct FusedSocketContext {
     std::atomic_bool should_stop { false };
@@ -29,6 +31,12 @@ struct FusedSocketContext {
     int fd_zts = -1;                // libzt socket
     Logger* log = nullptr;
     std::uint64_t connection_id = 0;
+};
+
+struct HvRelayDirectionContext {
+    Logger* log = nullptr;
+    std::uint64_t connection_id = 0;
+    const char* direction = nullptr;
 };
 
 std::string conn_prefix(const FusedSocketContext& conn)
@@ -67,7 +75,9 @@ bool native_send_all(FusedSocketContext& conn, const char* data, std::size_t siz
             remaining_size > static_cast<std::size_t>(std::numeric_limits<int>::max())
                 ? std::numeric_limits<int>::max()
                 : remaining_size);
+        const auto started = std::chrono::steady_clock::now();
         const int sent = send(conn.fd_int, data + offset, remaining, 0);
+        const auto elapsed = std::chrono::steady_clock::now() - started;
         if (sent == SOCKET_ERROR || sent == 0) {
             if (!conn.should_stop.load()) {
                 fail_fused_socket(
@@ -75,6 +85,14 @@ bool native_send_all(FusedSocketContext& conn, const char* data, std::size_t siz
                     "fused zt->os send failed, WSA=" + std::to_string(WSAGetLastError()));
             }
             return false;
+        }
+        if (elapsed >= kSlowIoThreshold || sent < remaining) {
+            conn.log->info(
+                conn_prefix(conn) + "flow dir=zt->native stage=socketpair_send requested="
+                + std::to_string(remaining) + " written=" + std::to_string(sent)
+                + " elapsed_ms="
+                + std::to_string(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()));
         }
         offset += static_cast<std::size_t>(sent);
     }
@@ -85,7 +103,10 @@ bool zt_write_all(FusedSocketContext& conn, const char* data, std::size_t size)
 {
     std::size_t offset = 0;
     while (offset < size && !conn.should_stop.load()) {
-        const ssize_t written = zts_write(conn.fd_zts, data + offset, size - offset);
+        const std::size_t requested = size - offset;
+        const auto started = std::chrono::steady_clock::now();
+        const ssize_t written = zts_write(conn.fd_zts, data + offset, requested);
+        const auto elapsed = std::chrono::steady_clock::now() - started;
         if (written <= 0) {
             if (!conn.should_stop.load()) {
                 fail_fused_socket(
@@ -95,9 +116,61 @@ bool zt_write_all(FusedSocketContext& conn, const char* data, std::size_t size)
             }
             return false;
         }
+        if (elapsed >= kSlowIoThreshold
+            || static_cast<std::size_t>(written) < requested) {
+            conn.log->info(
+                conn_prefix(conn) + "flow dir=native->zt stage=zts_write requested="
+                + std::to_string(requested) + " written=" + std::to_string(written)
+                + " elapsed_ms="
+                + std::to_string(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()));
+        }
         offset += static_cast<std::size_t>(written);
     }
     return offset == size;
+}
+
+void hio_write_upstream_diagnostic(hio_t* io, void* buf, int bytes)
+{
+    hio_t* upstream_io = hio_get_upstream(io);
+    if (upstream_io == nullptr) {
+        return;
+    }
+
+    auto* context = static_cast<HvRelayDirectionContext*>(hio_context(io));
+    const std::size_t queued_before = hio_write_bufsize(upstream_io);
+    const auto started = std::chrono::steady_clock::now();
+    const int nwrite = hio_write(upstream_io, buf, bytes);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    const std::size_t queued_after = hio_write_bufsize(upstream_io);
+
+    if (context != nullptr && context->log != nullptr
+        && (nwrite < bytes || queued_before != 0 || queued_after != 0
+            || elapsed >= kSlowIoThreshold)) {
+        const std::string message =
+            "conn=" + std::to_string(context->connection_id)
+            + " flow dir=" + context->direction
+            + " stage=libhv_write read=" + std::to_string(bytes)
+            + " immediate=" + std::to_string(nwrite)
+            + " queued_before=" + std::to_string(queued_before)
+            + " queued_after=" + std::to_string(queued_after)
+            + " elapsed_ms="
+            + std::to_string(
+                std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
+        if (nwrite < 0) {
+            context->log->error(message);
+        } else {
+            context->log->info(message);
+        }
+    }
+
+    // Preserve libhv's own upstream backpressure behavior exactly: once a
+    // destination cannot accept the full read buffer, stop reading the source
+    // until the destination write queue drains.
+    if (nwrite >= 0 && nwrite < bytes) {
+        hio_read_stop(io);
+        hio_setcb_write(upstream_io, hio_read_upstream_on_write_complete);
+    }
 }
 
 // Pylon fused_socket_tx_helper equivalent: retrieve data from libzt and feed it
@@ -298,12 +371,25 @@ bool run_libhv_relay(
         return false;
     }
 
+    HvRelayDirectionContext native_to_zt {
+        &log,
+        connection_id,
+        "native->zt",
+    };
+    HvRelayDirectionContext zt_to_native {
+        &log,
+        connection_id,
+        "zt->native",
+    };
+    hio_set_context(native_io, &native_to_zt);
+    hio_set_context(fused_io, &zt_to_native);
+
     // This is libhv's own tcp-proxy wiring: both sides use its queued writes,
     // backpressure and close propagation instead of our previous hand-written
     // pair of blocking recv/send loops.
     hio_setup_upstream(native_io, fused_io);
-    hio_setcb_read(native_io, hio_write_upstream);
-    hio_setcb_read(fused_io, hio_write_upstream);
+    hio_setcb_read(native_io, hio_write_upstream_diagnostic);
+    hio_setcb_read(fused_io, hio_write_upstream_diagnostic);
     hio_setcb_close(native_io, hio_close_upstream);
     hio_setcb_close(fused_io, hio_close_upstream);
     hio_read_upstream(native_io);
