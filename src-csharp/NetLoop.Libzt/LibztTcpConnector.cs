@@ -1,6 +1,4 @@
-using System.Diagnostics;
 using System.Net;
-using System.Runtime.InteropServices;
 using NetLoop.Core;
 
 namespace NetLoop.Libzt;
@@ -8,10 +6,8 @@ namespace NetLoop.Libzt;
 public sealed class LibztTcpConnector : IProxyConnector
 {
     private static readonly TimeSpan RetryDelay = TimeSpan.FromMilliseconds(250);
-    private const int ConnectPollMilliseconds = 50;
     private const int AttemptTimeoutMilliseconds = 2_000;
     private const int IoPollMicroseconds = 250_000;
-    private const int SocketAddressBufferSize = 128;
 
     private readonly TimeSpan _connectTimeout;
 
@@ -70,18 +66,22 @@ public sealed class LibztTcpConnector : IProxyConnector
                         250,
                         AttemptTimeoutMilliseconds);
 
-                    await ConnectNonBlockingAsync(
-                        fd,
-                        target,
-                        attemptTimeout,
-                        token).ConfigureAwait(false);
+                    var result = await Task.Run(
+                        () => LibztNative.ConnectEasy(fd, target.Host, target.Port, attemptTimeout),
+                        CancellationToken.None).ConfigureAwait(false);
 
-                    if (attempt > 1)
-                        JsonLog.Info("libzt_connect_recovered", new { target = target.ToString(), attempts = attempt });
+                    token.ThrowIfCancellationRequested();
+                    if (result == LibztNative.Ok)
+                    {
+                        if (attempt > 1)
+                            JsonLog.Info("libzt_connect_recovered", new { target = target.ToString(), attempts = attempt });
 
-                    var connection = new LibztTcpConnection(fd, $"libzt:{target}");
-                    connection.BindGeneration(generationToken);
-                    return connection;
+                        var connection = new LibztTcpConnection(fd, $"libzt:{target}");
+                        connection.BindGeneration(generationToken);
+                        return connection;
+                    }
+
+                    lastError = new LibztException("zts_bsd_connect_easy", result, LibztNative.GetErrno());
                 }
                 catch (Exception ex)
                 {
@@ -104,123 +104,6 @@ public sealed class LibztTcpConnector : IProxyConnector
 
         throw new TimeoutException($"libzt connect timed out for {target}", lastError);
     }
-
-    private static async Task ConnectNonBlockingAsync(
-        int fd,
-        ProxyTarget target,
-        int timeoutMilliseconds,
-        CancellationToken cancellationToken)
-    {
-        ThrowSocketError(
-            "zts_set_blocking(connect)",
-            fd,
-            LibztNative.SetBlocking(fd, 0));
-
-        var address = Marshal.AllocHGlobal(SocketAddressBufferSize);
-        var pollPointer = Marshal.AllocHGlobal(Marshal.SizeOf<LibztNative.PollDescriptor>());
-        try
-        {
-            uint addressLength = SocketAddressBufferSize;
-            var convert = LibztNative.IpStringToSocketAddress(
-                target.Host,
-                target.Port,
-                address,
-                ref addressLength);
-            if (convert != LibztNative.Ok)
-            {
-                throw new LibztException(
-                    "zts_util_ipstr_to_saddr",
-                    convert,
-                    LibztNative.GetErrno());
-            }
-            if (addressLength > ushort.MaxValue)
-                throw new InvalidOperationException($"libzt sockaddr length is invalid: {addressLength}");
-
-            var started = Stopwatch.GetTimestamp();
-            var result = LibztNative.Connect(
-                fd,
-                address,
-                checked((ushort)addressLength));
-            if (result != LibztNative.Ok)
-            {
-                var errno = LibztNative.GetErrno();
-                if (!IsConnectPending(errno))
-                    throw new LibztException("zts_bsd_connect", result, errno);
-            }
-
-            while (result != LibztNative.Ok)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                var elapsed = Stopwatch.GetElapsedTime(started);
-                var remaining = TimeSpan.FromMilliseconds(timeoutMilliseconds) - elapsed;
-                if (remaining <= TimeSpan.Zero)
-                    throw new TimeoutException($"libzt non-blocking connect timed out for {target}");
-
-                var waitMilliseconds = Math.Clamp(
-                    (int)Math.Ceiling(remaining.TotalMilliseconds),
-                    1,
-                    ConnectPollMilliseconds);
-                var poll = new LibztNative.PollDescriptor {
-                    FileDescriptor = fd,
-                    Events = (short)(LibztNative.PollOut | LibztNative.PollErr),
-                    ReturnedEvents = 0
-                };
-                Marshal.StructureToPtr(poll, pollPointer, false);
-                var ready = LibztNative.Poll(
-                    pollPointer,
-                    1,
-                    waitMilliseconds);
-                if (ready < 0)
-                {
-                    throw new LibztException(
-                        "zts_bsd_poll(connect)",
-                        ready,
-                        LibztNative.GetErrno());
-                }
-                if (ready == 0)
-                    continue;
-
-                poll = Marshal.PtrToStructure<LibztNative.PollDescriptor>(pollPointer);
-                if ((poll.ReturnedEvents & LibztNative.PollNval) != 0)
-                    throw new IOException($"libzt connect poll reported POLLNVAL for {target}");
-
-                result = LibztNative.Connect(
-                    fd,
-                    address,
-                    checked((ushort)addressLength));
-                if (result == LibztNative.Ok)
-                    break;
-
-                var errno = LibztNative.GetErrno();
-                if (errno == LibztNative.EIsConn)
-                {
-                    result = LibztNative.Ok;
-                    break;
-                }
-                if (IsConnectPending(errno))
-                    continue;
-
-                throw new LibztException("zts_bsd_connect", result, errno);
-            }
-
-            cancellationToken.ThrowIfCancellationRequested();
-            ThrowSocketError(
-                "zts_set_blocking(connected)",
-                fd,
-                LibztNative.SetBlocking(fd, 1));
-        }
-        finally
-        {
-            Marshal.FreeHGlobal(pollPointer);
-            Marshal.FreeHGlobal(address);
-        }
-    }
-
-    private static bool IsConnectPending(int errno)
-        => errno is LibztNative.EAgain
-            or LibztNative.EAlready
-            or LibztNative.EInProgress
-            or LibztNative.WindowsEWouldBlock;
 
     internal static void ConfigureStream(int fd)
     {
