@@ -56,16 +56,29 @@ internal sealed class OverlayGenerationManager : IDisposable
         }
     }
 
-    internal OverlayGeneration AdvanceSoft(LibztNetworkState state)
+    internal OverlayGeneration BeginSoft()
     {
         lock (_gate)
         {
             ObjectDisposedException.ThrowIf(_disposed != 0, this);
 
             var next = new OverlayGeneration(_epoch.Advance());
-            next.TrySetReady(state);
             _current = next;
             return next;
+        }
+    }
+
+    internal void CompleteSoft(
+        OverlayGeneration generation,
+        LibztNetworkState state)
+    {
+        lock (_gate)
+        {
+            if (!ReferenceEquals(_current, generation))
+                throw new InvalidOperationException(
+                    "Soft recovery generation is no longer current.");
+
+            generation.TrySetReady(state);
         }
     }
 
@@ -272,7 +285,12 @@ internal sealed class GenerationLibztUdpSocket : IAsyncDisposable
         OverlayGeneration generation,
         CancellationToken cancellationToken)
     {
-        var readyState = await generation.Ready.WaitAsync(cancellationToken).ConfigureAwait(false);
+        using var readyCts = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            generation.Epoch.CancellationToken);
+        var readyState = await generation.Ready
+            .WaitAsync(readyCts.Token)
+            .ConfigureAwait(false);
         if (generation.Epoch.CancellationToken.IsCancellationRequested)
             throw new OperationCanceledException(generation.Epoch.CancellationToken);
 

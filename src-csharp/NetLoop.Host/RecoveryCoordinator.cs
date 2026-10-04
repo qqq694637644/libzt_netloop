@@ -88,7 +88,7 @@ internal sealed class RecoveryCoordinator : IOverlayRecoveryObserver, IAsyncDisp
             var state = _node.State
                 ?? throw new InvalidOperationException("libzt network state is not available.");
 
-            generation = _generations.AdvanceSoft(state);
+            generation = _generations.BeginSoft();
             sequence = Interlocked.Increment(ref _sequence);
             _pendingSoftEpoch = generation.Epoch.Value;
             _pendingSoftStartedTimestamp = Stopwatch.GetTimestamp();
@@ -121,6 +121,7 @@ internal sealed class RecoveryCoordinator : IOverlayRecoveryObserver, IAsyncDisp
                 await _overlayRuntime.ReplaceAsync(
                     state,
                     cancellationToken).ConfigureAwait(false);
+                _generations.CompleteSoft(generation, state);
             }
             catch (Exception ex)
             {
