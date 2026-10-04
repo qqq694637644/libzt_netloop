@@ -81,14 +81,15 @@ internal static class Program
             try
             {
                 resetMonitor.Start();
+                double? resetElapsedMs = resetStarted is null
+                    ? null
+                    : Stopwatch.GetElapsedTime(resetStarted.Value).TotalMilliseconds;
 
                 await WriteReadyStatusAsync(
                     options,
                     runtime,
                     resetCount,
-                    resetStarted is null
-                        ? null
-                        : Stopwatch.GetElapsedTime(resetStarted.Value).TotalMilliseconds,
+                    resetElapsedMs,
                     lastResetReason,
                     shutdownToken).ConfigureAwait(false);
 
@@ -99,9 +100,7 @@ internal static class Program
                     overlay_udp = $"{runtime.OverlayBindAddress}:{options.OverlayUdpPort}",
                     socks = $"{options.SocksAddress}:{options.SocksPort}",
                     reset_count = resetCount,
-                    reset_elapsed_ms = resetStarted is null
-                        ? null
-                        : Stopwatch.GetElapsedTime(resetStarted.Value).TotalMilliseconds,
+                    reset_elapsed_ms = resetElapsedMs,
                     process_id = Environment.ProcessId
                 });
 
