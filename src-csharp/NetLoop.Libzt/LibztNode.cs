@@ -72,6 +72,20 @@ public sealed class LibztNode : IAsyncDisposable
         ThrowIfError("zts_node_stop", LibztNative.NodeStop());
         _started = false;
 
+        // zts_node_stop() requests termination but the service/network state
+        // can remain observable for a short period. Starting again while the
+        // previous generation still reports online/transport-ready lets
+        // RejoinAndWaitAsync consume stale readiness and return before the new
+        // transport is actually usable. Require a real down transition first.
+        while (LibztNative.NodeIsOnline() == 1
+               || LibztNative.NetTransportIsReady(_networkId) == 1)
+        {
+            await Task.Delay(25, cancellationToken).ConfigureAwait(false);
+        }
+        JsonLog.Info("libzt_hard_recovery_transport_stopped", new {
+            network = _networkId.ToString("x16")
+        });
+
         ThrowIfError("zts_node_start", LibztNative.NodeStart());
         _started = true;
         State = await RejoinAndWaitAsync(cancellationToken).ConfigureAwait(false);
