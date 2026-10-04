@@ -9,7 +9,7 @@ namespace NetLoop.Host;
 internal sealed class RecoveryCoordinator : IOverlayRecoveryObserver, IAsyncDisposable
 {
     private static readonly TimeSpan HardRecoveryStabilizationDelay =
-        TimeSpan.FromMilliseconds(1_750);
+        TimeSpan.FromMilliseconds(3_500);
 
     private readonly HostOptions _options;
     private readonly LibztNode _node;
