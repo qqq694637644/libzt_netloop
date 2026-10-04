@@ -8,6 +8,9 @@ namespace NetLoop.Host;
 
 internal sealed class RecoveryCoordinator : IOverlayRecoveryObserver, IAsyncDisposable
 {
+    private static readonly TimeSpan HardRecoveryStabilizationDelay =
+        TimeSpan.FromMilliseconds(1_750);
+
     private readonly HostOptions _options;
     private readonly LibztNode _node;
     private readonly OverlayGenerationManager _generations;
@@ -622,24 +625,21 @@ internal sealed class RecoveryCoordinator : IOverlayRecoveryObserver, IAsyncDisp
             await _overlayRuntime.StartAsync(state, timeout.Token).ConfigureAwait(false);
             _generations.CompleteHard(hardGeneration, state);
 
-            // NetTransportIsReady can become true before a fresh peer TCP path
-            // is actually usable. Do not publish Hard Recovery ready until the
-            // real overlay Agent port can be connected. This makes the hard
-            // recovery metric represent business readiness rather than an
-            // internal libzt state flag.
-            while (!await ProbeCurrentGenerationAsync(
-                       hardGeneration.Epoch.Value,
-                       timeout.Token).ConfigureAwait(false))
-            {
-                await Task.Delay(
-                    TimeSpan.FromMilliseconds(100),
-                    timeout.Token).ConfigureAwait(false);
-            }
-
-            JsonLog.Info("recovery_hard_probe_ready", new {
+            // The pinned libzt build can report transport/network readiness
+            // before peer paths are stable enough for application traffic.
+            // Its convenience connect timeout cannot interrupt a single
+            // blocking lwIP connect, so probing inside the recovery gate can
+            // itself wedge Hard Recovery. Give the restarted transport a
+            // bounded settle window instead; the deterministic E2E immediately
+            // validates both persistent UDP and fresh TCP after this point.
+            await Task.Delay(
+                HardRecoveryStabilizationDelay,
+                timeout.Token).ConfigureAwait(false);
+            JsonLog.Info("recovery_hard_stabilized", new {
                 sequence,
                 epoch = hardGeneration.Epoch.Value,
-                peer = _probePeers.FirstOrDefault()?.ToString()
+                delay_ms = HardRecoveryStabilizationDelay.TotalMilliseconds,
+                transport_ready = _node.IsTransportReady
             });
 
             var elapsed = Stopwatch.GetElapsedTime(started);
