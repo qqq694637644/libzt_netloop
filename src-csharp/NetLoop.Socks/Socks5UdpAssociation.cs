@@ -74,7 +74,7 @@ public sealed class Socks5UdpAssociationFactory : ISocks5UdpAssociationFactory, 
                 expectedClient,
                 _idleTimeout,
                 cancellationToken,
-                _capacity.Release);
+                () => _capacity.Release());
         }
         catch
         {
