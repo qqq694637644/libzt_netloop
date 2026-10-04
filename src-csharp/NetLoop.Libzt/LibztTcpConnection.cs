@@ -5,7 +5,9 @@ namespace NetLoop.Libzt;
 
 public sealed class LibztTcpConnection : IProxyConnection
 {
+    private CancellationTokenRegistration _generationRegistration;
     private int _fd;
+    private int _generationBound;
 
     internal LibztTcpConnection(int fd, string description)
     {
@@ -18,6 +20,21 @@ public sealed class LibztTcpConnection : IProxyConnection
     public System.Net.EndPoint? LocalEndPoint => null;
 
     public System.Net.EndPoint? RemoteEndPoint => null;
+
+    public void BindGeneration(CancellationToken generationToken)
+    {
+        if (!generationToken.CanBeCanceled)
+            return;
+        if (Interlocked.Exchange(ref _generationBound, 1) != 0)
+            throw new InvalidOperationException("libzt connection is already bound to a network generation.");
+
+        _generationRegistration = generationToken.Register(
+            static state => ((LibztTcpConnection)state!).AbortGeneration(),
+            this);
+
+        if (Volatile.Read(ref _fd) < 0)
+            _generationRegistration.Dispose();
+    }
 
     public ValueTask<int> ReadAsync(byte[] buffer, int count, CancellationToken cancellationToken)
     {
@@ -113,12 +130,20 @@ public sealed class LibztTcpConnection : IProxyConnection
     public ValueTask DisposeAsync()
     {
         var fd = Interlocked.Exchange(ref _fd, -1);
+        _generationRegistration.Dispose();
         if (fd < 0)
             return ValueTask.CompletedTask;
 
         _ = LibztNative.Shutdown(fd, LibztNative.ShutReadWrite);
         _ = LibztNative.Close(fd);
         return ValueTask.CompletedTask;
+    }
+
+    private void AbortGeneration()
+    {
+        var fd = Volatile.Read(ref _fd);
+        if (fd >= 0)
+            _ = LibztNative.Shutdown(fd, LibztNative.ShutReadWrite);
     }
 
     private int GetFd()

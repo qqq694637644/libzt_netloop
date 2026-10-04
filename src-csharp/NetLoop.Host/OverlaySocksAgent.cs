@@ -8,6 +8,7 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
 {
     private readonly LibztTcpListener _listener;
     private readonly Socks5ConnectionHandler _handler;
+    private readonly OverlayGenerationManager _generations;
     private readonly SemaphoreSlim _capacity;
     private readonly CancellationTokenSource _stop = new();
     private readonly Task _loop;
@@ -16,9 +17,11 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
         string bindAddress,
         ushort port,
         Socks5ConnectionHandler handler,
+        OverlayGenerationManager generations,
         int maxConnections)
     {
         _handler = handler;
+        _generations = generations;
         _capacity = new SemaphoreSlim(maxConnections, maxConnections);
         _listener = LibztTcpListener.Start(bindAddress, port, maxConnections);
         _loop = AcceptLoopAsync(_stop.Token);
@@ -32,6 +35,8 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
             try
             {
                 connection = await _listener.AcceptAsync(cancellationToken).ConfigureAwait(false);
+                connection.BindGeneration(
+                    _generations.Capture().Epoch.CancellationToken);
             }
             catch (OperationCanceledException)
             {

@@ -50,14 +50,17 @@ internal static class Program
                 Array.Empty<ManagedRoute>());
             var selector = new RouteSelector(snapshot, options.DefaultExit);
 
-            var libztConnector = new LibztTcpConnector(options.ConnectTimeout);
+            using var generations = new OverlayGenerationManager(state);
+            var libztConnector = new GenerationLibztTcpConnector(
+                generations,
+                options.ConnectTimeout);
             var loopbackConnector = new LoopbackTcpConnector(options.ConnectTimeout);
             IProxyConnector egressConnector = BuildEgressConnector(options);
             var overlayBind = SelectOverlayBindAddress(state.ManagedAddresses);
             var udpEgressFactory = BuildUdpEgressFactory(options);
             var routingUdpFactory = new RoutingUdpTransportFactory(
                 selector,
-                overlayBind,
+                generations,
                 options.OverlayUdpPort,
                 udpEgressFactory);
             var udpAssociationFactory = new Socks5UdpAssociationFactory(
@@ -84,6 +87,7 @@ internal static class Program
                 overlayBind.ToString(),
                 options.OverlayPort,
                 new Socks5ConnectionHandler(overlayRouter, HalfCloseTimeout),
+                generations,
                 MaxTcpTunnels);
             await using var overlayUdpAgent = new OverlayUdpAgent(
                 overlayBind,

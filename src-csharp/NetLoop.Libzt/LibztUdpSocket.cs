@@ -13,7 +13,9 @@ public sealed class LibztUdpSocket : IAsyncDisposable
     private const int MaxDatagramSize = 65_535;
 
     private readonly SemaphoreSlim _sendLock = new(1, 1);
+    private CancellationTokenRegistration _generationRegistration;
     private int _fd;
+    private int _generationBound;
 
     private LibztUdpSocket(int fd, IPAddress bindAddress, ushort bindPort)
     {
@@ -25,6 +27,21 @@ public sealed class LibztUdpSocket : IAsyncDisposable
     public IPAddress BindAddress { get; }
 
     public ushort BindPort { get; }
+
+    public void BindGeneration(CancellationToken generationToken)
+    {
+        if (!generationToken.CanBeCanceled)
+            return;
+        if (Interlocked.Exchange(ref _generationBound, 1) != 0)
+            throw new InvalidOperationException("libzt UDP socket is already bound to a network generation.");
+
+        _generationRegistration = generationToken.Register(
+            static state => ((LibztUdpSocket)state!).AbortGeneration(),
+            this);
+
+        if (Volatile.Read(ref _fd) < 0)
+            _generationRegistration.Dispose();
+    }
 
     public static LibztUdpSocket Bind(IPAddress bindAddress, ushort bindPort)
     {
@@ -198,13 +215,28 @@ public sealed class LibztUdpSocket : IAsyncDisposable
             or LibztNative.WindowsETimedOut
             or LibztNative.WindowsEWouldBlock;
 
-    public ValueTask DisposeAsync()
+    public async ValueTask DisposeAsync()
+    {
+        var fd = Interlocked.Exchange(ref _fd, -1);
+        _generationRegistration.Dispose();
+        await _sendLock.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (fd >= 0)
+                _ = LibztNative.Close(fd);
+        }
+        finally
+        {
+            _sendLock.Release();
+            _sendLock.Dispose();
+        }
+    }
+
+    private void AbortGeneration()
     {
         var fd = Interlocked.Exchange(ref _fd, -1);
         if (fd >= 0)
             _ = LibztNative.Close(fd);
-        _sendLock.Dispose();
-        return ValueTask.CompletedTask;
     }
 
     private int GetFd()

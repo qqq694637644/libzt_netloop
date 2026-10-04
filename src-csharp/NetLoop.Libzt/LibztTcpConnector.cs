@@ -18,9 +18,23 @@ public sealed class LibztTcpConnector : IProxyConnector
     public async ValueTask<IProxyConnection> ConnectAsync(
         ProxyTarget target,
         CancellationToken cancellationToken)
+        => await ConnectForGenerationAsync(
+            target,
+            CancellationToken.None,
+            cancellationToken).ConfigureAwait(false);
+
+    public async ValueTask<LibztTcpConnection> ConnectForGenerationAsync(
+        ProxyTarget target,
+        CancellationToken generationToken,
+        CancellationToken cancellationToken)
     {
         if (!IPAddress.TryParse(target.Host, out var address))
             throw new ArgumentException("libzt peer target must be a Managed IP address.", nameof(target));
+
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            generationToken);
+        var token = linkedCts.Token;
 
         var family = address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork
             ? LibztNative.AfInet
@@ -32,7 +46,7 @@ public sealed class LibztTcpConnector : IProxyConnector
 
         while (DateTimeOffset.UtcNow < deadline)
         {
-            cancellationToken.ThrowIfCancellationRequested();
+            token.ThrowIfCancellationRequested();
             attempt++;
 
             var fd = LibztNative.Socket(family, LibztNative.SockStream, 0);
@@ -55,12 +69,15 @@ public sealed class LibztTcpConnector : IProxyConnector
                         () => LibztNative.ConnectEasy(fd, target.Host, target.Port, attemptTimeout),
                         CancellationToken.None).ConfigureAwait(false);
 
+                    token.ThrowIfCancellationRequested();
                     if (result == LibztNative.Ok)
                     {
                         if (attempt > 1)
                             JsonLog.Info("libzt_connect_recovered", new { target = target.ToString(), attempts = attempt });
 
-                        return new LibztTcpConnection(fd, $"libzt:{target}");
+                        var connection = new LibztTcpConnection(fd, $"libzt:{target}");
+                        connection.BindGeneration(generationToken);
+                        return connection;
                     }
 
                     lastError = new LibztException("zts_bsd_connect_easy", result, LibztNative.GetErrno());
@@ -81,7 +98,7 @@ public sealed class LibztTcpConnector : IProxyConnector
             if (delay <= TimeSpan.Zero)
                 break;
 
-            await Task.Delay(delay < RetryDelay ? delay : RetryDelay, cancellationToken).ConfigureAwait(false);
+            await Task.Delay(delay < RetryDelay ? delay : RetryDelay, token).ConfigureAwait(false);
         }
 
         throw new TimeoutException($"libzt connect timed out for {target}", lastError);
