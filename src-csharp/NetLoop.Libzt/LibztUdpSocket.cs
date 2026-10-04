@@ -66,12 +66,46 @@ public sealed class LibztUdpSocket : IAsyncDisposable
                     timeout,
                     LibztNative.GetLastSocketError(fd));
 
-            return new LibztUdpSocket(fd, bindAddress, bindPort);
+            var localEndPoint = GetLocalEndPoint(fd);
+            return new LibztUdpSocket(
+                fd,
+                localEndPoint.Address,
+                checked((ushort)localEndPoint.Port));
         }
         catch
         {
             _ = LibztNative.Close(fd);
             throw;
+        }
+    }
+
+    private static unsafe IPEndPoint GetLocalEndPoint(int fd)
+    {
+        var text = Marshal.AllocHGlobal(LibztNative.IpStringLength);
+        try
+        {
+            new Span<byte>((void*)text, LibztNative.IpStringLength).Clear();
+            ushort port = 0;
+            var result = LibztNative.GetSockName(
+                fd,
+                text,
+                LibztNative.IpStringLength,
+                ref port);
+            if (result != LibztNative.Ok)
+            {
+                throw new LibztException(
+                    "zts_getsockname(udp)",
+                    result,
+                    LibztNative.GetLastSocketError(fd));
+            }
+
+            var addressText = Marshal.PtrToStringAnsi(text)
+                ?? throw new IOException("libzt returned an empty UDP local address.");
+            return new IPEndPoint(IPAddress.Parse(addressText), port);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(text);
         }
     }
 

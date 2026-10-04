@@ -118,6 +118,17 @@ internal static class LibztNative
         CallingConvention = CallingConvention.Cdecl)]
     internal static extern int BindEasy(int fd, string localAddress, ushort localPort);
 
+    [DllImport(
+        LibraryName,
+        CharSet = CharSet.Ansi,
+        EntryPoint = "zts_getsockname",
+        CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int GetSockName(
+        int fd,
+        nint localAddress,
+        int localAddressLength,
+        ref ushort localPort);
+
     [DllImport(LibraryName, EntryPoint = "CSharp_zts_bsd_listen")]
     internal static extern int Listen(int fd, int backlog);
 

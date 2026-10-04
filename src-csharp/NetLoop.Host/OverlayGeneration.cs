@@ -211,8 +211,8 @@ internal sealed class GenerationLibztTcpConnector : IProxyConnector
 internal sealed class GenerationLibztUdpSocket : IAsyncDisposable
 {
     private readonly OverlayGenerationManager _generations;
-    private readonly ushort _bindPort;
     private readonly SemaphoreSlim _gate = new(1, 1);
+    private ushort _bindPort;
     private LibztUdpSocket? _socket;
     private long _socketEpoch = -1;
     private int _disposed;
@@ -317,13 +317,15 @@ internal sealed class GenerationLibztUdpSocket : IAsyncDisposable
             var bindAddress = OverlayGenerationManager.SelectBindAddress(readyState);
             var created = LibztUdpSocket.Bind(bindAddress, _bindPort);
             created.BindGeneration(generation.Epoch.CancellationToken);
+            if (_bindPort == 0)
+                _bindPort = created.BindPort;
             _socket = created;
             _socketEpoch = generation.Epoch.Value;
 
             JsonLog.Info("libzt_udp_generation_ready", new {
                 epoch = generation.Epoch.Value,
-                bind = bindAddress.ToString(),
-                port = _bindPort
+                bind = created.BindAddress.ToString(),
+                port = created.BindPort
             });
             return created;
         }
