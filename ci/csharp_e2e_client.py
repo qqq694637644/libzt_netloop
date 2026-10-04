@@ -421,7 +421,20 @@ def write_json_atomic(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(path.suffix + ".tmp")
     temp.write_text(json.dumps(payload), encoding="utf-8")
-    os.replace(temp, path)
+    last_error: PermissionError | None = None
+    for _ in range(50):
+        try:
+            os.replace(temp, path)
+            return
+        except PermissionError as exc:
+            # On Windows the C# watcher can briefly have the destination open
+            # without FILE_SHARE_DELETE while File.ReadAllText is in flight.
+            # Keep the atomic-replace protocol and retry only that bounded
+            # sharing violation instead of falling back to an in-place write.
+            last_error = exc
+            time.sleep(0.02)
+
+    raise last_error or PermissionError(f"unable to replace {path}")
 
 
 def wait_recovery_status(
