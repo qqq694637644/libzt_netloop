@@ -11,7 +11,15 @@ import sys
 import time
 import traceback
 
-from common import ROOT, collect_windows_evidence, kill_process_tree, start_detached, wait_for_json
+from common import (
+    ROOT,
+    build_stun_binding_request,
+    collect_windows_evidence,
+    kill_process_tree,
+    parse_stun_public_ip,
+    start_detached,
+    wait_for_json,
+)
 from github_artifacts import wait_and_download
 
 
@@ -70,6 +78,235 @@ def socks_connect(
         raise RuntimeError(f"invalid SOCKS5 reply address type: {header[3]}")
     recv_exact(sock, 2)
     return sock
+
+
+def encode_socks_target(host: str, port: int) -> bytes:
+    try:
+        return b"\x01" + socket.inet_pton(socket.AF_INET, host) + struct.pack("!H", port)
+    except OSError:
+        pass
+
+    try:
+        return b"\x04" + socket.inet_pton(socket.AF_INET6, host) + struct.pack("!H", port)
+    except OSError:
+        pass
+
+    encoded = host.encode("idna")
+    if not 1 <= len(encoded) <= 255:
+        raise ValueError(f"SOCKS5 domain length is invalid: {host!r}")
+    return b"\x03" + bytes([len(encoded)]) + encoded + struct.pack("!H", port)
+
+
+def decode_socks_endpoint(payload: bytes, offset: int = 0) -> tuple[str, int, int]:
+    if offset >= len(payload):
+        raise ValueError("truncated SOCKS5 address")
+
+    address_type = payload[offset]
+    offset += 1
+    if address_type == 1:
+        if len(payload) < offset + 4 + 2:
+            raise ValueError("truncated SOCKS5 IPv4 address")
+        host = socket.inet_ntop(socket.AF_INET, payload[offset : offset + 4])
+        offset += 4
+    elif address_type == 4:
+        if len(payload) < offset + 16 + 2:
+            raise ValueError("truncated SOCKS5 IPv6 address")
+        host = socket.inet_ntop(socket.AF_INET6, payload[offset : offset + 16])
+        offset += 16
+    elif address_type == 3:
+        if len(payload) < offset + 1:
+            raise ValueError("truncated SOCKS5 domain length")
+        length = payload[offset]
+        offset += 1
+        if len(payload) < offset + length + 2:
+            raise ValueError("truncated SOCKS5 domain")
+        host = payload[offset : offset + length].decode("ascii")
+        offset += length
+    else:
+        raise ValueError(f"invalid SOCKS5 address type {address_type}")
+
+    port = struct.unpack("!H", payload[offset : offset + 2])[0]
+    offset += 2
+    return host, port, offset
+
+
+class SocksUdpAssociation:
+    def __init__(self, proxy_host: str, proxy_port: int):
+        self.proxy_host = proxy_host
+        self.proxy_port = proxy_port
+        self.control = socket.create_connection((proxy_host, proxy_port), timeout=15)
+        self.control.settimeout(15)
+        self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp.bind(("127.0.0.1", 0))
+        self.udp.settimeout(15)
+
+        try:
+            self.control.sendall(b"\x05\x01\x00")
+            if recv_exact(self.control, 2) != b"\x05\x00":
+                raise RuntimeError("SOCKS5 UDP method negotiation failed")
+
+            # Port zero intentionally exercises the RFC 1928 first-datagram
+            # source claim path used by the server-side association.
+            request = b"\x05\x03\x00" + encode_socks_target("0.0.0.0", 0)
+            self.control.sendall(request)
+
+            header = recv_exact(self.control, 4)
+            if header[0] != 5 or header[1] != 0:
+                raise RuntimeError(f"SOCKS5 UDP ASSOCIATE failed: {header.hex()}")
+
+            address_type = header[3]
+            if address_type == 1:
+                remainder = recv_exact(self.control, 6)
+            elif address_type == 4:
+                remainder = recv_exact(self.control, 18)
+            elif address_type == 3:
+                length = recv_exact(self.control, 1)[0]
+                remainder = bytes([length]) + recv_exact(self.control, length + 2)
+            else:
+                raise RuntimeError(
+                    f"invalid SOCKS5 UDP relay address type: {address_type}"
+                )
+
+            relay_host, relay_port, _ = decode_socks_endpoint(
+                bytes([address_type]) + remainder
+            )
+            if relay_host in ("0.0.0.0", "::"):
+                relay_host = proxy_host
+            self.relay = (relay_host, relay_port)
+        except Exception:
+            self.close()
+            raise
+
+    def send(
+        self,
+        target_host: str,
+        target_port: int,
+        payload: bytes,
+        *,
+        frag: int = 0,
+    ) -> None:
+        if not 0 <= frag <= 255:
+            raise ValueError("SOCKS5 UDP FRAG must fit in one byte")
+        packet = b"\x00\x00" + bytes([frag]) + encode_socks_target(
+            target_host, target_port
+        ) + payload
+        self.udp.sendto(packet, self.relay)
+
+    def receive(self, timeout: float = 15.0) -> tuple[str, int, bytes]:
+        self.udp.settimeout(timeout)
+        packet, remote = self.udp.recvfrom(65535)
+        if remote[0] != self.relay[0] or remote[1] != self.relay[1]:
+            raise RuntimeError(
+                f"SOCKS5 UDP response came from unexpected relay {remote}, "
+                f"expected {self.relay}"
+            )
+        if len(packet) < 7 or packet[0:2] != b"\x00\x00":
+            raise RuntimeError(f"invalid SOCKS5 UDP response: {packet[:20].hex()}")
+        if packet[2] != 0:
+            raise RuntimeError(f"unexpected SOCKS5 UDP response FRAG={packet[2]}")
+        host, port, payload_offset = decode_socks_endpoint(packet, 3)
+        return host, port, packet[payload_offset:]
+
+    def roundtrip(
+        self,
+        target_host: str,
+        target_port: int,
+        payload: bytes,
+        *,
+        timeout: float = 15.0,
+    ) -> tuple[str, int, bytes]:
+        self.send(target_host, target_port, payload)
+        return self.receive(timeout)
+
+    def close_control(self) -> None:
+        try:
+            self.control.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.control.close()
+
+    def close(self) -> None:
+        try:
+            self.control.close()
+        except OSError:
+            pass
+        try:
+            self.udp.close()
+        except OSError:
+            pass
+
+    def __enter__(self) -> "SocksUdpAssociation":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback_value) -> None:
+        self.close()
+
+
+def verify_peer_local_udp(proxy_port: int, peer_ip: str, service_port: int) -> None:
+    payload = b"netloop-peer-udp-echo"
+    with SocksUdpAssociation("127.0.0.1", proxy_port) as association:
+        _, _, response = association.roundtrip(peer_ip, service_port, payload)
+        if response != payload:
+            raise AssertionError(
+                f"peer UDP echo mismatch: expected={payload!r}, observed={response!r}"
+            )
+
+
+def verify_udp_frag_rejected(proxy_port: int, peer_ip: str, service_port: int) -> None:
+    payload = b"netloop-frag-must-drop"
+    with SocksUdpAssociation("127.0.0.1", proxy_port) as association:
+        association.send(peer_ip, service_port, payload, frag=1)
+        try:
+            association.receive(timeout=1.0)
+        except (TimeoutError, socket.timeout, ConnectionResetError, OSError):
+            pass
+        else:
+            raise AssertionError("SOCKS5 UDP FRAG != 0 unexpectedly produced a response")
+
+        # A malformed datagram must not poison the live association.
+        _, _, response = association.roundtrip(peer_ip, service_port, payload)
+        if response != payload:
+            raise AssertionError("UDP association did not recover after FRAG rejection")
+
+
+def udp_public_ip_via_socks(
+    proxy_port: int,
+    stun_host: str,
+    stun_port: int,
+) -> str:
+    request, transaction_id = build_stun_binding_request()
+    with SocksUdpAssociation("127.0.0.1", proxy_port) as association:
+        _, _, response = association.roundtrip(
+            stun_host,
+            stun_port,
+            request,
+            timeout=20,
+        )
+    return parse_stun_public_ip(response, transaction_id)
+
+
+def verify_udp_control_close_cleanup(
+    proxy_port: int,
+    peer_ip: str,
+    service_port: int,
+) -> None:
+    association = SocksUdpAssociation("127.0.0.1", proxy_port)
+    try:
+        payload = b"netloop-control-lifetime"
+        _, _, response = association.roundtrip(peer_ip, service_port, payload)
+        if response != payload:
+            raise AssertionError("UDP association did not work before control close")
+
+        association.close_control()
+        time.sleep(1.0)
+        association.send(peer_ip, service_port, payload)
+        try:
+            association.receive(timeout=1.5)
+        except (TimeoutError, socket.timeout, ConnectionResetError, OSError):
+            return
+        raise AssertionError("UDP association still relayed traffic after control TCP closed")
+    finally:
+        association.close()
 
 
 def https_public_ip_via_socks(proxy_port: int) -> str:
@@ -133,6 +370,8 @@ def start_client(
             str(listen_port),
             "--overlay-port",
             str(rendezvous["overlay_port"]),
+            "--overlay-udp-port",
+            str(rendezvous["overlay_udp_port"]),
             "--default-exit",
             rendezvous["server_ip"],
             "--status-file",
@@ -171,6 +410,10 @@ def main() -> int:
         "success": False,
         "client_joined": False,
         "peer_local_service": False,
+        "peer_local_udp": False,
+        "udp_frag_rejected": False,
+        "udp_default_exit_matches": False,
+        "udp_control_close_cleanup": False,
         "egress_ip_matches": False,
         "restart_recovery": False,
         "identity_preserved": False,
@@ -207,6 +450,60 @@ def main() -> int:
             ),
         )
         result["peer_local_service"] = True
+
+        retry(
+            "peer_local_udp",
+            lambda: verify_peer_local_udp(
+                args.listen_port,
+                rendezvous["server_ip"],
+                int(rendezvous["local_udp_service_port"]),
+            ),
+        )
+        result["peer_local_udp"] = True
+
+        retry(
+            "udp_frag_rejected",
+            lambda: verify_udp_frag_rejected(
+                args.listen_port,
+                rendezvous["server_ip"],
+                int(rendezvous["local_udp_service_port"]),
+            ),
+            attempts=3,
+            delay=1.0,
+        )
+        result["udp_frag_rejected"] = True
+
+        observed_udp_ip = retry(
+            "udp_default_exit",
+            lambda: udp_public_ip_via_socks(
+                args.listen_port,
+                rendezvous["stun_host"],
+                int(rendezvous["stun_port"]),
+            ),
+            attempts=4,
+            delay=2.0,
+        )
+        expected_udp_ip = rendezvous["expected_udp_public_ip"]
+        result["observed_udp_public_ip"] = observed_udp_ip
+        result["expected_udp_public_ip"] = expected_udp_ip
+        if observed_udp_ip != expected_udp_ip:
+            raise AssertionError(
+                "UDP default_exit public IP mismatch: "
+                f"through default_exit={observed_udp_ip}, server={expected_udp_ip}"
+            )
+        result["udp_default_exit_matches"] = True
+
+        retry(
+            "udp_control_close_cleanup",
+            lambda: verify_udp_control_close_cleanup(
+                args.listen_port,
+                rendezvous["server_ip"],
+                int(rendezvous["local_udp_service_port"]),
+            ),
+            attempts=3,
+            delay=1.0,
+        )
+        result["udp_control_close_cleanup"] = True
 
         observed_ip = retry(
             "egress",

@@ -5,7 +5,9 @@ import argparse
 import json
 import os
 from pathlib import Path
+import socket
 import sys
+import time
 import traceback
 
 from common import (
@@ -14,6 +16,7 @@ from common import (
     kill_process_tree,
     public_ip,
     start_detached,
+    stun_public_ip,
     wait_for_json,
     wait_for_tcp,
 )
@@ -26,6 +29,27 @@ PIDS = EVIDENCE / "pids.json"
 
 def adhoc_network_id(port: int) -> str:
     return f"ff{port:04x}{port:04x}000000"
+
+
+def wait_for_udp_echo(host: str, port: int, timeout: float = 20.0) -> None:
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    deadline = time.monotonic() + timeout
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            with socket.socket(family, socket.SOCK_DGRAM) as udp:
+                udp.settimeout(1.0)
+                token = b"netloop-udp-ready"
+                udp.sendto(token, (host, port))
+                payload, _ = udp.recvfrom(1024)
+                if payload == token:
+                    return
+        except Exception as exc:
+            last_error = exc
+            time.sleep(0.2)
+    raise TimeoutError(
+        f"timed out waiting for UDP echo {host}:{port}; last_error={last_error}"
+    )
 
 
 def prepare(args: argparse.Namespace) -> int:
@@ -50,13 +74,29 @@ def prepare(args: argparse.Namespace) -> int:
         ],
         EVIDENCE / "local_service.log",
     )
+    udp_pid = start_detached(
+        [
+            sys.executable,
+            str(ROOT / "ci" / "udp_echo_server.py"),
+            "--host",
+            "::1",
+            "--port",
+            str(args.local_udp_service_port),
+        ],
+        EVIDENCE / "local_udp_service.log",
+    )
 
     netloop_pid = 0
     try:
         wait_for_tcp("::1", args.local_service_port, timeout=20)
+        wait_for_udp_echo("::1", args.local_udp_service_port, timeout=20)
         expected_ip = public_ip()
+        expected_udp_ip = stun_public_ip()
         (EVIDENCE / "expected_public_ip.txt").write_text(
             expected_ip + "\n", encoding="utf-8"
+        )
+        (EVIDENCE / "expected_udp_public_ip.txt").write_text(
+            expected_udp_ip + "\n", encoding="utf-8"
         )
 
         netloop_pid = start_detached(
@@ -72,6 +112,8 @@ def prepare(args: argparse.Namespace) -> int:
                 str(args.socks_port),
                 "--overlay-port",
                 str(args.overlay_port),
+                "--overlay-udp-port",
+                str(args.overlay_udp_port),
                 "--egress",
                 "direct",
                 "--status-file",
@@ -86,7 +128,11 @@ def prepare(args: argparse.Namespace) -> int:
 
         PIDS.write_text(
             json.dumps(
-                {"netloop_pid": netloop_pid, "http_pid": http_pid},
+                {
+                    "netloop_pid": netloop_pid,
+                    "http_pid": http_pid,
+                    "udp_pid": udp_pid,
+                },
                 indent=2,
             ),
             encoding="utf-8",
@@ -102,8 +148,13 @@ def prepare(args: argparse.Namespace) -> int:
             "server_ip": server_ip,
             "server_node_id": status.get("node_id"),
             "overlay_port": args.overlay_port,
+            "overlay_udp_port": args.overlay_udp_port,
             "local_service_port": args.local_service_port,
+            "local_udp_service_port": args.local_udp_service_port,
             "expected_public_ip": expected_ip,
+            "expected_udp_public_ip": expected_udp_ip,
+            "stun_host": "stun.l.google.com",
+            "stun_port": 19302,
             "github_run_id": os.environ.get("GITHUB_RUN_ID", ""),
             "github_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
         }
@@ -116,6 +167,7 @@ def prepare(args: argparse.Namespace) -> int:
     except Exception:
         kill_process_tree(netloop_pid)
         kill_process_tree(http_pid)
+        kill_process_tree(udp_pid)
         raise
 
 
@@ -139,6 +191,7 @@ def hold(args: argparse.Namespace) -> int:
             pids = json.loads(PIDS.read_text(encoding="utf-8"))
             kill_process_tree(int(pids.get("netloop_pid", 0)))
             kill_process_tree(int(pids.get("http_pid", 0)))
+            kill_process_tree(int(pids.get("udp_pid", 0)))
     return exit_code
 
 
@@ -149,8 +202,10 @@ def main() -> int:
     prep = subparsers.add_parser("prepare")
     prep.add_argument("--runtime", default="runtime-csharp")
     prep.add_argument("--overlay-port", type=int, default=42042)
+    prep.add_argument("--overlay-udp-port", type=int, default=42043)
     prep.add_argument("--socks-port", type=int, default=18080)
     prep.add_argument("--local-service-port", type=int, default=18181)
+    prep.add_argument("--local-udp-service-port", type=int, default=18182)
 
     wait = subparsers.add_parser("hold")
     wait.add_argument("--client-artifact", required=True)
@@ -169,6 +224,7 @@ def main() -> int:
             pids = json.loads(PIDS.read_text(encoding="utf-8"))
             kill_process_tree(int(pids.get("netloop_pid", 0)))
             kill_process_tree(int(pids.get("http_pid", 0)))
+            kill_process_tree(int(pids.get("udp_pid", 0)))
         print(traceback.format_exc(), file=sys.stderr)
         return 1
 
