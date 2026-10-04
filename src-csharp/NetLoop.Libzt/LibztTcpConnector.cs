@@ -7,6 +7,7 @@ public sealed class LibztTcpConnector : IProxyConnector
 {
     private static readonly TimeSpan RetryDelay = TimeSpan.FromMilliseconds(250);
     private const int AttemptTimeoutMilliseconds = 2_000;
+    private const int IoPollMicroseconds = 250_000;
 
     private readonly TimeSpan _connectTimeout;
 
@@ -108,6 +109,14 @@ public sealed class LibztTcpConnector : IProxyConnector
     {
         ThrowSocketError("zts_set_no_delay", fd, LibztNative.SetNoDelay(fd, 1));
         ThrowSocketError("zts_set_keepalive", fd, LibztNative.SetKeepAlive(fd, 1));
+        ThrowSocketError(
+            "zts_set_recv_timeout",
+            fd,
+            LibztNative.SetReceiveTimeout(fd, 0, IoPollMicroseconds));
+        ThrowSocketError(
+            "zts_set_send_timeout",
+            fd,
+            LibztNative.SetSendTimeout(fd, 0, IoPollMicroseconds));
         SetTcpOption(fd, LibztNative.TcpKeepIdle, 5, "TCP_KEEPIDLE");
         SetTcpOption(fd, LibztNative.TcpKeepInterval, 2, "TCP_KEEPINTVL");
         SetTcpOption(fd, LibztNative.TcpKeepCount, 3, "TCP_KEEPCNT");

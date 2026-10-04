@@ -178,6 +178,9 @@ internal static class LibztNative
     [DllImport(LibraryName, EntryPoint = "CSharp_zts_set_recv_timeout")]
     internal static extern int SetReceiveTimeout(int fd, int seconds, int microseconds);
 
+    [DllImport(LibraryName, EntryPoint = "CSharp_zts_set_send_timeout")]
+    internal static extern int SetSendTimeout(int fd, int seconds, int microseconds);
+
     [DllImport(LibraryName, EntryPoint = "CSharp_zts_set_blocking")]
     internal static extern int SetBlocking(int fd, int enabled);
 
