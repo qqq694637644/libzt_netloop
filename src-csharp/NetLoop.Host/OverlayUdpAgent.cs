@@ -73,10 +73,25 @@ internal sealed class OverlayUdpAgent : IAsyncDisposable
                     continue;
                 }
 
-                await association.ForwardAsync(
-                    packet.Target,
-                    packet.Payload,
-                    cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    await association.ForwardAsync(
+                        packet.Target,
+                        packet.Payload,
+                        cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+                {
+                    JsonLog.Error("overlay_udp_forward_failed", new {
+                        peer = datagram.RemoteEndPoint.ToString(),
+                        target = packet.Target.ToString(),
+                        error_type = ex.GetType().Name,
+                        error = ex.Message
+                    });
+
+                    if (TryRemoveAssociation(datagram.RemoteEndPoint, association))
+                        await association.DisposeAsync().ConfigureAwait(false);
+                }
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -106,40 +121,27 @@ internal sealed class OverlayUdpAgent : IAsyncDisposable
         if (_associations.Count >= _maxAssociations)
             return null;
 
-        var localTransport = new SystemUdpTransport();
-        IProxyUdpTransport? egressTransport = null;
-        try
-        {
-            egressTransport = await _egressFactory.CreateAsync(cancellationToken).ConfigureAwait(false);
-            var created = new OverlayUdpAssociation(
-                peer,
-                _selector,
-                localTransport,
-                egressTransport,
-                _idleTimeout,
-                SendResponseAsync,
-                _stop.Token);
+        var created = new OverlayUdpAssociation(
+            peer,
+            _selector,
+            new SystemUdpTransport(),
+            _egressFactory,
+            _idleTimeout,
+            SendResponseAsync,
+            _stop.Token);
 
-            if (!_associations.TryAdd(peer, created))
-            {
-                await created.DisposeAsync().ConfigureAwait(false);
-                return _associations.TryGetValue(peer, out var winner) ? winner : null;
-            }
-
-            _ = ObserveAssociationAsync(peer, created);
-            JsonLog.Info("overlay_udp_association_created", new {
-                peer = peer.ToString(),
-                active = _associations.Count
-            });
-            return created;
-        }
-        catch
+        if (!_associations.TryAdd(peer, created))
         {
-            await localTransport.DisposeAsync().ConfigureAwait(false);
-            if (egressTransport is not null)
-                await egressTransport.DisposeAsync().ConfigureAwait(false);
-            throw;
+            await created.DisposeAsync().ConfigureAwait(false);
+            return _associations.TryGetValue(peer, out var winner) ? winner : null;
         }
+
+        _ = ObserveAssociationAsync(peer, created);
+        JsonLog.Info("overlay_udp_association_created", new {
+            peer = peer.ToString(),
+            active = _associations.Count
+        });
+        return created;
     }
 
     private async Task ObserveAssociationAsync(
@@ -228,12 +230,15 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
     private readonly IPEndPoint _peer;
     private readonly RouteSelector _selector;
     private readonly IProxyUdpTransport _localTransport;
-    private readonly IProxyUdpTransport _egressTransport;
+    private readonly IProxyUdpTransportFactory _egressFactory;
     private readonly TimeSpan _idleTimeout;
     private readonly Func<IPEndPoint, ProxyUdpDatagram, CancellationToken, ValueTask> _responseSender;
     private readonly CancellationTokenSource _stop;
-    private readonly Task[] _receiveLoops;
+    private readonly SemaphoreSlim _egressCreateLock = new(1, 1);
+    private readonly Task _localReceiveLoop;
     private readonly Task _idleMonitor;
+    private IProxyUdpTransport? _egressTransport;
+    private Task? _egressReceiveLoop;
     private long _lastActivity;
     private int _disposed;
 
@@ -241,7 +246,7 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
         IPEndPoint peer,
         RouteSelector selector,
         IProxyUdpTransport localTransport,
-        IProxyUdpTransport egressTransport,
+        IProxyUdpTransportFactory egressFactory,
         TimeSpan idleTimeout,
         Func<IPEndPoint, ProxyUdpDatagram, CancellationToken, ValueTask> responseSender,
         CancellationToken cancellationToken)
@@ -249,24 +254,19 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
         _peer = peer;
         _selector = selector;
         _localTransport = localTransport;
-        _egressTransport = egressTransport;
+        _egressFactory = egressFactory;
         _idleTimeout = idleTimeout;
         _responseSender = responseSender;
         _stop = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         _lastActivity = Environment.TickCount64;
 
-        _receiveLoops = [
-            RunGuardedAsync(
-                token => PumpResponsesAsync(_localTransport, "local", token),
-                "overlay_udp_local_response_failed"),
-            RunGuardedAsync(
-                token => PumpResponsesAsync(_egressTransport, "egress", token),
-                "overlay_udp_egress_response_failed")
-        ];
+        _localReceiveLoop = RunGuardedAsync(
+            token => PumpResponsesAsync(_localTransport, "local", token),
+            "overlay_udp_local_response_failed");
         _idleMonitor = RunGuardedAsync(
             IdleMonitorAsync,
             "overlay_udp_idle_monitor_failed");
-        Completion = Task.WhenAll(_receiveLoops.Append(_idleMonitor));
+        Completion = Task.WhenAll(_localReceiveLoop, _idleMonitor);
     }
 
     internal Task Completion { get; }
@@ -295,7 +295,9 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
                 break;
 
             case RouteKind.DirectEgress:
-                await _egressTransport.SendAsync(
+                var egressTransport = await GetEgressTransportAsync(
+                    cancellationToken).ConfigureAwait(false);
+                await egressTransport.SendAsync(
                     target,
                     payload,
                     cancellationToken).ConfigureAwait(false);
@@ -318,6 +320,39 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
         }
 
         Touch();
+    }
+
+    private async ValueTask<IProxyUdpTransport> GetEgressTransportAsync(
+        CancellationToken cancellationToken)
+    {
+        if (_egressTransport is { } existing)
+            return existing;
+
+        await _egressCreateLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (_egressTransport is { } current)
+                return current;
+
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken,
+                _stop.Token);
+            var created = await _egressFactory.CreateAsync(
+                linked.Token).ConfigureAwait(false);
+            _egressTransport = created;
+            _egressReceiveLoop = RunGuardedAsync(
+                token => PumpResponsesAsync(created, "egress", token),
+                "overlay_udp_egress_response_failed");
+
+            JsonLog.Info("overlay_udp_egress_created", new {
+                peer = _peer.ToString()
+            });
+            return created;
+        }
+        finally
+        {
+            _egressCreateLock.Release();
+        }
     }
 
     private async Task PumpResponsesAsync(
@@ -405,16 +440,28 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
 
         await _stop.CancelAsync().ConfigureAwait(false);
         await _localTransport.DisposeAsync().ConfigureAwait(false);
-        await _egressTransport.DisposeAsync().ConfigureAwait(false);
+
+        await _egressCreateLock.WaitAsync().ConfigureAwait(false);
+        var egressTransport = _egressTransport;
+        var egressReceiveLoop = _egressReceiveLoop;
+        _egressTransport = null;
+        _egressReceiveLoop = null;
+        _egressCreateLock.Release();
+
+        if (egressTransport is not null)
+            await egressTransport.DisposeAsync().ConfigureAwait(false);
 
         try
         {
             await Completion.ConfigureAwait(false);
+            if (egressReceiveLoop is not null)
+                await egressReceiveLoop.ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
         }
 
+        _egressCreateLock.Dispose();
         _stop.Dispose();
     }
 }
