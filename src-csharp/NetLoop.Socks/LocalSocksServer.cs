@@ -12,7 +12,10 @@ public sealed class LocalSocksServer : IAsyncDisposable
     private readonly CancellationTokenSource _stop = new();
     private readonly object _clientsGate = new();
     private readonly HashSet<Task> _clients = [];
+    private readonly HashSet<TcpClient> _activeClients = [];
     private Task? _loop;
+    private int _aborted;
+    private int _disposed;
 
     public LocalSocksServer(
         IPEndPoint listenEndPoint,
@@ -63,18 +66,20 @@ public sealed class LocalSocksServer : IAsyncDisposable
                 continue;
             }
 
-            TrackClient(HandleClientAsync(client, cancellationToken));
+            lock (_clientsGate)
+                _activeClients.Add(client);
+            TrackClient(HandleClientAsync(client, cancellationToken), client);
         }
     }
 
-    private void TrackClient(Task task)
+    private void TrackClient(Task task, TcpClient client)
     {
         lock (_clientsGate)
             _clients.Add(task);
-        _ = ObserveClientAsync(task);
+        _ = ObserveClientAsync(task, client);
     }
 
-    private async Task ObserveClientAsync(Task task)
+    private async Task ObserveClientAsync(Task task, TcpClient client)
     {
         try
         {
@@ -83,7 +88,10 @@ public sealed class LocalSocksServer : IAsyncDisposable
         finally
         {
             lock (_clientsGate)
+            {
                 _clients.Remove(task);
+                _activeClients.Remove(client);
+            }
         }
     }
 
@@ -109,10 +117,27 @@ public sealed class LocalSocksServer : IAsyncDisposable
         }
     }
 
+    public void Abort()
+    {
+        if (Interlocked.Exchange(ref _aborted, 1) != 0)
+            return;
+
+        _stop.Cancel();
+        _listener.Stop();
+
+        TcpClient[] activeClients;
+        lock (_clientsGate)
+            activeClients = [.. _activeClients];
+        foreach (var client in activeClients)
+            client.Dispose();
+    }
+
     public async ValueTask DisposeAsync()
     {
-        await _stop.CancelAsync().ConfigureAwait(false);
-        _listener.Stop();
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+
+        Abort();
 
         if (_loop is not null)
         {

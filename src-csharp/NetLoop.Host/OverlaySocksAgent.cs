@@ -12,7 +12,10 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
     private readonly CancellationTokenSource _stop = new();
     private readonly object _clientsGate = new();
     private readonly HashSet<Task> _clients = [];
+    private readonly HashSet<LibztTcpConnection> _activeClients = [];
     private readonly Task _loop;
+    private int _aborted;
+    private int _disposed;
 
     internal OverlaySocksAgent(
         string bindAddress,
@@ -55,18 +58,22 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
                 continue;
             }
 
-            TrackClient(HandleClientAsync(connection, cancellationToken));
+            lock (_clientsGate)
+                _activeClients.Add(connection);
+            TrackClient(HandleClientAsync(connection, cancellationToken), connection);
         }
     }
 
-    private void TrackClient(Task task)
+    private void TrackClient(Task task, LibztTcpConnection connection)
     {
         lock (_clientsGate)
             _clients.Add(task);
-        _ = ObserveClientAsync(task);
+        _ = ObserveClientAsync(task, connection);
     }
 
-    private async Task ObserveClientAsync(Task task)
+    private async Task ObserveClientAsync(
+        Task task,
+        LibztTcpConnection connection)
     {
         try
         {
@@ -75,7 +82,10 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
         finally
         {
             lock (_clientsGate)
+            {
                 _clients.Remove(task);
+                _activeClients.Remove(connection);
+            }
         }
     }
 
@@ -101,10 +111,27 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
         }
     }
 
+    internal void Abort()
+    {
+        if (Interlocked.Exchange(ref _aborted, 1) != 0)
+            return;
+
+        _stop.Cancel();
+        _ = _listener.DisposeAsync();
+
+        LibztTcpConnection[] activeClients;
+        lock (_clientsGate)
+            activeClients = [.. _activeClients];
+        foreach (var connection in activeClients)
+            _ = connection.DisposeAsync();
+    }
+
     public async ValueTask DisposeAsync()
     {
-        await _stop.CancelAsync().ConfigureAwait(false);
-        await _listener.DisposeAsync().ConfigureAwait(false);
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+
+        Abort();
 
         try
         {

@@ -15,6 +15,7 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
     private readonly OverlaySocksAgent _overlayAgent;
     private readonly OverlayUdpAgent _overlayUdpAgent;
     private readonly LocalSocksServer _localSocks;
+    private int _aborted;
     private int _disposed;
 
     private NetLoopRuntime(
@@ -137,21 +138,31 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
         }
     }
 
+    internal void Abort()
+    {
+        if (Interlocked.Exchange(ref _aborted, 1) != 0)
+            return;
+
+        _localSocks.Abort();
+        _overlayAgent.Abort();
+        _overlayUdpAgent.Abort();
+        _udpAssociationFactory.Abort();
+
+        JsonLog.Info("runtime_sessions_aborted", new {
+            node = State.NodeId.ToString("x10")
+        });
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
             return;
 
-        // Stop ingress first so no new sessions can appear while the old
-        // runtime is being discarded.
+        Abort();
         await _localSocks.DisposeAsync().ConfigureAwait(false);
         await _overlayAgent.DisposeAsync().ConfigureAwait(false);
         await _overlayUdpAgent.DisposeAsync().ConfigureAwait(false);
         await _udpAssociationFactory.DisposeAsync().ConfigureAwait(false);
-
-        JsonLog.Info("runtime_sessions_disposed", new {
-            node = State.NodeId.ToString("x10")
-        });
     }
 
     private static IProxyConnector BuildEgressConnector(HostOptions options)

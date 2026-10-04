@@ -16,6 +16,7 @@ internal sealed class OverlayUdpAgent : IAsyncDisposable
     private readonly ConcurrentDictionary<IPEndPoint, OverlayUdpAssociation> _associations = new();
     private readonly CancellationTokenSource _stop = new();
     private readonly Task _receiveLoop;
+    private int _aborted;
     private int _disposed;
 
     internal OverlayUdpAgent(
@@ -200,13 +201,24 @@ internal sealed class OverlayUdpAgent : IAsyncDisposable
         await _socket.SendToAsync(packet, peer, cancellationToken).ConfigureAwait(false);
     }
 
+    internal void Abort()
+    {
+        if (Interlocked.Exchange(ref _aborted, 1) != 0)
+            return;
+
+        _stop.Cancel();
+        _ = _socket.DisposeAsync();
+
+        foreach (var association in _associations.Values)
+            association.Abort();
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
             return;
 
-        await _stop.CancelAsync().ConfigureAwait(false);
-        await _socket.DisposeAsync().ConfigureAwait(false);
+        Abort();
 
         try
         {
@@ -240,6 +252,7 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
     private IProxyUdpTransport? _egressTransport;
     private Task? _egressReceiveLoop;
     private long _lastActivity;
+    private int _aborted;
     private int _disposed;
 
     internal OverlayUdpAssociation(
@@ -433,12 +446,39 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
     private void Touch()
         => Interlocked.Exchange(ref _lastActivity, Environment.TickCount64);
 
+    internal void Abort()
+    {
+        if (Interlocked.Exchange(ref _aborted, 1) != 0)
+            return;
+
+        _stop.Cancel();
+        _ = DisposeTransportNoThrowAsync(_localTransport);
+        if (_egressTransport is { } egressTransport)
+            _ = DisposeTransportNoThrowAsync(egressTransport);
+    }
+
+    private static async Task DisposeTransportNoThrowAsync(
+        IProxyUdpTransport transport)
+    {
+        try
+        {
+            await transport.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            JsonLog.Error("overlay_udp_abort_transport_failed", new {
+                error_type = ex.GetType().Name,
+                error = ex.Message
+            });
+        }
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
             return;
 
-        await _stop.CancelAsync().ConfigureAwait(false);
+        Abort();
         await _localTransport.DisposeAsync().ConfigureAwait(false);
 
         await _egressCreateLock.WaitAsync().ConfigureAwait(false);

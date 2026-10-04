@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Collections.Concurrent;
 using NetLoop.Core;
 
 namespace NetLoop.Socks;
@@ -24,6 +25,7 @@ public sealed class Socks5UdpAssociationFactory : ISocks5UdpAssociationFactory, 
     private readonly IProxyUdpTransportFactory _transportFactory;
     private readonly TimeSpan _idleTimeout;
     private readonly SemaphoreSlim _capacity;
+    private readonly ConcurrentDictionary<Socks5UdpAssociation, byte> _active = new();
     private int _disposed;
 
     public Socks5UdpAssociationFactory(
@@ -67,7 +69,7 @@ public sealed class Socks5UdpAssociationFactory : ISocks5UdpAssociationFactory, 
                 declaredClientEndpoint,
                 controlRemote);
 
-            return new Socks5UdpAssociation(
+            var association = new Socks5UdpAssociation(
                 relay,
                 transport,
                 controlRemote,
@@ -75,6 +77,9 @@ public sealed class Socks5UdpAssociationFactory : ISocks5UdpAssociationFactory, 
                 _idleTimeout,
                 cancellationToken,
                 () => _capacity.Release());
+            _active.TryAdd(association, 0);
+            _ = ObserveAssociationAsync(association);
+            return association;
         }
         catch
         {
@@ -84,6 +89,24 @@ public sealed class Socks5UdpAssociationFactory : ISocks5UdpAssociationFactory, 
             _capacity.Release();
             throw;
         }
+    }
+
+    private async Task ObserveAssociationAsync(Socks5UdpAssociation association)
+    {
+        try
+        {
+            await association.Completion.ConfigureAwait(false);
+        }
+        finally
+        {
+            _active.TryRemove(association, out _);
+        }
+    }
+
+    public void Abort()
+    {
+        foreach (var association in _active.Keys)
+            association.Abort();
     }
 
     private static IPEndPoint? GetExpectedClientUdpEndpoint(
@@ -126,6 +149,7 @@ internal sealed class Socks5UdpAssociation : ISocks5UdpAssociation
     private readonly Task _idleMonitor;
     private IPEndPoint? _clientUdpEndpoint;
     private long _lastActivity;
+    private int _aborted;
     private int _disposed;
 
     internal Socks5UdpAssociation(
@@ -282,13 +306,37 @@ internal sealed class Socks5UdpAssociation : ISocks5UdpAssociation
     private void Touch()
         => Interlocked.Exchange(ref _lastActivity, Environment.TickCount64);
 
+    internal void Abort()
+    {
+        if (Interlocked.Exchange(ref _aborted, 1) != 0)
+            return;
+
+        _stop.Cancel();
+        _relay.Dispose();
+        _ = DisposeTransportNoThrowAsync();
+    }
+
+    private async Task DisposeTransportNoThrowAsync()
+    {
+        try
+        {
+            await _transport.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            JsonLog.Error("socks_udp_abort_transport_failed", new {
+                error_type = ex.GetType().Name,
+                error = ex.Message
+            });
+        }
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
             return;
 
-        await _stop.CancelAsync().ConfigureAwait(false);
-        _relay.Dispose();
+        Abort();
         await _transport.DisposeAsync().ConfigureAwait(false);
 
         try

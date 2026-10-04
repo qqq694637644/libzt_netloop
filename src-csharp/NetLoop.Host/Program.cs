@@ -71,6 +71,7 @@ internal static class Program
             var runtime = await NetLoopRuntime.CreateAsync(
                 options,
                 state).ConfigureAwait(false);
+            var runtimeAborted = false;
             var resetRequested = new TaskCompletionSource<string>(
                 TaskCreationOptions.RunContinuationsAsynchronously);
             var resetMonitor = new RuntimeResetMonitor(
@@ -151,10 +152,13 @@ internal static class Program
                     process_id = Environment.ProcessId
                 });
 
-                // Stop accepting traffic and wait until every active managed
-                // session from the old runtime is gone.
+                // Network reset is an abort, not a graceful drain. Close every
+                // old socket immediately and do not wait for old handlers or
+                // TCP half-close semantics before refreshing the transport.
                 await resetMonitor.DisposeAsync().ConfigureAwait(false);
-                await runtime.DisposeAsync().ConfigureAwait(false);
+                runtime.Abort();
+                runtimeAborted = true;
+                _ = DisposeDiscardedRuntimeAsync(runtime);
 
                 // Keep the ZeroTier node/identity/network alive. Tell the
                 // service that the host physical network changed so it
@@ -172,11 +176,27 @@ internal static class Program
             finally
             {
                 await resetMonitor.DisposeAsync().ConfigureAwait(false);
-                await runtime.DisposeAsync().ConfigureAwait(false);
+                if (!runtimeAborted)
+                    await runtime.DisposeAsync().ConfigureAwait(false);
             }
         }
 
         return 0;
+    }
+
+    private static async Task DisposeDiscardedRuntimeAsync(NetLoopRuntime runtime)
+    {
+        try
+        {
+            await runtime.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            JsonLog.Error("runtime_background_dispose_failed", new {
+                error_type = ex.GetType().Name,
+                error = ex.Message
+            });
+        }
     }
 
     private static Task WriteReadyStatusAsync(
