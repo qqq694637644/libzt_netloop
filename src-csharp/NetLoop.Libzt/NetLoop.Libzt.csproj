@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>NetLoop.Libzt</AssemblyName>
+    <RootNamespace>NetLoop.Libzt</RootNamespace>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../NetLoop.Core/NetLoop.Core.csproj" />
+  </ItemGroup>
+</Project>

@@ -14,9 +14,16 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<$<CONFIG:Debug,RelWithDebInfo>:Embedded>")
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set(NETLOOP_VERSION "0.1.0" CACHE STRING "libzt_netloop version")
+option(NETLOOP_CSHARP_NATIVE "Build only the shared libzt P/Invoke runtime used by the C# rewrite" OFF)
 
-set(BUILD_STATIC_LIB ON CACHE BOOL "" FORCE)
-set(BUILD_SHARED_LIB OFF CACHE BOOL "" FORCE)
+if(NETLOOP_CSHARP_NATIVE)
+    set(ZTS_ENABLE_PINVOKE ON CACHE BOOL "" FORCE)
+    set(BUILD_STATIC_LIB OFF CACHE BOOL "" FORCE)
+    set(BUILD_SHARED_LIB ON CACHE BOOL "" FORCE)
+else()
+    set(BUILD_STATIC_LIB ON CACHE BOOL "" FORCE)
+    set(BUILD_SHARED_LIB OFF CACHE BOOL "" FORCE)
+endif()
 set(BUILD_HOST_SELFTEST OFF CACHE BOOL "" FORCE)
 set(BUILD_HOST_SELFTEST_ONLY OFF CACHE BOOL "" FORCE)
 set(BUILD_HOST_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -49,10 +56,26 @@ endif()
 # their transitive link interface. Use SDK library names so MSVC resolves them
 # from the active Windows SDK selected by the runner/developer environment.
 if(MSVC)
-    set_property(
-        TARGET zt-static
-        PROPERTY INTERFACE_LINK_LIBRARIES "ws2_32;Shlwapi;iphlpapi"
-    )
+    if(TARGET zt-static)
+        set_property(
+            TARGET zt-static
+            PROPERTY INTERFACE_LINK_LIBRARIES "ws2_32;Shlwapi;iphlpapi"
+        )
+    endif()
+    if(TARGET zt-shared)
+        # libzt's pinned CMake still bakes an obsolete Windows SDK directory
+        # into the shared target. Resolve SDK libraries through the active
+        # VS/Windows SDK environment, the same way the proven static build does.
+        set_property(
+            TARGET zt-shared
+            PROPERTY LINK_LIBRARIES
+                "ws2_32;Shlwapi;iphlpapi;zt_pic;lwip_pic;zto_pic;natpmp_pic;miniupnpc_pic"
+        )
+    endif()
+endif()
+
+if(NETLOOP_CSHARP_NATIVE)
+    return()
 endif()
 
 add_library(netloop_common STATIC

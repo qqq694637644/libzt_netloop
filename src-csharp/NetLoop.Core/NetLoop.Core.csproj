@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>NetLoop.Core</AssemblyName>
+    <RootNamespace>NetLoop.Core</RootNamespace>
+  </PropertyGroup>
+</Project>

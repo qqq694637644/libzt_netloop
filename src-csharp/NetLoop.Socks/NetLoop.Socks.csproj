@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>NetLoop.Socks</AssemblyName>
+    <RootNamespace>NetLoop.Socks</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../NetLoop.Core/NetLoop.Core.csproj" />
+  </ItemGroup>
+</Project>

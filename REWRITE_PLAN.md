@@ -210,7 +210,9 @@ C# 不重新实现 libzt，只建立薄封装层：
 
 ## 10. 跨平台 Native 打包
 
-最低目标平台：Windows x64、Linux x64、Linux arm64、Android arm64。Android x86_64 可作为模拟器开发支持。
+最低目标平台：Windows x64、Linux x64、Linux arm64、Android arm64-v8a。
+
+Android 第一版**只支持 arm64-v8a**，不构建、不发布、也不承诺 x86/x86_64/armeabi-v7a。
 
 固定一个 libzt commit，由 CI 构建各平台原生库，禁止开发机手工拷贝未知版本二进制。
 
@@ -391,7 +393,7 @@ Windows 错误同时记录数值错误码；文本日志统一 UTF-8。
 - Hard Recovery。
 - restart-storm protection。
 
-切网测试至少覆盖 Wi-Fi A -> Wi-Fi B、Wi-Fi -> 手机热点、Android Wi-Fi -> Cellular、Linux interface down/up、默认路由变化和连续快速抖动。
+自动测试阶段使用确定性故障注入覆盖 transport generation 变化、peer 暂时不可达、进程/libzt 重启和连续 recovery。真实 Wi-Fi A -> Wi-Fi B、Wi-Fi -> 手机热点、Android Wi-Fi -> Cellular 等物理切网测试暂缓，不作为当前 CI 或第一阶段交付阻塞项。
 
 每次记录 OS event、epoch 更新、旧 tunnel 关闭、fresh connect、第一次 SOCKS 成功、RELAY/DIRECT 变化的时间点。
 
@@ -414,6 +416,8 @@ UDP：UDP ASSOCIATE 建立/关闭、peer 本机 UDP、default_exit UDP、多 ass
 Mobility：切网时旧 TCP 立即关闭、新 TCP fresh socket 恢复、UDP association 保持但底层 transport 换代、RELAY 可用时不等待 DIRECT、Soft Recovery 失败自动 Hard Recovery、任何一端都不需要人工重启、多次切网不积累 zombie socket/thread/task。
 
 Identity：restart 后 Node ID 和 Managed IP 不变，Hard Recovery 不删除 identity 和 network membership。
+
+当前自动 E2E 范围只做 **Windows x64 <-> Windows x64**，且两个节点必须运行在两个独立 GitHub-hosted runner 上。Linux/Android runtime E2E 暂不作为当前 gate。
 
 ## 20. 从当前 C++ 版本迁移
 
@@ -453,3 +457,62 @@ Identity：restart 后 Node ID 和 Managed IP 不变，Hard Recovery 不删除 i
 8. 不访问远端 LAN，因此不引入 CIDR 路由系统。
 9. 平台差异限制在 Native/Host 层。
 10. 个人使用优先：简单、可诊断、可恢复，比企业级抽象更重要。
+
+## 23. 已冻结的实现决策
+
+以下决策已经确认，后续实现和 CI 以此为准，不再把它们当作开放问题。
+
+### 23.1 Toolchain 与原生基线
+
+- .NET SDK 固定为 `10.0.401`，通过根目录 `global.json` 严格锁定，不随 runner 漂移。
+- C# Target Framework 为 `net10.0`。
+- libzt ABI/行为基线固定为仓库 submodule commit `a707ea6ae0910efdc1125d04758c411e2e9ea4f9`。
+- C# 使用该 commit 已提供的 `ZTS_ENABLE_PINVOKE` shared-library wrapper ABI，只在 `NetLoop.Libzt` 建立 NetLoop 所需的薄封装，不复制整套历史 SWIG managed wrapper。
+- C# 直接兼容当前 C++ 使用的 `state_dir`，必须复用已有 identity、network membership 和 Node ID。继续沿用当前 C++ 的 mobility 策略：保留 identity/network state，启动前清理 `peers.d` 并禁用 peer cache。
+
+### 23.2 Overlay 路由
+
+- 只把当前 ZeroTier network 的**直接 Managed Route**视为 overlay 地址空间。
+- 带 gateway/`via` 的 managed route 不作为 NetLoop overlay peer 路由；NetLoop 第一版不访问远端 LAN。
+- Phase 0 已验证固定 libzt 的 `zts_core_query_route()`：它能返回 target/via，但当前实现只把 route target 转成裸 IP 字符串，不返回 prefix/netmask，因此无法可靠用 managed route 判断任意目标 IP 是否属于 overlay CIDR。第一版据此启用已批准的 fallback：使用**显式 peer Managed-IP 列表**，并把 `default_exit` 自动加入 peer 集合；禁止根据缺失的 CIDR 信息猜测。route query 仍用于诊断 direct/via，不作为地址空间归属的唯一判据。
+- 本机 Managed IP -> 本机 loopback。
+- 其他 overlay Managed IP -> 直接连接该 peer Agent。
+- Overlay Agent 收到请求后是最终处理节点：本机 Managed IP 访问 loopback；非 overlay 目标执行本机 egress；**不得再次转发给第三个 NetLoop 节点**。
+- 对某个 overlay Managed IP 的 Agent 连接失败时明确失败，不改走 `default_exit`。
+- `default_exit` 不可达时 fail closed，不自动 DIRECT。
+
+### 23.3 SOCKS5 与 Egress
+
+- 节点间 TCP 控制协议第一版使用标准 SOCKS5 CONNECT，不引入额外 tunnel protocol。
+- DOMAIN 尽量保持到最终出口解析，避免入口侧 DNS 泄漏。
+- `UPSTREAM_SOCKS5` 支持 no-auth 和 username/password。
+- upstream TCP 使用 CONNECT。
+- upstream UDP 必须使用 UDP ASSOCIATE；若 upstream 不支持 UDP，明确失败，禁止回退 DIRECT。
+- Phase 0 对 `VpnHood.Core.Proxies 8.1.851` 的验证结论：其 SOCKS5 server 已具备 CONNECT、UDP ASSOCIATE、source validation、bounded state、half-close 等成熟行为，但 server 出站路径直接创建 `TcpClient/UdpClient`，没有可注入 libzt transport 的接口。因此 NetLoop 不直接套用 server；TCP 先实现最小标准 CONNECT adapter，UDP Phase 复用/抽取其成熟 association、validation、timeout/cancellation 语义并接入 NetLoop transport abstraction。
+
+### 23.4 Recovery
+
+- 继续继承当前 C++ 已验证的 fresh zts socket、TCP_NODELAY、keepalive、half-close 和 backpressure 语义。
+- Hard Recovery 首先尝试同进程 `stop -> start -> join`。
+- 如果 native libzt 无法在限定窗口内可靠恢复，允许自动重启整个 NetLoop 进程作为最终保险；必须复用同一 `state_dir`，不得删除 identity/network membership。
+- 当前自动验收中：常规 recovery 做 20 次确定性故障注入，要求 p95 <= 3 秒；强制 Hard Recovery 做 10 次，要求 p95 <= 5 秒；任何一次需要人工干预即失败。
+- recovery stress 目标为 100 轮后 active tunnel/association/native-socket 计数回到基线，不允许持续积累 zombie 资源。
+
+### 23.5 第一版容量
+
+- 至少支持 128 个并发 TCP tunnel。
+- 至少支持 64 个并发 UDP association。
+
+### 23.6 GitHub CI / E2E
+
+- 编译结果以 GitHub Actions 为权威；本地构建仅用于开发便利，不替代 CI。
+- 自动 E2E 使用 GitHub-hosted runner，并且每个节点必须位于独立 runner；禁止在一个 runner 上启动多个进程冒充跨机测试。
+- 当前完整 E2E 只做 Windows x64 <-> Windows x64。
+- 普通 push/PR/fork CI 继续使用无 secret 的 controller-less ZeroTier ad-hoc network。
+- 暂不建设需要 ZeroTier controller/私有 network secret 的 trusted E2E。
+- 暂不把真实 Wi-Fi/热点/蜂窝物理切网纳入自动或人工 release gate。
+- Build job 只构建一次，E2E jobs 只下载同一不可变 artifact，不重新编译。
+- workflow 使用 `concurrency` + `cancel-in-progress: true` 取消同一 branch/PR 的过时 run。
+- native libzt 使用 Ninja + sccache；同时缓存按 libzt commit + OS/arch + toolchain/build-input hash 生成的 native bundle。native bundle cache 命中时不递归拉取 native submodules、不重新配置/编译 libzt。
+- NuGet 有实际外部依赖后使用 lock file 和 `setup-dotnet` dependency cache；不为了“看起来有缓存”去缓存无依赖 restore 或整个 `bin/obj`。
+- 每次 CI 输出 native cache hit/miss、sccache hit/miss 和主要阶段耗时，用数据判断优化是否有效。

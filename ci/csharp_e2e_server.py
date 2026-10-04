@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import sys
+import traceback
+
+from common import (
+    ROOT,
+    collect_windows_evidence,
+    kill_process_tree,
+    public_ip,
+    start_detached,
+    wait_for_json,
+    wait_for_tcp,
+)
+from github_artifacts import wait_and_download
+
+
+EVIDENCE = ROOT / "evidence" / "csharp-server"
+PIDS = EVIDENCE / "pids.json"
+
+
+def adhoc_network_id(port: int) -> str:
+    return f"ff{port:04x}{port:04x}000000"
+
+
+def prepare(args: argparse.Namespace) -> int:
+    EVIDENCE.mkdir(parents=True, exist_ok=True)
+    runtime = Path(args.runtime).resolve()
+    executable = runtime / "netloop.exe"
+    if not executable.exists():
+        raise FileNotFoundError(executable)
+
+    network_id = adhoc_network_id(args.overlay_port)
+    status_path = EVIDENCE / "server_status.json"
+    state_dir = ROOT / "state" / "csharp-ci-server"
+
+    http_pid = start_detached(
+        [
+            sys.executable,
+            "-m",
+            "http.server",
+            str(args.local_service_port),
+            "--bind",
+            "127.0.0.1",
+        ],
+        EVIDENCE / "local_service.log",
+    )
+
+    netloop_pid = 0
+    try:
+        wait_for_tcp("127.0.0.1", args.local_service_port, timeout=20)
+        expected_ip = public_ip()
+        (EVIDENCE / "expected_public_ip.txt").write_text(
+            expected_ip + "\n", encoding="utf-8"
+        )
+
+        netloop_pid = start_detached(
+            [
+                str(executable),
+                "--network",
+                network_id,
+                "--state-dir",
+                str(state_dir),
+                "--socks-host",
+                "127.0.0.1",
+                "--socks-port",
+                str(args.socks_port),
+                "--overlay-port",
+                str(args.overlay_port),
+                "--egress",
+                "direct",
+                "--status-file",
+                str(status_path),
+                "--startup-timeout",
+                "180",
+                "--connect-timeout",
+                "20",
+            ],
+            EVIDENCE / "netloop_process.log",
+        )
+
+        PIDS.write_text(
+            json.dumps(
+                {"netloop_pid": netloop_pid, "http_pid": http_pid},
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        status = wait_for_json(status_path, timeout=200)
+        server_ip = status.get("overlay_host")
+        if not server_ip:
+            raise RuntimeError(f"server did not publish overlay_host: {status}")
+
+        rendezvous = {
+            "network_id": network_id,
+            "server_ip": server_ip,
+            "server_node_id": status.get("node_id"),
+            "overlay_port": args.overlay_port,
+            "local_service_port": args.local_service_port,
+            "expected_public_ip": expected_ip,
+            "github_run_id": os.environ.get("GITHUB_RUN_ID", ""),
+            "github_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
+        }
+        rendezvous_path = EVIDENCE / "rendezvous.json"
+        rendezvous_path.write_text(
+            json.dumps(rendezvous, indent=2), encoding="utf-8"
+        )
+        print(json.dumps(rendezvous, indent=2))
+        return 0
+    except Exception:
+        kill_process_tree(netloop_pid)
+        kill_process_tree(http_pid)
+        raise
+
+
+def hold(args: argparse.Namespace) -> int:
+    result_dir = EVIDENCE / "client_result"
+    exit_code = 1
+    try:
+        wait_and_download(args.client_artifact, result_dir, timeout=args.timeout)
+        result_files = list(result_dir.rglob("result.json"))
+        if not result_files:
+            raise FileNotFoundError("client result artifact did not contain result.json")
+        result = json.loads(result_files[0].read_text(encoding="utf-8"))
+        (EVIDENCE / "observed_client_result.json").write_text(
+            json.dumps(result, indent=2), encoding="utf-8"
+        )
+        exit_code = 0 if result.get("success") else 1
+        print(json.dumps(result, indent=2))
+    finally:
+        collect_windows_evidence(EVIDENCE / "network")
+        if PIDS.exists():
+            pids = json.loads(PIDS.read_text(encoding="utf-8"))
+            kill_process_tree(int(pids.get("netloop_pid", 0)))
+            kill_process_tree(int(pids.get("http_pid", 0)))
+    return exit_code
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    prep = subparsers.add_parser("prepare")
+    prep.add_argument("--runtime", default="runtime-csharp")
+    prep.add_argument("--overlay-port", type=int, default=42042)
+    prep.add_argument("--socks-port", type=int, default=18080)
+    prep.add_argument("--local-service-port", type=int, default=18181)
+
+    wait = subparsers.add_parser("hold")
+    wait.add_argument("--client-artifact", required=True)
+    wait.add_argument("--timeout", type=float, default=600)
+
+    args = parser.parse_args()
+    try:
+        return prepare(args) if args.command == "prepare" else hold(args)
+    except Exception:
+        EVIDENCE.mkdir(parents=True, exist_ok=True)
+        (EVIDENCE / f"{args.command}_failure.txt").write_text(
+            traceback.format_exc(), encoding="utf-8"
+        )
+        collect_windows_evidence(EVIDENCE / "network_failure")
+        if args.command == "prepare" and PIDS.exists():
+            pids = json.loads(PIDS.read_text(encoding="utf-8"))
+            kill_process_tree(int(pids.get("netloop_pid", 0)))
+            kill_process_tree(int(pids.get("http_pid", 0)))
+        print(traceback.format_exc(), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

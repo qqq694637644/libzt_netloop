@@ -1,0 +1,109 @@
+using System.Net;
+using System.Net.Sockets;
+using NetLoop.Core;
+
+namespace NetLoop.Socks;
+
+public sealed class LocalSocksServer : IAsyncDisposable
+{
+    private readonly TcpListener _listener;
+    private readonly Socks5ConnectionHandler _handler;
+    private readonly SemaphoreSlim _capacity;
+    private readonly CancellationTokenSource _stop = new();
+    private Task? _loop;
+
+    public LocalSocksServer(
+        IPEndPoint listenEndPoint,
+        Socks5ConnectionHandler handler,
+        int maxConnections)
+    {
+        if (maxConnections <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maxConnections));
+
+        _listener = new TcpListener(listenEndPoint);
+        _handler = handler;
+        _capacity = new SemaphoreSlim(maxConnections, maxConnections);
+    }
+
+    public IPEndPoint EndPoint => (IPEndPoint)_listener.LocalEndpoint;
+
+    public void Start()
+    {
+        if (_loop is not null)
+            throw new InvalidOperationException("SOCKS5 server is already started.");
+
+        _listener.Start(512);
+        JsonLog.Info("local_socks_ready", new { endpoint = EndPoint.ToString() });
+        _loop = AcceptLoopAsync(_stop.Token);
+    }
+
+    private async Task AcceptLoopAsync(CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            TcpClient client;
+            try
+            {
+                client = await _listener.AcceptTcpClientAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (ObjectDisposedException)
+            {
+                break;
+            }
+
+            if (!await _capacity.WaitAsync(0, cancellationToken).ConfigureAwait(false))
+            {
+                client.Dispose();
+                continue;
+            }
+
+            _ = HandleClientAsync(client, cancellationToken);
+        }
+    }
+
+    private async Task HandleClientAsync(TcpClient client, CancellationToken cancellationToken)
+    {
+        await using var connection = new SystemTcpConnection(
+            client,
+            $"local:{client.Client.RemoteEndPoint}");
+        try
+        {
+            await _handler.HandleAsync(connection, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            JsonLog.Error("local_socks_client_failed", new { error = ex.Message });
+        }
+        finally
+        {
+            _capacity.Release();
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await _stop.CancelAsync().ConfigureAwait(false);
+        _listener.Stop();
+
+        if (_loop is not null)
+        {
+            try
+            {
+                await _loop.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
+
+        _stop.Dispose();
+        _capacity.Dispose();
+    }
+}
