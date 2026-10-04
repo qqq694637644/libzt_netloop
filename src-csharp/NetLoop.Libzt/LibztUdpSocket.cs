@@ -149,7 +149,7 @@ public sealed class LibztUdpSocket : IAsyncDisposable
             if (received < 0)
             {
                 var errno = LibztNative.GetErrno();
-                if (errno == LibztNative.EAgain)
+                if (IsTransientReceiveError(errno))
                     return null;
 
                 if (cancellationToken.IsCancellationRequested)
@@ -191,6 +191,12 @@ public sealed class LibztUdpSocket : IAsyncDisposable
             payloadHandle.Free();
         }
     }
+
+    private static bool IsTransientReceiveError(int errno)
+        => errno is LibztNative.EAgain
+            or LibztNative.ETimedOut
+            or LibztNative.WindowsETimedOut
+            or LibztNative.WindowsEWouldBlock;
 
     public ValueTask DisposeAsync()
     {

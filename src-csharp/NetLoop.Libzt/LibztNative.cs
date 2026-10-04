@@ -32,6 +32,11 @@ internal static class LibztNative
     internal const int NetworkStatusPortError = 4;
     internal const int NetworkStatusClientTooOld = 5;
     internal const int EAgain = 11;
+    internal const int ETimedOut = 110;
+    // The pinned Windows libzt/lwIP build uses UCRT errno values for
+    // SO_RCVTIMEO. Keep these explicit until the native ABI is normalized.
+    internal const int WindowsETimedOut = 138;
+    internal const int WindowsEWouldBlock = 140;
 
     internal const int IpStringLength = 46;
 
