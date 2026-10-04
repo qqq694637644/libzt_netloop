@@ -25,6 +25,11 @@ public sealed class LibztNode : IAsyncDisposable
 
     public LibztNetworkState? State { get; private set; }
 
+    public bool IsTransportReady
+        => _started
+           && LibztNative.NodeIsOnline() == 1
+           && LibztNative.NetTransportIsReady(_networkId) == 1;
+
     public async Task<LibztNetworkState> StartAsync(CancellationToken cancellationToken)
     {
         if (_freed)

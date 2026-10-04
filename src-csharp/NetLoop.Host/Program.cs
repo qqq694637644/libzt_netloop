@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using NetLoop.Core;
 using NetLoop.Libzt;
@@ -9,6 +10,8 @@ internal static class Program
 {
     private const int MaxTcpTunnels = 128;
     private const int MaxUdpAssociations = 64;
+    private const int MaxAutomaticProcessRestarts = 3;
+    private const string ProcessRestartCountEnvironment = "NETLOOP_PROCESS_RESTART_COUNT";
     private static readonly TimeSpan HalfCloseTimeout = TimeSpan.FromSeconds(15);
 
     internal static async Task<int> Main(string[] args)
@@ -28,12 +31,33 @@ internal static class Program
                 return 0;
             }
 
-            using var shutdown = new CancellationTokenSource();
-            Console.CancelKeyPress += (_, eventArgs) => {
-                eventArgs.Cancel = true;
-                shutdown.Cancel();
-            };
+            var restart = await RunNodeAsync(options).ConfigureAwait(false);
+            return restart is null ? 0 : StartReplacementProcess(args, restart);
+        }
+        catch (Exception ex)
+        {
+            JsonLog.Error("fatal", new {
+                error_type = ex.GetType().FullName,
+                error = ex.Message,
+                stack = ex.StackTrace
+            });
+            return 1;
+        }
+    }
 
+    private static async Task<ProcessRestartRequest?> RunNodeAsync(HostOptions options)
+    {
+        using var shutdown = new CancellationTokenSource();
+        var restartRequested = new TaskCompletionSource<ProcessRestartRequest>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        ConsoleCancelEventHandler cancelHandler = (_, eventArgs) => {
+            eventArgs.Cancel = true;
+            shutdown.Cancel();
+        };
+        Console.CancelKeyPress += cancelHandler;
+
+        try
+        {
             await using var node = new LibztNode(
                 options.NetworkId,
                 options.StateDirectory,
@@ -56,14 +80,13 @@ internal static class Program
                 options.ConnectTimeout);
             var loopbackConnector = new LoopbackTcpConnector(options.ConnectTimeout);
             IProxyConnector egressConnector = BuildEgressConnector(options);
-            var overlayBind = SelectOverlayBindAddress(state.ManagedAddresses);
             var udpEgressFactory = BuildUdpEgressFactory(options);
             var routingUdpFactory = new RoutingUdpTransportFactory(
                 selector,
                 generations,
                 options.OverlayUdpPort,
                 udpEgressFactory);
-            var udpAssociationFactory = new Socks5UdpAssociationFactory(
+            await using var udpAssociationFactory = new Socks5UdpAssociationFactory(
                 routingUdpFactory,
                 MaxUdpAssociations,
                 options.UdpIdleTimeout);
@@ -75,27 +98,21 @@ internal static class Program
                 libztConnector,
                 loopbackConnector,
                 egressConnector);
-            var overlayRouter = new RoutingConnector(
+
+            await using var overlayRuntime = new OverlayRuntimeController(
+                options,
                 selector,
-                overlayIngress: true,
-                options.OverlayPort,
                 libztConnector,
                 loopbackConnector,
-                egressConnector);
-
-            await using var overlayAgent = new OverlaySocksAgent(
-                overlayBind.ToString(),
-                options.OverlayPort,
-                new Socks5ConnectionHandler(overlayRouter, HalfCloseTimeout),
-                generations,
-                MaxTcpTunnels);
-            await using var overlayUdpAgent = new OverlayUdpAgent(
-                overlayBind,
-                options.OverlayUdpPort,
-                selector,
+                egressConnector,
                 udpEgressFactory,
-                MaxUdpAssociations,
-                options.UdpIdleTimeout);
+                generations,
+                HalfCloseTimeout,
+                MaxTcpTunnels,
+                MaxUdpAssociations);
+            await overlayRuntime.StartAsync(
+                state,
+                shutdown.Token).ConfigureAwait(false);
 
             await using var localSocks = new LocalSocksServer(
                 new IPEndPoint(options.SocksAddress, options.SocksPort),
@@ -106,6 +123,21 @@ internal static class Program
                 MaxTcpTunnels);
             localSocks.Start();
 
+            await using var recovery = new RecoveryCoordinator(
+                options,
+                node,
+                generations,
+                overlayRuntime,
+                peers,
+                (reason, exception) => restartRequested.TrySetResult(
+                    new ProcessRestartRequest(reason, exception.Message)));
+            libztConnector.RecoveryObserver = recovery;
+            await recovery.StartAsync(shutdown.Token).ConfigureAwait(false);
+            await using var recoveryCommands = new RecoveryCommandWatcher(
+                options.RecoveryCommandFile,
+                recovery);
+
+            var overlayBind = OverlayGenerationManager.SelectBindAddress(state);
             await StatusWriter.WriteAsync(
                 options.StatusFile,
                 new {
@@ -120,7 +152,9 @@ internal static class Program
                     socks_port = options.SocksPort,
                     peers = peers.Select(static x => x.ToString()).Order().ToArray(),
                     default_exit = options.DefaultExit?.ToString(),
-                    egress = options.Egress
+                    egress = options.Egress,
+                    epoch = generations.CurrentEpoch,
+                    process_id = Environment.ProcessId
                 },
                 shutdown.Token).ConfigureAwait(false);
 
@@ -129,27 +163,38 @@ internal static class Program
                 node = state.NodeId.ToString("x10"),
                 overlay = $"{overlayBind}:{options.OverlayPort}",
                 overlay_udp = $"{overlayBind}:{options.OverlayUdpPort}",
-                socks = $"{options.SocksAddress}:{options.SocksPort}"
+                socks = $"{options.SocksAddress}:{options.SocksPort}",
+                epoch = generations.CurrentEpoch,
+                process_id = Environment.ProcessId
             });
+
+            var shutdownTask = WaitForCancellationAsync(shutdown.Token);
+            var completed = await Task.WhenAny(
+                shutdownTask,
+                restartRequested.Task).ConfigureAwait(false);
+            if (ReferenceEquals(completed, restartRequested.Task))
+            {
+                var restart = await restartRequested.Task.ConfigureAwait(false);
+                JsonLog.Error("process_restart_requested", new {
+                    restart.Reason,
+                    restart.Error,
+                    process_id = Environment.ProcessId
+                });
+                return restart;
+            }
 
             try
             {
-                await Task.Delay(Timeout.InfiniteTimeSpan, shutdown.Token).ConfigureAwait(false);
+                await shutdownTask.ConfigureAwait(false);
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (shutdown.IsCancellationRequested)
             {
             }
-
-            return 0;
+            return null;
         }
-        catch (Exception ex)
+        finally
         {
-            JsonLog.Error("fatal", new {
-                error_type = ex.GetType().FullName,
-                error = ex.Message,
-                stack = ex.StackTrace
-            });
-            return 1;
+            Console.CancelKeyPress -= cancelHandler;
         }
     }
 
@@ -183,13 +228,59 @@ internal static class Program
             options.UpstreamPassword);
     }
 
-    private static IPAddress SelectOverlayBindAddress(IReadOnlyList<IPAddress> addresses)
+    private static async Task WaitForCancellationAsync(CancellationToken cancellationToken)
     {
-        if (addresses.Count == 0)
-            throw new InvalidOperationException("ZeroTier network has no Managed IP.");
-
-        return addresses.FirstOrDefault(static x => x.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
-            ?? addresses[0];
+        await Task.Delay(
+            Timeout.InfiniteTimeSpan,
+            cancellationToken).ConfigureAwait(false);
     }
+
+    private static int StartReplacementProcess(
+        string[] args,
+        ProcessRestartRequest restart)
+    {
+        var currentCount = int.TryParse(
+            Environment.GetEnvironmentVariable(ProcessRestartCountEnvironment),
+            out var parsed)
+            ? parsed
+            : 0;
+        if (currentCount >= MaxAutomaticProcessRestarts)
+        {
+            JsonLog.Error("process_restart_limit_reached", new {
+                restart.Reason,
+                restart.Error,
+                restart_count = currentCount,
+                limit = MaxAutomaticProcessRestarts
+            });
+            return 1;
+        }
+
+        var executable = Environment.ProcessPath
+            ?? throw new InvalidOperationException(
+                "Unable to resolve current executable for automatic restart.");
+        var startInfo = new ProcessStartInfo(executable) {
+            UseShellExecute = false,
+            WorkingDirectory = Environment.CurrentDirectory
+        };
+        foreach (var argument in args)
+            startInfo.ArgumentList.Add(argument);
+        startInfo.Environment[ProcessRestartCountEnvironment] =
+            (currentCount + 1).ToString(
+                System.Globalization.CultureInfo.InvariantCulture);
+
+        var process = Process.Start(startInfo)
+            ?? throw new InvalidOperationException(
+                "Failed to start replacement NetLoop process.");
+        JsonLog.Info("process_restart_spawned", new {
+            old_process_id = Environment.ProcessId,
+            new_process_id = process.Id,
+            restart_count = currentCount + 1,
+            restart.Reason
+        });
+        process.Dispose();
+        return 0;
+    }
+
+    private sealed record ProcessRestartRequest(string Reason, string Error);
 
 }
