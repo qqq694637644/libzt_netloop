@@ -118,14 +118,40 @@ public sealed class LibztNode : IAsyncDisposable
         });
         ThrowIfError("zts_net_join", LibztNative.NetJoin(_networkId));
 
-        while (LibztNative.NetTransportIsReady(_networkId) != 1)
+        // NodeService::networkIsReady() is backed by cached assigned-address
+        // state, which can survive briefly across node stop/start. A single
+        // ready=true immediately after NetJoin can therefore belong to the old
+        // service generation. Hard Recovery must observe the stale network
+        // state being cleared before accepting the next ready=true.
+        var observedReset = false;
+        while (true)
         {
+            var ready = LibztNative.NetTransportIsReady(_networkId) == 1;
+            if (!ready)
+            {
+                if (!observedReset)
+                {
+                    observedReset = true;
+                    JsonLog.Info("libzt_hard_recovery_network_reset_observed", new {
+                        network = _networkId.ToString("x16")
+                    });
+                }
+            }
+            else if (observedReset)
+            {
+                break;
+            }
+
             var status = LibztNative.NetGetStatus(_networkId);
             if (IsTerminalNetworkStatus(status))
                 throw new LibztException($"network join status={status}", status);
 
-            await Task.Delay(50, token).ConfigureAwait(false);
+            await Task.Delay(25, token).ConfigureAwait(false);
         }
+
+        JsonLog.Info("libzt_hard_recovery_network_ready", new {
+            network = _networkId.ToString("x16")
+        });
 
         LibztNetworkState state;
         while (true)
