@@ -106,7 +106,7 @@ public sealed class LibztTcpConnector : IProxyConnector
                 LibztNative.IpProtoTcp,
                 option,
                 (nint)(&localValue),
-                sizeof(int));
+                checked((ushort)sizeof(int)));
             ThrowSocketError($"zts_bsd_setsockopt({name})", fd, result);
         }
     }

@@ -72,7 +72,7 @@ public sealed class LibztTcpConnection : IProxyConnection
                     var requested = count - offset;
                     var result = LibztNative.Write(
                         fd,
-                        nint.Add(basePointer, offset),
+                        basePointer + offset,
                         checked((uint)requested));
 
                     if (result <= 0)
