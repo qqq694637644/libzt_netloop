@@ -10,6 +10,8 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
     private readonly Socks5ConnectionHandler _handler;
     private readonly SemaphoreSlim _capacity;
     private readonly CancellationTokenSource _stop = new();
+    private readonly object _clientsGate = new();
+    private readonly HashSet<Task> _clients = [];
     private readonly Task _loop;
 
     internal OverlaySocksAgent(
@@ -53,7 +55,27 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
                 continue;
             }
 
-            _ = HandleClientAsync(connection, cancellationToken);
+            TrackClient(HandleClientAsync(connection, cancellationToken));
+        }
+    }
+
+    private void TrackClient(Task task)
+    {
+        lock (_clientsGate)
+            _clients.Add(task);
+        _ = ObserveClientAsync(task);
+    }
+
+    private async Task ObserveClientAsync(Task task)
+    {
+        try
+        {
+            await task.ConfigureAwait(false);
+        }
+        finally
+        {
+            lock (_clientsGate)
+                _clients.Remove(task);
         }
     }
 
@@ -91,6 +113,12 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
         catch (OperationCanceledException)
         {
         }
+
+        Task[] activeClients;
+        lock (_clientsGate)
+            activeClients = [.. _clients];
+        if (activeClients.Length != 0)
+            await Task.WhenAll(activeClients).ConfigureAwait(false);
 
         _stop.Dispose();
         _capacity.Dispose();

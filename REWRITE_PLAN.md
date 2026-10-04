@@ -231,15 +231,15 @@ Android 第一版**只支持 arm64-v8a**，不构建、不发布、也不承诺 
 
 网络变化后：
 
-1. 停止当前 NetLoop runtime。
-2. 直接丢弃所有本地 SOCKS TCP、peer TCP、UDP association、overlay TCP listener、overlay UDP socket 和 libzt native socket。
-3. 不等待旧 TCP 对端收到 EOF/RST；旧进程/旧 runtime 被销毁即视为旧会话失效。
-4. 使用同一 state_dir 和 identity 启动全新 runtime。
-5. libzt start -> join -> transport ready -> Managed IP ready。
-6. 重新创建 overlay TCP/UDP Agent 和本地 SOCKS5 listener。
+1. 停止当前 NetLoop 业务 runtime。
+2. 直接丢弃所有本地 SOCKS TCP、peer TCP、UDP association、overlay TCP listener 和 overlay UDP socket。
+3. 不等待旧 TCP 对端收到 EOF/RST；旧业务 runtime 被销毁即视为旧会话失效。
+4. ZeroTier node、identity 和 network membership 保持运行，不做 node stop/start。
+5. 通知 libzt 主机物理网络已变化，立即刷新 physical UDP bindings 和本地接口地址；该逻辑回移自 ZeroTierOne 1.12 的 reconnect 改进。
+6. 使用同一 Managed IP 重新创建 overlay TCP/UDP Agent 和本地 SOCKS5 listener。
 7. 标记 ready，只接受全新的 TCP CONNECT / UDP ASSOCIATE。
 
-Windows/Linux CLI 第一版采用进程自替换完成 runtime reset：replacement 进程等待旧进程退出后启动，借助 OS 一次性销毁旧进程所有 socket/thread/native 状态。Android 使用相同语义，但由 foreground service 重建 runtime，不要求产生新 Android 进程。
+Windows/Linux/Android 使用同一语义：只重建 NetLoop 业务 runtime；libzt node 本身持续运行。这样既彻底丢弃旧应用会话，也避免 node 重启导致重新连接 ZeroTier roots/peers 的额外数秒开销。
 
 不存在 Soft Recovery、Hard Recovery、NetworkEpoch、旧 UDP association 保活或 TCP session migration。
 
@@ -356,7 +356,7 @@ Windows 错误同时记录数值错误码；文本日志统一 UTF-8。
 - 新 TCP/UDP 只在新 runtime ready 后建立。
 - 连续 reset 不产生残留进程/socket。
 
-自动 E2E 使用确定性 reset 注入：连续 10 次 reset -> 新进程 ready -> fresh TCP 成功 -> fresh UDP ASSOCIATE 成功，每轮 Node ID 必须不变，单轮目标 <= 3 秒。真实 Wi-Fi/热点/蜂窝物理切网测试暂缓。
+自动 E2E 使用确定性 reset 注入：连续 10 次 reset -> 同进程新业务 runtime ready -> fresh TCP 成功 -> fresh UDP ASSOCIATE 成功，每轮 Node ID 必须不变，单轮目标 <= 3 秒。真实 Wi-Fi/热点/蜂窝物理切网测试暂缓。
 
 ### Phase 4 - 跨平台交付
 
@@ -374,7 +374,7 @@ TCP：peer 本机服务双向访问、多节点并发、default_exit 统一公�
 
 UDP：UDP ASSOCIATE 建立/关闭、peer 本机 UDP、default_exit UDP、多 association 并发、control TCP close 后清理、idle timeout 清理。
 
-Mobility：触发 runtime reset 后旧进程/runtime 被整体丢弃；新进程使用同一 state_dir，fresh TCP 和 fresh UDP ASSOCIATE 恢复；不要求旧 TCP/UDP 会话继续存活；任何一端都不需要人工重启。
+Mobility：触发 runtime reset 后旧业务 runtime 被整体丢弃；libzt node 保持运行并立即刷新 physical bindings；fresh TCP 和 fresh UDP ASSOCIATE 恢复；不要求旧 TCP/UDP 会话继续存活；任何一端都不需要人工重启。
 
 Identity：runtime reset 后 Node ID 不变，不删除 identity 和 network membership。
 
@@ -450,9 +450,9 @@ C++ 实现不作为 C# 的 recovery 设计依据。
 
 - 不实现 Soft Recovery / Hard Recovery / NetworkEpoch / transport generation migration。
 - 网络变化统一触发一次 runtime reset；OS 事件做约 250ms debounce。
-- Desktop CLI 第一版使用进程自替换：新进程等待旧 PID 退出，再以同一参数和 state_dir 启动。
-- 旧进程退出即视为旧 TCP/UDP 全部丢弃；不测试远端何时观察到 TCP RST。
-- 新进程必须复用 identity，Node ID 不变。
+- Desktop/Android 都只重建 NetLoop 业务 runtime，不重启 libzt node。
+- reset 时关闭并等待所有 active TCP handler、UDP association 和 overlay listener 退出；不测试远端何时观察到 TCP RST。
+- libzt 接收 host-network-changed 通知后立即执行 ZeroTierOne 1.12 同等的 binder refresh / local-interface rescan；identity 和 Node ID 保持不变。
 - 当前自动验收连续执行 10 次 deterministic reset；每轮必须重新建立 fresh TCP 和 fresh UDP ASSOCIATE，目标 <= 3 秒。
 
 ### 23.5 第一版容量

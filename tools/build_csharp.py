@@ -14,6 +14,9 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BUILD = ROOT / "build-csharp-native"
 DEFAULT_DIST = ROOT / "dist-csharp"
+LIBZT_PATCHES = [
+    ROOT / "patches" / "libzt" / "0001-host-network-change-refresh.patch",
+]
 
 
 def run(command: list[str], *, cwd: Path = ROOT, env: dict[str, str] | None = None) -> None:
@@ -34,15 +37,52 @@ def ensure_submodules() -> None:
     run(["git", "submodule", "update", "--init", "--recursive"])
 
 
+def apply_libzt_patches() -> None:
+    libzt = ROOT / "external" / "libzt"
+    for patch in LIBZT_PATCHES:
+        if not patch.exists():
+            raise FileNotFoundError(patch)
+
+        check = subprocess.run(
+            ["git", "apply", "--check", str(patch)],
+            cwd=libzt,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        if check.returncode == 0:
+            run(["git", "apply", str(patch)], cwd=libzt)
+            continue
+
+        reverse = subprocess.run(
+            ["git", "apply", "--reverse", "--check", str(patch)],
+            cwd=libzt,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        if reverse.returncode != 0:
+            raise RuntimeError(
+                f"libzt patch does not apply cleanly: {patch}\n"
+                f"apply: {check.stderr}\nreverse: {reverse.stderr}"
+            )
+
+
 def native_cache_identity() -> dict[str, str]:
     libzt_tree = git_output("ls-tree", "HEAD", "external/libzt").split()
     if len(libzt_tree) < 3:
         raise RuntimeError("unable to resolve external/libzt gitlink")
-    return {
+    identity = {
         "libzt_commit": libzt_tree[2],
         "cmake_sha": git_output("hash-object", "CMakeLists.txt"),
         "build_script_sha": git_output("hash-object", "tools/build_csharp.py"),
     }
+    for index, patch in enumerate(LIBZT_PATCHES, start=1):
+        identity[f"libzt_patch_{index}_sha"] = git_output(
+            "hash-object",
+            str(patch.relative_to(ROOT)),
+        )
+    return identity
 
 
 def find_native_library(build_dir: Path) -> Path:
@@ -58,6 +98,7 @@ def find_native_library(build_dir: Path) -> Path:
 def build_native(args: argparse.Namespace) -> Path:
     started = time.monotonic()
     ensure_submodules()
+    apply_libzt_patches()
 
     build_dir = Path(args.native_build_dir).resolve()
     if args.clean_native and build_dir.exists():

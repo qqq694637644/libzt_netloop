@@ -69,6 +69,12 @@ internal static class LibztNative
     [DllImport(LibraryName, EntryPoint = "CSharp_zts_node_get_id")]
     internal static extern ulong NodeGetId();
 
+    [DllImport(
+        LibraryName,
+        EntryPoint = "zts_node_network_changed",
+        CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int NodeNetworkChanged();
+
     [DllImport(LibraryName, EntryPoint = "CSharp_zts_net_join")]
     internal static extern int NetJoin(ulong networkId);
 

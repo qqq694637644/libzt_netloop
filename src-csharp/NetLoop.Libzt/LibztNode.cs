@@ -69,6 +69,20 @@ public sealed class LibztNode : IAsyncDisposable
         return State;
     }
 
+    public void NotifyPhysicalNetworkChanged()
+    {
+        if (!_started)
+            throw new InvalidOperationException("libzt node has not been started.");
+
+        ThrowIfError(
+            "zts_node_network_changed",
+            LibztNative.NodeNetworkChanged());
+        JsonLog.Info("libzt_physical_network_refresh_requested", new {
+            network = _networkId.ToString("x16"),
+            node = State?.NodeId.ToString("x10")
+        });
+    }
+
     private async Task<LibztNetworkState> JoinAndWaitAsync(CancellationToken cancellationToken)
     {
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);

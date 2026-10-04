@@ -10,6 +10,8 @@ public sealed class LocalSocksServer : IAsyncDisposable
     private readonly Socks5ConnectionHandler _handler;
     private readonly SemaphoreSlim _capacity;
     private readonly CancellationTokenSource _stop = new();
+    private readonly object _clientsGate = new();
+    private readonly HashSet<Task> _clients = [];
     private Task? _loop;
 
     public LocalSocksServer(
@@ -61,7 +63,27 @@ public sealed class LocalSocksServer : IAsyncDisposable
                 continue;
             }
 
-            _ = HandleClientAsync(client, cancellationToken);
+            TrackClient(HandleClientAsync(client, cancellationToken));
+        }
+    }
+
+    private void TrackClient(Task task)
+    {
+        lock (_clientsGate)
+            _clients.Add(task);
+        _ = ObserveClientAsync(task);
+    }
+
+    private async Task ObserveClientAsync(Task task)
+    {
+        try
+        {
+            await task.ConfigureAwait(false);
+        }
+        finally
+        {
+            lock (_clientsGate)
+                _clients.Remove(task);
         }
     }
 
@@ -102,6 +124,12 @@ public sealed class LocalSocksServer : IAsyncDisposable
             {
             }
         }
+
+        Task[] activeClients;
+        lock (_clientsGate)
+            activeClients = [.. _clients];
+        if (activeClients.Length != 0)
+            await Task.WhenAll(activeClients).ConfigureAwait(false);
 
         _stop.Dispose();
         _capacity.Dispose();

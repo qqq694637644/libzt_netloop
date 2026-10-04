@@ -413,7 +413,7 @@ def write_json_atomic(path: Path, payload: dict) -> None:
 def wait_for_reset_ready(
     status_path: Path,
     *,
-    previous_process_id: int,
+    expected_process_id: int,
     expected_reset_count: int,
     expected_node_id: str,
     timeout: float,
@@ -427,7 +427,7 @@ def wait_for_reset_ready(
                 if (
                     last.get("phase") == "ready"
                     and int(last.get("reset_count", -1)) == expected_reset_count
-                    and int(last.get("process_id", 0)) != previous_process_id
+                    and int(last.get("process_id", 0)) == expected_process_id
                 ):
                     if last.get("node_id") != expected_node_id:
                         raise AssertionError(
@@ -458,7 +458,7 @@ def run_reset_stress(
     samples_ms: list[float] = []
 
     for iteration in range(cycles):
-        previous_pid = int(current["process_id"])
+        process_id = int(current["process_id"])
         expected_reset_count = int(current.get("reset_count", 0)) + 1
         started = time.monotonic()
 
@@ -469,7 +469,7 @@ def run_reset_stress(
 
         current = wait_for_reset_ready(
             status_path,
-            previous_process_id=previous_pid,
+            expected_process_id=process_id,
             expected_reset_count=expected_reset_count,
             expected_node_id=node_id,
             timeout=5.0,
