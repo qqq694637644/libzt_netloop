@@ -10,18 +10,18 @@ namespace NetLoop.Host;
 internal sealed class RoutingUdpTransportFactory : IProxyUdpTransportFactory
 {
     private readonly RouteSelector _selector;
-    private readonly OverlayGenerationManager _generations;
+    private readonly IPAddress _overlayBindAddress;
     private readonly ushort _overlayUdpPort;
     private readonly IProxyUdpTransportFactory _egressFactory;
 
     internal RoutingUdpTransportFactory(
         RouteSelector selector,
-        OverlayGenerationManager generations,
+        IPAddress overlayBindAddress,
         ushort overlayUdpPort,
         IProxyUdpTransportFactory egressFactory)
     {
         _selector = selector;
-        _generations = generations;
+        _overlayBindAddress = overlayBindAddress;
         _overlayUdpPort = overlayUdpPort;
         _egressFactory = egressFactory;
     }
@@ -32,11 +32,11 @@ internal sealed class RoutingUdpTransportFactory : IProxyUdpTransportFactory
 
         var localTransport = new SystemUdpTransport();
         IProxyUdpTransport? egressTransport = null;
-        GenerationLibztUdpSocket? overlaySocket = null;
+        LibztUdpSocket? overlaySocket = null;
         try
         {
             egressTransport = await _egressFactory.CreateAsync(cancellationToken).ConfigureAwait(false);
-            overlaySocket = new GenerationLibztUdpSocket(_generations);
+            overlaySocket = LibztUdpSocket.Bind(_overlayBindAddress, 0);
             return new RoutingUdpTransport(
                 _selector,
                 _overlayUdpPort,
@@ -62,7 +62,7 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
     private readonly ushort _overlayUdpPort;
     private readonly IProxyUdpTransport _localTransport;
     private readonly IProxyUdpTransport _egressTransport;
-    private readonly GenerationLibztUdpSocket _overlaySocket;
+    private readonly LibztUdpSocket _overlaySocket;
     private readonly ConcurrentDictionary<IPEndPoint, byte> _allowedPeers = new();
     private readonly Channel<ProxyUdpDatagram> _received = Channel.CreateUnbounded<ProxyUdpDatagram>(
         new UnboundedChannelOptions {
@@ -79,7 +79,7 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
         ushort overlayUdpPort,
         IProxyUdpTransport localTransport,
         IProxyUdpTransport egressTransport,
-        GenerationLibztUdpSocket overlaySocket)
+        LibztUdpSocket overlaySocket)
     {
         _selector = selector;
         _overlayUdpPort = overlayUdpPort;

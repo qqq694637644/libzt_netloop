@@ -10,14 +10,17 @@ internal static class Program
 {
     private const int MaxTcpTunnels = 128;
     private const int MaxUdpAssociations = 64;
-    private const int MaxAutomaticProcessRestarts = 3;
-    private const string ProcessRestartCountEnvironment = "NETLOOP_PROCESS_RESTART_COUNT";
+    private const string ResetCountEnvironment = "NETLOOP_RESET_COUNT";
     private static readonly TimeSpan HalfCloseTimeout = TimeSpan.FromSeconds(15);
 
     internal static async Task<int> Main(string[] args)
     {
         try
         {
+            var waitForPid = TryGetOptionInt(args, "--wait-for-pid");
+            if (waitForPid is > 0)
+                await WaitForParentExitAsync(waitForPid.Value).ConfigureAwait(false);
+
             var options = HostOptions.Parse(args);
             if (options.ShowHelp)
             {
@@ -31,8 +34,24 @@ internal static class Program
                 return 0;
             }
 
-            var restart = await RunNodeAsync(options).ConfigureAwait(false);
-            return restart is null ? 0 : StartReplacementProcess(args, restart);
+            using var shutdown = new CancellationTokenSource();
+            ConsoleCancelEventHandler cancelHandler = (_, eventArgs) => {
+                eventArgs.Cancel = true;
+                shutdown.Cancel();
+            };
+            Console.CancelKeyPress += cancelHandler;
+
+            try
+            {
+                return await RunAsync(
+                    options,
+                    args,
+                    shutdown.Token).ConfigureAwait(false);
+            }
+            finally
+            {
+                Console.CancelKeyPress -= cancelHandler;
+            }
         }
         catch (Exception ex)
         {
@@ -45,157 +64,189 @@ internal static class Program
         }
     }
 
-    private static async Task<ProcessRestartRequest?> RunNodeAsync(HostOptions options)
+    private static async Task<int> RunAsync(
+        HostOptions options,
+        string[] originalArgs,
+        CancellationToken shutdownToken)
     {
-        using var shutdown = new CancellationTokenSource();
-        var restartRequested = new TaskCompletionSource<ProcessRestartRequest>(
+        var resetRequested = new TaskCompletionSource<string>(
             TaskCreationOptions.RunContinuationsAsynchronously);
-        ConsoleCancelEventHandler cancelHandler = (_, eventArgs) => {
-            eventArgs.Cancel = true;
-            shutdown.Cancel();
-        };
-        Console.CancelKeyPress += cancelHandler;
 
-        try
-        {
-            await using var node = new LibztNode(
-                options.NetworkId,
-                options.StateDirectory,
-                options.StartupTimeout);
-            var state = await node.StartAsync(shutdown.Token).ConfigureAwait(false);
+        await using var node = new LibztNode(
+            options.NetworkId,
+            options.StateDirectory,
+            options.StartupTimeout);
+        var state = await node.StartAsync(shutdownToken).ConfigureAwait(false);
 
-            var peers = options.Peers.ToHashSet();
-            if (options.DefaultExit is not null)
-                peers.Add(options.DefaultExit);
+        var peers = options.Peers.ToHashSet();
+        if (options.DefaultExit is not null)
+            peers.Add(options.DefaultExit);
 
-            var snapshot = new OverlayNetworkSnapshot(
-                state.ManagedAddresses,
-                peers,
-                Array.Empty<ManagedRoute>());
-            var selector = new RouteSelector(snapshot, options.DefaultExit);
+        var snapshot = new OverlayNetworkSnapshot(
+            state.ManagedAddresses,
+            peers,
+            Array.Empty<ManagedRoute>());
+        var selector = new RouteSelector(snapshot, options.DefaultExit);
 
-            using var generations = new OverlayGenerationManager(state);
-            var libztConnector = new GenerationLibztTcpConnector(
-                generations,
-                options.ConnectTimeout);
-            var loopbackConnector = new LoopbackTcpConnector(options.ConnectTimeout);
-            IProxyConnector egressConnector = BuildEgressConnector(options);
-            var udpEgressFactory = BuildUdpEgressFactory(options);
-            var routingUdpFactory = new RoutingUdpTransportFactory(
-                selector,
-                generations,
-                options.OverlayUdpPort,
-                udpEgressFactory);
-            await using var udpAssociationFactory = new Socks5UdpAssociationFactory(
-                routingUdpFactory,
-                MaxUdpAssociations,
-                options.UdpIdleTimeout);
+        var libztConnector = new LibztTcpConnector(options.ConnectTimeout);
+        var loopbackConnector = new LoopbackTcpConnector(options.ConnectTimeout);
+        IProxyConnector egressConnector = BuildEgressConnector(options);
+        var overlayBind = SelectOverlayBindAddress(state.ManagedAddresses);
+        var udpEgressFactory = BuildUdpEgressFactory(options);
+        var routingUdpFactory = new RoutingUdpTransportFactory(
+            selector,
+            overlayBind,
+            options.OverlayUdpPort,
+            udpEgressFactory);
 
-            var localRouter = new RoutingConnector(
-                selector,
-                overlayIngress: false,
-                options.OverlayPort,
-                libztConnector,
-                loopbackConnector,
-                egressConnector);
+        await using var udpAssociationFactory = new Socks5UdpAssociationFactory(
+            routingUdpFactory,
+            MaxUdpAssociations,
+            options.UdpIdleTimeout);
 
-            await using var overlayRuntime = new OverlayRuntimeController(
-                options,
-                selector,
-                libztConnector,
-                loopbackConnector,
-                egressConnector,
-                udpEgressFactory,
-                generations,
+        var localRouter = new RoutingConnector(
+            selector,
+            overlayIngress: false,
+            options.OverlayPort,
+            libztConnector,
+            loopbackConnector,
+            egressConnector);
+        var overlayRouter = new RoutingConnector(
+            selector,
+            overlayIngress: true,
+            options.OverlayPort,
+            libztConnector,
+            loopbackConnector,
+            egressConnector);
+
+        await using var overlayAgent = new OverlaySocksAgent(
+            overlayBind.ToString(),
+            options.OverlayPort,
+            new Socks5ConnectionHandler(overlayRouter, HalfCloseTimeout),
+            MaxTcpTunnels);
+        await using var overlayUdpAgent = new OverlayUdpAgent(
+            overlayBind,
+            options.OverlayUdpPort,
+            selector,
+            udpEgressFactory,
+            MaxUdpAssociations,
+            options.UdpIdleTimeout);
+
+        await using var localSocks = new LocalSocksServer(
+            new IPEndPoint(options.SocksAddress, options.SocksPort),
+            new Socks5ConnectionHandler(
+                localRouter,
                 HalfCloseTimeout,
-                MaxTcpTunnels,
-                MaxUdpAssociations);
-            await overlayRuntime.StartAsync(
-                state,
-                shutdown.Token).ConfigureAwait(false);
+                udpAssociationFactory),
+            MaxTcpTunnels);
+        localSocks.Start();
 
-            await using var localSocks = new LocalSocksServer(
-                new IPEndPoint(options.SocksAddress, options.SocksPort),
-                new Socks5ConnectionHandler(
-                    localRouter,
-                    HalfCloseTimeout,
-                    udpAssociationFactory),
-                MaxTcpTunnels);
-            localSocks.Start();
+        await using var resetMonitor = new RuntimeResetMonitor(
+            options.ResetCommandFile,
+            options.ResetEventDebounce,
+            reason => resetRequested.TrySetResult(reason));
+        resetMonitor.Start();
 
-            await using var recovery = new RecoveryCoordinator(
-                options,
-                node,
-                generations,
-                overlayRuntime,
-                peers,
-                (reason, exception) => restartRequested.TrySetResult(
-                    new ProcessRestartRequest(reason, exception.Message)));
-            libztConnector.RecoveryObserver = recovery;
-            await recovery.StartAsync(shutdown.Token).ConfigureAwait(false);
-            await using var recoveryCommands = new RecoveryCommandWatcher(
-                options.RecoveryCommandFile,
-                recovery);
+        var resetCount = GetResetCount();
+        await WriteReadyStatusAsync(
+            options,
+            state,
+            peers,
+            overlayBind,
+            resetCount,
+            shutdownToken).ConfigureAwait(false);
 
-            var overlayBind = OverlayGenerationManager.SelectBindAddress(state);
+        JsonLog.Info("netloop_ready", new {
+            network = options.NetworkId.ToString("x16"),
+            node = state.NodeId.ToString("x10"),
+            overlay = $"{overlayBind}:{options.OverlayPort}",
+            overlay_udp = $"{overlayBind}:{options.OverlayUdpPort}",
+            socks = $"{options.SocksAddress}:{options.SocksPort}",
+            reset_count = resetCount,
+            process_id = Environment.ProcessId
+        });
+
+        var shutdownTask = Task.Delay(
+            Timeout.InfiniteTimeSpan,
+            shutdownToken);
+        var completed = await Task.WhenAny(
+            shutdownTask,
+            resetRequested.Task).ConfigureAwait(false);
+
+        if (ReferenceEquals(completed, resetRequested.Task))
+        {
+            var reason = await resetRequested.Task.ConfigureAwait(false);
+            var nextResetCount = checked(resetCount + 1);
+
             await StatusWriter.WriteAsync(
                 options.StatusFile,
                 new {
-                    phase = "ready",
+                    phase = "resetting",
                     network_id = options.NetworkId.ToString("x16"),
                     node_id = state.NodeId.ToString("x10"),
-                    managed_addresses = state.ManagedAddresses.Select(static x => x.ToString()).ToArray(),
-                    overlay_host = overlayBind.ToString(),
-                    overlay_port = options.OverlayPort,
-                    overlay_udp_port = options.OverlayUdpPort,
-                    socks_host = options.SocksAddress.ToString(),
-                    socks_port = options.SocksPort,
-                    peers = peers.Select(static x => x.ToString()).Order().ToArray(),
-                    default_exit = options.DefaultExit?.ToString(),
-                    egress = options.Egress,
-                    epoch = generations.CurrentEpoch,
-                    process_id = Environment.ProcessId
+                    reset_count = resetCount,
+                    next_reset_count = nextResetCount,
+                    process_id = Environment.ProcessId,
+                    reason
                 },
-                shutdown.Token).ConfigureAwait(false);
+                CancellationToken.None).ConfigureAwait(false);
 
-            JsonLog.Info("netloop_ready", new {
-                network = options.NetworkId.ToString("x16"),
-                node = state.NodeId.ToString("x10"),
-                overlay = $"{overlayBind}:{options.OverlayPort}",
-                overlay_udp = $"{overlayBind}:{options.OverlayUdpPort}",
-                socks = $"{options.SocksAddress}:{options.SocksPort}",
-                epoch = generations.CurrentEpoch,
-                process_id = Environment.ProcessId
+            var replacementPid = StartReplacementProcess(
+                originalArgs,
+                nextResetCount);
+
+            JsonLog.Info("runtime_reset_spawned", new {
+                reason,
+                old_process_id = Environment.ProcessId,
+                new_process_id = replacementPid,
+                next_reset_count = nextResetCount
             });
 
-            var shutdownTask = WaitForCancellationAsync(shutdown.Token);
-            var completed = await Task.WhenAny(
-                shutdownTask,
-                restartRequested.Task).ConfigureAwait(false);
-            if (ReferenceEquals(completed, restartRequested.Task))
-            {
-                var restart = await restartRequested.Task.ConfigureAwait(false);
-                JsonLog.Error("process_restart_requested", new {
-                    restart.Reason,
-                    restart.Error,
-                    process_id = Environment.ProcessId
-                });
-                return restart;
-            }
+            // This is intentional. A network reset means all old sessions are
+            // disposable. Let the OS tear down every TCP/UDP/native handle at
+            // once instead of trying to migrate or gracefully drain them.
+            Environment.Exit(0);
+            return 0;
+        }
 
-            try
-            {
-                await shutdownTask.ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) when (shutdown.IsCancellationRequested)
-            {
-            }
-            return null;
-        }
-        finally
+        try
         {
-            Console.CancelKeyPress -= cancelHandler;
+            await shutdownTask.ConfigureAwait(false);
         }
+        catch (OperationCanceledException) when (shutdownToken.IsCancellationRequested)
+        {
+        }
+
+        return 0;
+    }
+
+    private static async Task WriteReadyStatusAsync(
+        HostOptions options,
+        LibztNetworkState state,
+        IReadOnlyCollection<IPAddress> peers,
+        IPAddress overlayBind,
+        int resetCount,
+        CancellationToken cancellationToken)
+    {
+        await StatusWriter.WriteAsync(
+            options.StatusFile,
+            new {
+                phase = "ready",
+                network_id = options.NetworkId.ToString("x16"),
+                node_id = state.NodeId.ToString("x10"),
+                managed_addresses = state.ManagedAddresses.Select(static x => x.ToString()).ToArray(),
+                overlay_host = overlayBind.ToString(),
+                overlay_port = options.OverlayPort,
+                overlay_udp_port = options.OverlayUdpPort,
+                socks_host = options.SocksAddress.ToString(),
+                socks_port = options.SocksPort,
+                peers = peers.Select(static x => x.ToString()).Order().ToArray(),
+                default_exit = options.DefaultExit?.ToString(),
+                egress = options.Egress,
+                reset_count = resetCount,
+                process_id = Environment.ProcessId
+            },
+            cancellationToken).ConfigureAwait(false);
     }
 
     private static IProxyConnector BuildEgressConnector(HostOptions options)
@@ -228,59 +279,112 @@ internal static class Program
             options.UpstreamPassword);
     }
 
-    private static async Task WaitForCancellationAsync(CancellationToken cancellationToken)
+    private static IPAddress SelectOverlayBindAddress(IReadOnlyList<IPAddress> addresses)
     {
-        await Task.Delay(
-            Timeout.InfiniteTimeSpan,
-            cancellationToken).ConfigureAwait(false);
+        if (addresses.Count == 0)
+            throw new InvalidOperationException("ZeroTier network has no Managed IP.");
+
+        return addresses.FirstOrDefault(static x => x.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+            ?? addresses[0];
     }
 
-    private static int StartReplacementProcess(
-        string[] args,
-        ProcessRestartRequest restart)
-    {
-        var currentCount = int.TryParse(
-            Environment.GetEnvironmentVariable(ProcessRestartCountEnvironment),
-            out var parsed)
-            ? parsed
+    private static int GetResetCount()
+        => int.TryParse(
+            Environment.GetEnvironmentVariable(ResetCountEnvironment),
+            out var value)
+            ? Math.Max(0, value)
             : 0;
-        if (currentCount >= MaxAutomaticProcessRestarts)
-        {
-            JsonLog.Error("process_restart_limit_reached", new {
-                restart.Reason,
-                restart.Error,
-                restart_count = currentCount,
-                limit = MaxAutomaticProcessRestarts
-            });
-            return 1;
-        }
 
+    private static int StartReplacementProcess(
+        string[] originalArgs,
+        int nextResetCount)
+    {
         var executable = Environment.ProcessPath
             ?? throw new InvalidOperationException(
-                "Unable to resolve current executable for automatic restart.");
+                "Unable to resolve current executable for runtime reset.");
+
         var startInfo = new ProcessStartInfo(executable) {
             UseShellExecute = false,
             WorkingDirectory = Environment.CurrentDirectory
         };
-        foreach (var argument in args)
+
+        foreach (var argument in WithoutWaitForPid(originalArgs))
             startInfo.ArgumentList.Add(argument);
-        startInfo.Environment[ProcessRestartCountEnvironment] =
-            (currentCount + 1).ToString(
+        startInfo.ArgumentList.Add("--wait-for-pid");
+        startInfo.ArgumentList.Add(
+            Environment.ProcessId.ToString(
+                System.Globalization.CultureInfo.InvariantCulture));
+        startInfo.Environment[ResetCountEnvironment] =
+            nextResetCount.ToString(
                 System.Globalization.CultureInfo.InvariantCulture);
 
         var process = Process.Start(startInfo)
             ?? throw new InvalidOperationException(
                 "Failed to start replacement NetLoop process.");
-        JsonLog.Info("process_restart_spawned", new {
-            old_process_id = Environment.ProcessId,
-            new_process_id = process.Id,
-            restart_count = currentCount + 1,
-            restart.Reason
-        });
+        var pid = process.Id;
         process.Dispose();
-        return 0;
+        return pid;
     }
 
-    private sealed record ProcessRestartRequest(string Reason, string Error);
+    private static IEnumerable<string> WithoutWaitForPid(string[] args)
+    {
+        for (var index = 0; index < args.Length; index++)
+        {
+            if (string.Equals(
+                    args[index],
+                    "--wait-for-pid",
+                    StringComparison.Ordinal))
+            {
+                index++;
+                continue;
+            }
 
+            yield return args[index];
+        }
+    }
+
+    private static int? TryGetOptionInt(
+        string[] args,
+        string option)
+    {
+        for (var index = 0; index + 1 < args.Length; index++)
+        {
+            if (!string.Equals(
+                    args[index],
+                    option,
+                    StringComparison.Ordinal))
+                continue;
+
+            return int.TryParse(
+                args[index + 1],
+                System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var value)
+                ? value
+                : throw new ArgumentException(
+                    $"Invalid {option}: {args[index + 1]}");
+        }
+
+        return null;
+    }
+
+    private static async Task WaitForParentExitAsync(int parentPid)
+    {
+        if (parentPid == Environment.ProcessId)
+            return;
+
+        try
+        {
+            using var parent = Process.GetProcessById(parentPid);
+            await parent.WaitForExitAsync().ConfigureAwait(false);
+        }
+        catch (ArgumentException)
+        {
+            // Parent already exited.
+        }
+        catch (InvalidOperationException)
+        {
+            // Parent already exited.
+        }
+    }
 }

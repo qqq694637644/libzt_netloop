@@ -25,11 +25,6 @@ public sealed class LibztNode : IAsyncDisposable
 
     public LibztNetworkState? State { get; private set; }
 
-    public bool IsTransportReady
-        => _started
-           && LibztNative.NodeIsOnline() == 1
-           && LibztNative.NetTransportIsReady(_networkId) == 1;
-
     public async Task<LibztNetworkState> StartAsync(CancellationToken cancellationToken)
     {
         if (_freed)
@@ -60,107 +55,6 @@ public sealed class LibztNode : IAsyncDisposable
         {
             TryStop();
             throw;
-        }
-    }
-
-    public async Task<LibztNetworkState> RestartAsync(CancellationToken cancellationToken)
-    {
-        if (!_started)
-            throw new InvalidOperationException("libzt node has not been started.");
-
-        JsonLog.Info("libzt_hard_recovery_start", new { network = _networkId.ToString("x16") });
-        ThrowIfError("zts_node_stop", LibztNative.NodeStop());
-        _started = false;
-
-        // zts_node_stop() requests termination but the service/network state
-        // can remain observable for a short period. Starting again while the
-        // previous generation still reports online/transport-ready lets
-        // RejoinAndWaitAsync consume stale readiness and return before the new
-        // transport is actually usable. Require a real down transition first.
-        while (LibztNative.NodeIsOnline() == 1
-               || LibztNative.NetTransportIsReady(_networkId) == 1)
-        {
-            await Task.Delay(25, cancellationToken).ConfigureAwait(false);
-        }
-        JsonLog.Info("libzt_hard_recovery_transport_stopped", new {
-            network = _networkId.ToString("x16")
-        });
-
-        ThrowIfError("zts_node_start", LibztNative.NodeStart());
-        _started = true;
-        State = await RejoinAndWaitAsync(cancellationToken).ConfigureAwait(false);
-        JsonLog.Info("libzt_hard_recovery_ready", new {
-            network = _networkId.ToString("x16"),
-            node = State.NodeId.ToString("x10"),
-            addresses = State.ManagedAddresses.Select(static x => x.ToString()).ToArray(),
-            node_online = LibztNative.NodeIsOnline() == 1
-        });
-        return State;
-    }
-
-    private async Task<LibztNetworkState> RejoinAndWaitAsync(
-        CancellationToken cancellationToken)
-    {
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(
-            cancellationToken);
-        timeoutCts.CancelAfter(_startupTimeout);
-        var token = timeoutCts.Token;
-
-        // Do not serialize Hard Recovery behind NodeIsOnline(). The network
-        // join API only requires a started node, and cached/ad-hoc network
-        // transport can become usable before root connectivity reports online.
-        // Business recovery is gated on transport readiness + Managed IP, not
-        // on the broader node-online indicator.
-        JsonLog.Info("libzt_hard_recovery_join_start", new {
-            network = _networkId.ToString("x16"),
-            node = LibztNative.NodeGetId().ToString("x10"),
-            node_online = LibztNative.NodeIsOnline() == 1
-        });
-        ThrowIfError("zts_net_join", LibztNative.NetJoin(_networkId));
-
-        // NodeService::networkIsReady() is backed by cached assigned-address
-        // state, which can survive briefly across node stop/start. A single
-        // ready=true immediately after NetJoin can therefore belong to the old
-        // service generation. Hard Recovery must observe the stale network
-        // state being cleared before accepting the next ready=true.
-        var observedReset = false;
-        while (true)
-        {
-            var ready = LibztNative.NetTransportIsReady(_networkId) == 1;
-            if (!ready)
-            {
-                if (!observedReset)
-                {
-                    observedReset = true;
-                    JsonLog.Info("libzt_hard_recovery_network_reset_observed", new {
-                        network = _networkId.ToString("x16")
-                    });
-                }
-            }
-            else if (observedReset)
-            {
-                break;
-            }
-
-            var status = LibztNative.NetGetStatus(_networkId);
-            if (IsTerminalNetworkStatus(status))
-                throw new LibztException($"network join status={status}", status);
-
-            await Task.Delay(25, token).ConfigureAwait(false);
-        }
-
-        JsonLog.Info("libzt_hard_recovery_network_ready", new {
-            network = _networkId.ToString("x16")
-        });
-
-        LibztNetworkState state;
-        while (true)
-        {
-            state = QueryNetworkState();
-            if (state.ManagedAddresses.Count != 0)
-                return state;
-
-            await Task.Delay(50, token).ConfigureAwait(false);
         }
     }
 

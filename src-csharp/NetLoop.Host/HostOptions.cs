@@ -21,12 +21,8 @@ internal sealed class HostOptions
     internal TimeSpan StartupTimeout { get; init; } = TimeSpan.FromSeconds(120);
     internal TimeSpan ConnectTimeout { get; init; } = TimeSpan.FromSeconds(20);
     internal TimeSpan UdpIdleTimeout { get; init; } = TimeSpan.FromSeconds(60);
-    internal TimeSpan RecoverySoftWindow { get; init; } = TimeSpan.FromMilliseconds(2_000);
-    internal TimeSpan RecoveryEventDebounce { get; init; } = TimeSpan.FromMilliseconds(200);
-    internal TimeSpan RecoveryHardTimeout { get; init; } = TimeSpan.FromMilliseconds(10_000);
-    internal TimeSpan RecoveryCooldown { get; init; } = TimeSpan.FromMilliseconds(3_000);
-    internal string? RecoveryCommandFile { get; init; }
-    internal string? RecoveryStatusFile { get; init; }
+    internal TimeSpan ResetEventDebounce { get; init; } = TimeSpan.FromMilliseconds(250);
+    internal string? ResetCommandFile { get; init; }
     internal bool ShowHelp { get; init; }
     internal bool ShowVersion { get; init; }
 
@@ -95,12 +91,8 @@ internal sealed class HostOptions
             StartupTimeout = TimeSpan.FromSeconds(ParsePositiveInt(Optional(values, "--startup-timeout") ?? "120", "--startup-timeout")),
             ConnectTimeout = TimeSpan.FromSeconds(ParsePositiveInt(Optional(values, "--connect-timeout") ?? "20", "--connect-timeout")),
             UdpIdleTimeout = TimeSpan.FromSeconds(ParsePositiveInt(Optional(values, "--udp-idle-timeout") ?? "60", "--udp-idle-timeout")),
-            RecoverySoftWindow = TimeSpan.FromMilliseconds(ParsePositiveInt(Optional(values, "--recovery-soft-window-ms") ?? "2000", "--recovery-soft-window-ms")),
-            RecoveryEventDebounce = TimeSpan.FromMilliseconds(ParsePositiveInt(Optional(values, "--recovery-event-debounce-ms") ?? "200", "--recovery-event-debounce-ms")),
-            RecoveryHardTimeout = TimeSpan.FromMilliseconds(ParsePositiveInt(Optional(values, "--recovery-hard-timeout-ms") ?? "10000", "--recovery-hard-timeout-ms")),
-            RecoveryCooldown = TimeSpan.FromMilliseconds(ParsePositiveInt(Optional(values, "--recovery-cooldown-ms") ?? "3000", "--recovery-cooldown-ms")),
-            RecoveryCommandFile = Optional(values, "--recovery-command-file"),
-            RecoveryStatusFile = Optional(values, "--recovery-status-file")
+            ResetEventDebounce = TimeSpan.FromMilliseconds(ParsePositiveInt(Optional(values, "--reset-debounce-ms") ?? "250", "--reset-debounce-ms")),
+            ResetCommandFile = Optional(values, "--reset-command-file")
         };
     }
 
@@ -147,17 +139,8 @@ internal sealed class HostOptions
           --startup-timeout <sec>     libzt startup timeout (default 120)
           --connect-timeout <sec>     Peer/egress connect timeout (default 20)
           --udp-idle-timeout <sec>    UDP association idle timeout (default 60)
-          --recovery-soft-window-ms <ms>
-                                      Soft recovery validation window (default 2000)
-          --recovery-event-debounce-ms <ms>
-                                      NetworkChange debounce (default 200)
-          --recovery-hard-timeout-ms <ms>
-                                      In-process Hard Recovery timeout (default 10000)
-          --recovery-cooldown-ms <ms> Ignore restart-induced network events (default 3000)
-          --recovery-command-file <path>
-                                      Optional deterministic recovery injection input
-          --recovery-status-file <path>
-                                      Optional recovery state JSON output
+          --reset-debounce-ms <ms>    Coalesce OS network-change events (default 250)
+          --reset-command-file <path> Optional deterministic reset injection input
           --version
           --help
         """;

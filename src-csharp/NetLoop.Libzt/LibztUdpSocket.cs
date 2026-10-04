@@ -13,9 +13,7 @@ public sealed class LibztUdpSocket : IAsyncDisposable
     private const int MaxDatagramSize = 65_535;
 
     private readonly SemaphoreSlim _sendLock = new(1, 1);
-    private CancellationTokenRegistration _generationRegistration;
     private int _fd;
-    private int _generationBound;
 
     private LibztUdpSocket(int fd, IPAddress bindAddress, ushort bindPort)
     {
@@ -27,21 +25,6 @@ public sealed class LibztUdpSocket : IAsyncDisposable
     public IPAddress BindAddress { get; }
 
     public ushort BindPort { get; }
-
-    public void BindGeneration(CancellationToken generationToken)
-    {
-        if (!generationToken.CanBeCanceled)
-            return;
-        if (Interlocked.Exchange(ref _generationBound, 1) != 0)
-            throw new InvalidOperationException("libzt UDP socket is already bound to a network generation.");
-
-        _generationRegistration = generationToken.Register(
-            static state => ((LibztUdpSocket)state!).AbortGeneration(),
-            this);
-
-        if (Volatile.Read(ref _fd) < 0)
-            _generationRegistration.Dispose();
-    }
 
     public static LibztUdpSocket Bind(IPAddress bindAddress, ushort bindPort)
     {
@@ -66,46 +49,12 @@ public sealed class LibztUdpSocket : IAsyncDisposable
                     timeout,
                     LibztNative.GetLastSocketError(fd));
 
-            var localEndPoint = GetLocalEndPoint(fd);
-            return new LibztUdpSocket(
-                fd,
-                localEndPoint.Address,
-                checked((ushort)localEndPoint.Port));
+            return new LibztUdpSocket(fd, bindAddress, bindPort);
         }
         catch
         {
             _ = LibztNative.Close(fd);
             throw;
-        }
-    }
-
-    private static unsafe IPEndPoint GetLocalEndPoint(int fd)
-    {
-        var text = Marshal.AllocHGlobal(LibztNative.IpStringLength);
-        try
-        {
-            new Span<byte>((void*)text, LibztNative.IpStringLength).Clear();
-            ushort port = 0;
-            var result = LibztNative.GetSockName(
-                fd,
-                text,
-                LibztNative.IpStringLength,
-                ref port);
-            if (result != LibztNative.Ok)
-            {
-                throw new LibztException(
-                    "zts_getsockname(udp)",
-                    result,
-                    LibztNative.GetLastSocketError(fd));
-            }
-
-            var addressText = Marshal.PtrToStringAnsi(text)
-                ?? throw new IOException("libzt returned an empty UDP local address.");
-            return new IPEndPoint(IPAddress.Parse(addressText), port);
-        }
-        finally
-        {
-            Marshal.FreeHGlobal(text);
         }
     }
 
@@ -249,28 +198,13 @@ public sealed class LibztUdpSocket : IAsyncDisposable
             or LibztNative.WindowsETimedOut
             or LibztNative.WindowsEWouldBlock;
 
-    public async ValueTask DisposeAsync()
-    {
-        var fd = Interlocked.Exchange(ref _fd, -1);
-        _generationRegistration.Dispose();
-        await _sendLock.WaitAsync().ConfigureAwait(false);
-        try
-        {
-            if (fd >= 0)
-                _ = LibztNative.Close(fd);
-        }
-        finally
-        {
-            _sendLock.Release();
-            _sendLock.Dispose();
-        }
-    }
-
-    private void AbortGeneration()
+    public ValueTask DisposeAsync()
     {
         var fd = Interlocked.Exchange(ref _fd, -1);
         if (fd >= 0)
             _ = LibztNative.Close(fd);
+        _sendLock.Dispose();
+        return ValueTask.CompletedTask;
     }
 
     private int GetFd()

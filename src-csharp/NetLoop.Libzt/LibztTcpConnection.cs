@@ -5,10 +5,7 @@ namespace NetLoop.Libzt;
 
 public sealed class LibztTcpConnection : IProxyConnection
 {
-    private CancellationTokenRegistration _generationRegistration;
-    private CancellationToken _generationToken;
     private int _fd;
-    private int _generationBound;
 
     internal LibztTcpConnection(int fd, string description)
     {
@@ -21,24 +18,6 @@ public sealed class LibztTcpConnection : IProxyConnection
     public System.Net.EndPoint? LocalEndPoint => null;
 
     public System.Net.EndPoint? RemoteEndPoint => null;
-
-    public CancellationToken LifetimeCancellation => _generationToken;
-
-    public void BindGeneration(CancellationToken generationToken)
-    {
-        if (!generationToken.CanBeCanceled)
-            return;
-        if (Interlocked.Exchange(ref _generationBound, 1) != 0)
-            throw new InvalidOperationException("libzt connection is already bound to a network generation.");
-
-        _generationToken = generationToken;
-        _generationRegistration = generationToken.Register(
-            static state => ((LibztTcpConnection)state!).AbortGeneration(),
-            this);
-
-        if (Volatile.Read(ref _fd) < 0)
-            _generationRegistration.Dispose();
-    }
 
     public ValueTask<int> ReadAsync(byte[] buffer, int count, CancellationToken cancellationToken)
     {
@@ -57,29 +36,14 @@ public sealed class LibztTcpConnection : IProxyConnection
             var handle = GCHandle.Alloc(buffer, GCHandleType.Pinned);
             try
             {
-                while (true)
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    if (_generationToken.IsCancellationRequested)
-                        throw new OperationCanceledException(_generationToken);
+                var result = LibztNative.Read(fd, handle.AddrOfPinnedObject(), checked((uint)count));
+                if (result >= 0)
+                    return result;
 
-                    var result = LibztNative.Read(
-                        fd,
-                        handle.AddrOfPinnedObject(),
-                        checked((uint)count));
-                    if (result >= 0)
-                        return result;
+                if (cancellationToken.IsCancellationRequested)
+                    throw new OperationCanceledException(cancellationToken);
 
-                    var errno = LibztNative.GetErrno();
-                    if (cancellationToken.IsCancellationRequested)
-                        throw new OperationCanceledException(cancellationToken);
-                    if (_generationToken.IsCancellationRequested)
-                        throw new OperationCanceledException(_generationToken);
-                    if (IsTransientIoError(errno))
-                        continue;
-
-                    throw new LibztException("zts_bsd_read", result, errno);
-                }
+                throw new LibztException("zts_bsd_read", result, LibztNative.GetErrno());
             }
             finally
             {
@@ -109,10 +73,6 @@ public sealed class LibztTcpConnection : IProxyConnection
                 var offset = 0;
                 while (offset < count)
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    if (_generationToken.IsCancellationRequested)
-                        throw new OperationCanceledException(_generationToken);
-
                     var requested = count - offset;
                     var result = LibztNative.Write(
                         fd,
@@ -123,14 +83,7 @@ public sealed class LibztTcpConnection : IProxyConnection
                     {
                         if (cancellationToken.IsCancellationRequested)
                             throw new OperationCanceledException(cancellationToken);
-                        if (_generationToken.IsCancellationRequested)
-                            throw new OperationCanceledException(_generationToken);
-
-                        var errno = LibztNative.GetErrno();
-                        if (IsTransientIoError(errno))
-                            continue;
-
-                        throw new LibztException("zts_bsd_write", result, errno);
+                        throw new LibztException("zts_bsd_write", result, LibztNative.GetErrno());
                     }
 
                     offset += result;
@@ -142,12 +95,6 @@ public sealed class LibztTcpConnection : IProxyConnection
             }
         }));
     }
-
-    private static bool IsTransientIoError(int errno)
-        => errno is LibztNative.EAgain
-            or LibztNative.ETimedOut
-            or LibztNative.WindowsETimedOut
-            or LibztNative.WindowsEWouldBlock;
 
     public ValueTask ShutdownWriteAsync(CancellationToken cancellationToken)
     {
@@ -166,23 +113,12 @@ public sealed class LibztTcpConnection : IProxyConnection
     public ValueTask DisposeAsync()
     {
         var fd = Interlocked.Exchange(ref _fd, -1);
-        _generationRegistration.Dispose();
         if (fd < 0)
             return ValueTask.CompletedTask;
 
         _ = LibztNative.Shutdown(fd, LibztNative.ShutReadWrite);
         _ = LibztNative.Close(fd);
         return ValueTask.CompletedTask;
-    }
-
-    private void AbortGeneration()
-    {
-        var fd = Interlocked.Exchange(ref _fd, -1);
-        if (fd < 0)
-            return;
-
-        _ = LibztNative.Shutdown(fd, LibztNative.ShutReadWrite);
-        _ = LibztNative.Close(fd);
     }
 
     private int GetFd()

@@ -118,17 +118,6 @@ internal static class LibztNative
         CallingConvention = CallingConvention.Cdecl)]
     internal static extern int BindEasy(int fd, string localAddress, ushort localPort);
 
-    [DllImport(
-        LibraryName,
-        CharSet = CharSet.Ansi,
-        EntryPoint = "zts_getsockname",
-        CallingConvention = CallingConvention.Cdecl)]
-    internal static extern int GetSockName(
-        int fd,
-        nint localAddress,
-        int localAddressLength,
-        ref ushort localPort);
-
     [DllImport(LibraryName, EntryPoint = "CSharp_zts_bsd_listen")]
     internal static extern int Listen(int fd, int backlog);
 
@@ -177,12 +166,6 @@ internal static class LibztNative
 
     [DllImport(LibraryName, EntryPoint = "CSharp_zts_set_recv_timeout")]
     internal static extern int SetReceiveTimeout(int fd, int seconds, int microseconds);
-
-    [DllImport(LibraryName, EntryPoint = "CSharp_zts_set_send_timeout")]
-    internal static extern int SetSendTimeout(int fd, int seconds, int microseconds);
-
-    [DllImport(LibraryName, EntryPoint = "CSharp_zts_set_blocking")]
-    internal static extern int SetBlocking(int fd, int enabled);
 
     [DllImport(LibraryName, EntryPoint = "CSharp_zts_bsd_setsockopt")]
     internal static extern int SetSocketOption(int fd, int level, int option, nint value, ushort valueLength);

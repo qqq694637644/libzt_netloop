@@ -218,72 +218,39 @@ Android 第一版**只支持 arm64-v8a**，不构建、不发布、也不承诺 
 
 ## 11. 网络切换与秒级恢复
 
-这是核心可靠性需求。原则是：网络一变，旧 tunnel 立即作废，新连接立即重新建立；不迁移旧 TCP。
+这是核心可靠性需求。原则只有一个：**网络一变，整个旧 NetLoop runtime 直接丢弃；不迁移、不修复、不保留旧 TCP/UDP 会话。**
 
-### 11.1 NetworkEpoch
-
-维护全局单调递增 NetworkEpoch。每个 TCP tunnel 和 libzt UDP transport 都记录创建时 epoch。检测到网络变化后 epoch++，所有旧 epoch transport 立即失效。
-
-### 11.2 触发来源
-
-至少监听：
+### 11.1 触发来源
 
 - Windows/Linux：.NET NetworkChange。
 - Android：ConnectivityManager.NetworkCallback。
-- libzt peer/path 状态事件。
-- 明确的 read/write/connect failure。
 
-OS 网络变化是主要快速触发器；libzt peer/path event 是第二信号；keepalive 只做兜底。
+同一次切网可能产生多个 OS event，统一做约 250ms debounce。触发后不分析旧 transport 状态，也不等待 keepalive/libzt path event。
 
-### 11.3 Soft Recovery
+### 11.2 Runtime Reset
 
-网络变化时：
+网络变化后：
 
-1. 对 OS event 做短 debounce，合并同一次切网产生的多事件。
-2. epoch + 1。
-3. 立即关闭所有旧 libzt TCP tunnel。
-4. 关闭或替换旧 libzt UDP transport socket。
-5. 不等待 DIRECT。
-6. RELAY 可用就立即恢复业务。
-7. 新 CONNECT 每次使用 fresh zts socket。
-8. 使用短间隔重试，避免 stale socket 长时间阻塞。
+1. 停止当前 NetLoop runtime。
+2. 直接丢弃所有本地 SOCKS TCP、peer TCP、UDP association、overlay TCP listener、overlay UDP socket 和 libzt native socket。
+3. 不等待旧 TCP 对端收到 EOF/RST；旧进程/旧 runtime 被销毁即视为旧会话失效。
+4. 使用同一 state_dir 和 identity 启动全新 runtime。
+5. libzt start -> join -> transport ready -> Managed IP ready。
+6. 重新创建 overlay TCP/UDP Agent 和本地 SOCKS5 listener。
+7. 标记 ready，只接受全新的 TCP CONNECT / UDP ASSOCIATE。
 
-初始重试节奏建议：0ms、150ms、300ms、500ms、800ms。Soft Recovery 总窗口目标约 2 秒，最终通过真实切网测试校准。
+Windows/Linux CLI 第一版采用进程自替换完成 runtime reset：replacement 进程等待旧进程退出后启动，借助 OS 一次性销毁旧进程所有 socket/thread/native 状态。Android 使用相同语义，但由 foreground service 重建 runtime，不要求产生新 Android 进程。
 
-### 11.4 Hard Recovery
-
-如果系统网络已经可用，但 Soft Recovery 窗口内 libzt 仍不能建立新的有效 peer connection：
-
-1. 当前 epoch 最多触发一次 Hard Recovery。
-2. stop libzt node。
-3. 使用同一 identity/state 重新 start。
-4. 重新 join 原 network。
-5. identity 和 Managed IP 保持稳定。
-6. network ready 后立即允许 fresh connect。
-7. 设置短 cooldown，避免 restart storm。
-
-Hard Recovery 是自动化的 libzt 重启，用来消除过去需要人工重启 A/B 才恢复的问题。
-
-### 11.5 不等待 DIRECT
-
-允许先通过 RELAY 恢复业务，再等待新的 DIRECT path。业务恢复优先于 P2P path 最优化。
-
-### 11.6 TCP 与 UDP
-
-TCP：epoch 变化后旧 tunnel 立即关闭，由浏览器/应用收到 EOF/reset 后重建；不尝试 session migration。
-
-UDP：本地 SOCKS5 control TCP 和 association 尽量保持，只替换底层 libzt UDP transport；切网期间允许丢少量 UDP 包。
+不存在 Soft Recovery、Hard Recovery、NetworkEpoch、旧 UDP association 保活或 TCP session migration。
 
 ## 12. 恢复性能目标
 
 | 项目 | 目标 |
 | --- | --- |
 | OS 网络变化事件进入 NetLoop | < 500 ms |
-| 旧 TCP tunnel 开始清理 | 立即 |
-| fresh libzt connect 开始 | < 300 ms |
-| RELAY 已可达时业务恢复 | 约 1-2 秒 |
-| 常规 Wi-Fi/热点/蜂窝切换 | 目标 1-3 秒 |
-| 需要 Hard Recovery | 目标 3-5 秒 |
+| runtime reset 开始 | debounce 后立即 |
+| 旧 runtime / 旧连接 | 整体丢弃，不等待迁移或 drain |
+| 新 runtime ready + fresh TCP/UDP 成功 | 目标 <= 3 秒 |
 | 正常恢复依赖十几秒 TCP keepalive | 不接受 |
 
 这些是工程目标，不是所有公网/NAT 环境的绝对保证；真实测试结果优先。
@@ -295,7 +262,7 @@ UDP：本地 SOCKS5 control TCP 和 association 尽量保持，只替换底层 l
     src-csharp/
       NetLoop.Core/
         Routing/
-        Recovery/
+        Runtime/
         Transport/
         Sessions/
       NetLoop.Socks/
@@ -325,9 +292,7 @@ Android：使用 .NET for Android，长期运行 Node 使用 foreground service�
     overlay.udp_port = 42043
     routing.default_exit = 172.26.0.254
     egress.mode = direct | upstream_socks5
-    recovery.soft_window_ms = 2000
-    recovery.event_debounce_ms = 200
-    recovery.hard_restart_enabled = true
+    reset.event_debounce_ms = 250
 
 默认本地 SOCKS 只监听 loopback，避免无意暴露给本地 LAN。
 
@@ -342,9 +307,9 @@ Android：使用 .NET for Android，长期运行 Node 使用 foreground service�
 
 ## 17. 日志与诊断
 
-统一结构化日志，至少包含 event、peer、connection_id/association_id、epoch、transport、target_host/target_port、api_rc/socket_error、elapsed_ms、DIRECT/RELAY/UNREACHABLE path。
+统一结构化日志，至少包含 event、peer、connection_id/association_id、transport、target_host/target_port、api_rc/socket_error、elapsed_ms、DIRECT/RELAY/UNREACHABLE path。
 
-必须记录 node 生命周期、Managed IP、peer path、OS network change、epoch、Soft/Hard Recovery、TCP retry、UDP association、default-exit routing、local-service routing 和 egress failure。
+必须记录 node 生命周期、Managed IP、peer path、OS network change、runtime reset reason/reset_count/process_id、TCP retry、UDP association、default-exit routing、local-service routing 和 egress failure。
 
 Windows 错误同时记录数值错误码；文本日志统一 UTF-8。
 
@@ -357,7 +322,6 @@ Windows 错误同时记录数值错误码；文本日志统一 UTF-8。
 - 做最小 libzt P/Invoke wrapper。
 - Windows/Linux 使用同一 identity 互相 TCP/UDP 通信。
 - Android arm64 加载 libzt native library。
-- 验证 libzt stop/start/join 可用于 Hard Recovery。
 - 验证各平台切网事件速度。
 
 退出条件：关键风险都有最小可运行 PoC。
@@ -380,22 +344,19 @@ Windows 错误同时记录数值错误码；文本日志统一 UTF-8。
 - peer 本机 UDP 服务。
 - default_exit UDP 出网。
 - association cleanup。
-- UDP transport epoch replacement。
 - FRAG != 0 明确拒绝。
 
-### Phase 3 - 秒级恢复
+### Phase 3 - 秒级 Runtime Reset
 
-- NetworkEpoch。
 - Windows/Linux NetworkChange monitor。
 - Android ConnectivityManager monitor。
-- libzt path event integration。
-- Soft Recovery。
-- Hard Recovery。
-- restart-storm protection。
+- 约 250ms event debounce。
+- 网络变化后整体丢弃旧 runtime。
+- 同 identity/state 启动新 runtime。
+- 新 TCP/UDP 只在新 runtime ready 后建立。
+- 连续 reset 不产生残留进程/socket。
 
-自动测试阶段使用确定性故障注入覆盖 transport generation 变化、peer 暂时不可达、进程/libzt 重启和连续 recovery。真实 Wi-Fi A -> Wi-Fi B、Wi-Fi -> 手机热点、Android Wi-Fi -> Cellular 等物理切网测试暂缓，不作为当前 CI 或第一阶段交付阻塞项。
-
-每次记录 OS event、epoch 更新、旧 tunnel 关闭、fresh connect、第一次 SOCKS 成功、RELAY/DIRECT 变化的时间点。
+自动 E2E 使用确定性 reset 注入：连续 10 次 reset -> 新进程 ready -> fresh TCP 成功 -> fresh UDP ASSOCIATE 成功，每轮 Node ID 必须不变，单轮目标 <= 3 秒。真实 Wi-Fi/热点/蜂窝物理切网测试暂缓。
 
 ### Phase 4 - 跨平台交付
 
@@ -413,22 +374,17 @@ TCP：peer 本机服务双向访问、多节点并发、default_exit 统一公�
 
 UDP：UDP ASSOCIATE 建立/关闭、peer 本机 UDP、default_exit UDP、多 association 并发、control TCP close 后清理、idle timeout 清理。
 
-Mobility：切网时旧 TCP 立即关闭、新 TCP fresh socket 恢复、UDP association 保持但底层 transport 换代、RELAY 可用时不等待 DIRECT、Soft Recovery 失败自动 Hard Recovery、任何一端都不需要人工重启、多次切网不积累 zombie socket/thread/task。
+Mobility：触发 runtime reset 后旧进程/runtime 被整体丢弃；新进程使用同一 state_dir，fresh TCP 和 fresh UDP ASSOCIATE 恢复；不要求旧 TCP/UDP 会话继续存活；任何一端都不需要人工重启。
 
-Identity：restart 后 Node ID 和 Managed IP 不变，Hard Recovery 不删除 identity 和 network membership。
+Identity：runtime reset 后 Node ID 不变，不删除 identity 和 network membership。
 
 当前自动 E2E 范围只做 **Windows x64 <-> Windows x64**，且两个节点必须运行在两个独立 GitHub-hosted runner 上。Linux/Android runtime E2E 暂不作为当前 gate。
 
-## 20. 从当前 C++ 版本迁移
+## 20. 旧 C++ 清理
 
-当前 C++ 版本作为已知可用 TCP 数据面、mobility 问题复现、E2E 行为和 libzt 参数参考。
+C++ 实现不作为 C# 的 recovery 设计依据。
 
-重写期间：
-
-- C++ 版本只做必要 bug fix，不再叠加大功能。
-- 新 TCP/UDP/跨平台能力进入 C# 版本。
-- 先让 C# 达到当前 C++ TCP 能力，再切换主实现。
-- C# 通过同等或更强 E2E 后，再考虑归档旧实现。
+在 C# 完成当前计划的 Windows/Linux/Android 构建与既定 E2E 后，删除旧 C++ 业务实现、旧 C++ CMake target、旧 C++ CI/发布路径和仅为 C++ 服务的脚本；保留仍被 C# native libzt 构建所必需的第三方源码/构建入口。
 
 ## 21. 第一版完成定义
 
@@ -439,9 +395,9 @@ Identity：restart 后 Node ID 和 Managed IP 不变，Hard Recovery 不删除 i
 5. 普通 TCP/UDP Internet 流量可统一通过 default_exit。
 6. default_exit 可直接出网，并可选接已有 upstream SOCKS5。
 7. 常规切网不要求人工重启任何节点。
-8. 常规切网恢复目标 1-3 秒，异常 path 卡死时自动 Hard Recovery。
-9. TCP 旧连接允许直接失败，由浏览器/应用重建。
-10. UDP association 在可行时保留，只替换底层 transport。
+8. 网络变化后整体丢弃旧 runtime，并在目标 1-3 秒内让 fresh TCP/UDP 恢复。
+9. TCP 旧连接直接失败，由浏览器/应用重建。
+10. UDP 旧 association 直接失败，由应用重新建立。
 11. 无 TUN/TAP、无系统路由、无远端 LAN 路由。
 12. 日志能完整还原一次网络切换和恢复时间线。
 
@@ -468,7 +424,7 @@ Identity：restart 后 Node ID 和 Managed IP 不变，Hard Recovery 不删除 i
 - C# Target Framework 为 `net10.0`。
 - libzt ABI/行为基线固定为仓库 submodule commit `a707ea6ae0910efdc1125d04758c411e2e9ea4f9`。
 - C# 使用该 commit 已提供的 `ZTS_ENABLE_PINVOKE` shared-library wrapper ABI，只在 `NetLoop.Libzt` 建立 NetLoop 所需的薄封装，不复制整套历史 SWIG managed wrapper。
-- C# 直接兼容当前 C++ 使用的 `state_dir`，必须复用已有 identity、network membership 和 Node ID。继续沿用当前 C++ 的 mobility 策略：保留 identity/network state，启动前清理 `peers.d` 并禁用 peer cache。
+- C# 直接兼容已有 `state_dir`，必须复用已有 identity、network membership 和 Node ID。启动时保留 identity/network state，清理 `peers.d` 并禁用 peer cache。
 
 ### 23.2 Overlay 路由
 
@@ -490,13 +446,14 @@ Identity：restart 后 Node ID 和 Managed IP 不变，Hard Recovery 不删除 i
 - upstream UDP 必须使用 UDP ASSOCIATE；若 upstream 不支持 UDP，明确失败，禁止回退 DIRECT。
 - Phase 0 对 `VpnHood.Core.Proxies 8.1.851` 的验证结论：其 SOCKS5 server 已具备 CONNECT、UDP ASSOCIATE、source validation、bounded state、half-close 等成熟行为，但 server 出站路径直接创建 `TcpClient/UdpClient`，没有可注入 libzt transport 的接口。因此 NetLoop 不直接套用 server；TCP 先实现最小标准 CONNECT adapter，UDP Phase 复用/抽取其成熟 association、validation、timeout/cancellation 语义并接入 NetLoop transport abstraction。
 
-### 23.4 Recovery
+### 23.4 Runtime Reset
 
-- 继续继承当前 C++ 已验证的 fresh zts socket、TCP_NODELAY、keepalive、half-close 和 backpressure 语义。
-- Hard Recovery 首先尝试同进程 `stop -> start -> join`。
-- 如果 native libzt 无法在限定窗口内可靠恢复，允许自动重启整个 NetLoop 进程作为最终保险；必须复用同一 `state_dir`，不得删除 identity/network membership。
-- 当前自动验收中：常规 recovery 做 20 次确定性故障注入，要求 p95 <= 3 秒；强制 Hard Recovery 做 10 次，要求 p95 <= 5 秒；任何一次需要人工干预即失败。
-- recovery stress 目标为 100 轮后 active tunnel/association/native-socket 计数回到基线，不允许持续积累 zombie 资源。
+- 不实现 Soft Recovery / Hard Recovery / NetworkEpoch / transport generation migration。
+- 网络变化统一触发一次 runtime reset；OS 事件做约 250ms debounce。
+- Desktop CLI 第一版使用进程自替换：新进程等待旧 PID 退出，再以同一参数和 state_dir 启动。
+- 旧进程退出即视为旧 TCP/UDP 全部丢弃；不测试远端何时观察到 TCP RST。
+- 新进程必须复用 identity，Node ID 不变。
+- 当前自动验收连续执行 10 次 deterministic reset；每轮必须重新建立 fresh TCP 和 fresh UDP ASSOCIATE，目标 <= 3 秒。
 
 ### 23.5 第一版容量
 
