@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
 from pathlib import Path
 import socket
 import ssl
@@ -41,8 +43,10 @@ def socks_connect(
     proxy_port: int,
     target_host: str,
     target_port: int,
+    *,
+    timeout: float = 15.0,
 ) -> socket.socket:
-    sock = socket.create_connection((proxy_host, proxy_port), timeout=15)
+    sock = socket.create_connection((proxy_host, proxy_port), timeout=timeout)
     sock.sendall(b"\x05\x01\x00")
     if recv_exact(sock, 2) != b"\x05\x00":
         sock.close()
@@ -333,9 +337,21 @@ def https_public_ip_via_socks(proxy_port: int) -> str:
     return body.decode("ascii").strip()
 
 
-def verify_peer_local_service(proxy_port: int, peer_ip: str, service_port: int) -> None:
-    with socks_connect("127.0.0.1", proxy_port, peer_ip, service_port) as sock:
-        sock.settimeout(20)
+def verify_peer_local_service(
+    proxy_port: int,
+    peer_ip: str,
+    service_port: int,
+    *,
+    timeout: float = 20.0,
+) -> None:
+    with socks_connect(
+        "127.0.0.1",
+        proxy_port,
+        peer_ip,
+        service_port,
+        timeout=timeout,
+    ) as sock:
+        sock.settimeout(timeout)
         sock.sendall(
             b"GET / HTTP/1.0\r\n"
             b"Host: netloop-peer-local\r\n"
@@ -356,33 +372,247 @@ def start_client(
     rendezvous: dict,
     listen_port: int,
     status_path: Path,
+    recovery_command_path: Path | None = None,
+    recovery_status_path: Path | None = None,
 ) -> int:
-    return start_detached(
-        [
-            str(executable),
-            "--network",
-            rendezvous["network_id"],
-            "--state-dir",
-            str(ROOT / "state" / "csharp-ci-client"),
-            "--socks-host",
-            "127.0.0.1",
-            "--socks-port",
-            str(listen_port),
-            "--overlay-port",
-            str(rendezvous["overlay_port"]),
-            "--overlay-udp-port",
-            str(rendezvous["overlay_udp_port"]),
-            "--default-exit",
-            rendezvous["server_ip"],
-            "--status-file",
-            str(status_path),
-            "--startup-timeout",
-            "180",
-            "--connect-timeout",
-            "20",
-        ],
-        EVIDENCE / "netloop_process.log",
+    command = [
+        str(executable),
+        "--network",
+        rendezvous["network_id"],
+        "--state-dir",
+        str(ROOT / "state" / "csharp-ci-client"),
+        "--socks-host",
+        "127.0.0.1",
+        "--socks-port",
+        str(listen_port),
+        "--overlay-port",
+        str(rendezvous["overlay_port"]),
+        "--overlay-udp-port",
+        str(rendezvous["overlay_udp_port"]),
+        "--default-exit",
+        rendezvous["server_ip"],
+        "--status-file",
+        str(status_path),
+        "--startup-timeout",
+        "180",
+        "--connect-timeout",
+        "20",
+    ]
+    if recovery_command_path is not None and recovery_status_path is not None:
+        command.extend(
+            [
+                "--recovery-command-file",
+                str(recovery_command_path),
+                "--recovery-status-file",
+                str(recovery_status_path),
+                "--recovery-soft-window-ms",
+                "2000",
+                "--recovery-hard-timeout-ms",
+                "8000",
+                "--recovery-cooldown-ms",
+                "1000",
+            ]
+        )
+
+    return start_detached(command, EVIDENCE / "netloop_process.log")
+
+
+def write_json_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(json.dumps(payload), encoding="utf-8")
+    os.replace(temp, path)
+
+
+def wait_recovery_status(
+    path: Path,
+    command_id: int,
+    kind: str,
+    timeout: float,
+) -> dict:
+    return wait_recovery_phase(path, command_id, kind, "ready", timeout)
+
+
+def wait_recovery_phase(
+    path: Path,
+    command_id: int,
+    kind: str,
+    phase: str,
+    timeout: float,
+) -> dict:
+    deadline = time.monotonic() + timeout
+    last: dict | None = None
+    while time.monotonic() < deadline:
+        try:
+            if path.exists():
+                last = json.loads(path.read_text(encoding="utf-8"))
+                if (
+                    last.get("command_id") == command_id
+                    and last.get("kind") == kind
+                    and last.get("phase") == phase
+                ):
+                    return last
+                if (
+                    last.get("command_id") == command_id
+                    and last.get("phase") == "failed"
+                ):
+                    raise RuntimeError(
+                        f"{kind} recovery command {command_id} failed: {last}"
+                    )
+        except (json.JSONDecodeError, PermissionError, OSError):
+            pass
+        time.sleep(0.05)
+    raise TimeoutError(
+        f"timed out waiting for {kind}/{phase} recovery command {command_id}; last={last}"
     )
+
+
+def wait_for_stale_tcp_close(sock: socket.socket, timeout: float = 1.0) -> None:
+    sock.settimeout(timeout)
+    try:
+        payload = sock.recv(1)
+        if payload:
+            raise AssertionError(
+                f"stale TCP tunnel produced data after epoch change: {payload!r}"
+            )
+    except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError) as exc:
+        if isinstance(exc, socket.timeout):
+            raise AssertionError("stale TCP tunnel did not close within recovery window")
+
+
+def percentile_nearest_rank(values: list[float], percentile: float) -> float:
+    if not values:
+        raise ValueError("cannot calculate percentile of an empty sample")
+    ordered = sorted(values)
+    rank = max(1, math.ceil(percentile * len(ordered)))
+    return ordered[rank - 1]
+
+
+def run_recovery_stress(
+    proxy_port: int,
+    rendezvous: dict,
+    command_path: Path,
+    recovery_status_path: Path,
+) -> dict:
+    peer_ip = rendezvous["server_ip"]
+    tcp_port = int(rendezvous["local_service_port"])
+    udp_port = int(rendezvous["local_udp_service_port"])
+    command_id = 0
+    soft_ms: list[float] = []
+    hard_ms: list[float] = []
+
+    with SocksUdpAssociation("127.0.0.1", proxy_port) as persistent_udp:
+        for iteration in range(20):
+            stale = socks_connect(
+                "127.0.0.1",
+                proxy_port,
+                peer_ip,
+                tcp_port,
+                timeout=2.0,
+            )
+            try:
+                command_id += 1
+                started = time.monotonic()
+                write_json_atomic(
+                    command_path,
+                    {"Id": command_id, "Command": "soft"},
+                )
+                wait_for_stale_tcp_close(stale, timeout=1.0)
+
+                payload = f"netloop-soft-{iteration}".encode("ascii")
+                _, _, response = persistent_udp.roundtrip(
+                    peer_ip,
+                    udp_port,
+                    payload,
+                    timeout=3.0,
+                )
+                if response != payload:
+                    raise AssertionError(
+                        f"soft recovery UDP association payload mismatch at {iteration}"
+                    )
+
+                verify_peer_local_service(
+                    proxy_port,
+                    peer_ip,
+                    tcp_port,
+                    timeout=2.0,
+                )
+                status = wait_recovery_status(
+                    recovery_status_path,
+                    command_id,
+                    "soft",
+                    timeout=3.0,
+                )
+                elapsed_ms = (time.monotonic() - started) * 1000.0
+                soft_ms.append(elapsed_ms)
+                if elapsed_ms > 3000:
+                    raise AssertionError(
+                        f"soft recovery {iteration} exceeded 3000ms: {elapsed_ms:.1f}ms; status={status}"
+                    )
+            finally:
+                stale.close()
+
+        for iteration in range(10):
+            command_id += 1
+            started = time.monotonic()
+            write_json_atomic(
+                command_path,
+                {"Id": command_id, "Command": "hard"},
+            )
+            wait_recovery_phase(
+                recovery_status_path,
+                command_id,
+                "hard",
+                "hard",
+                timeout=2.0,
+            )
+
+            payload = f"netloop-hard-{iteration}".encode("ascii")
+            _, _, response = persistent_udp.roundtrip(
+                peer_ip,
+                udp_port,
+                payload,
+                timeout=6.0,
+            )
+            if response != payload:
+                raise AssertionError(
+                    f"hard recovery UDP association payload mismatch at {iteration}"
+                )
+
+            status = wait_recovery_status(
+                recovery_status_path,
+                command_id,
+                "hard",
+                timeout=6.0,
+            )
+            verify_peer_local_service(
+                proxy_port,
+                peer_ip,
+                tcp_port,
+                timeout=2.0,
+            )
+            elapsed_ms = (time.monotonic() - started) * 1000.0
+            hard_ms.append(elapsed_ms)
+            if elapsed_ms > 5000:
+                raise AssertionError(
+                    f"hard recovery {iteration} exceeded 5000ms: {elapsed_ms:.1f}ms; status={status}"
+                )
+
+    soft_p95 = percentile_nearest_rank(soft_ms, 0.95)
+    hard_p95 = percentile_nearest_rank(hard_ms, 0.95)
+    if soft_p95 > 3000:
+        raise AssertionError(f"soft recovery p95 exceeded 3000ms: {soft_p95:.1f}ms")
+    if hard_p95 > 5000:
+        raise AssertionError(f"hard recovery p95 exceeded 5000ms: {hard_p95:.1f}ms")
+
+    return {
+        "soft_samples_ms": soft_ms,
+        "soft_p95_ms": soft_p95,
+        "hard_samples_ms": hard_ms,
+        "hard_p95_ms": hard_p95,
+        "soft_count": len(soft_ms),
+        "hard_count": len(hard_ms),
+    }
 
 
 def retry(label: str, action, attempts: int = 8, delay: float = 3.0):
@@ -403,6 +633,7 @@ def main() -> int:
     parser.add_argument("--runtime", default="runtime-csharp")
     parser.add_argument("--rendezvous-artifact", required=True)
     parser.add_argument("--listen-port", type=int, default=19080)
+    parser.add_argument("--recovery-stress", action="store_true")
     args = parser.parse_args()
 
     EVIDENCE.mkdir(parents=True, exist_ok=True)
@@ -417,6 +648,7 @@ def main() -> int:
         "egress_ip_matches": False,
         "restart_recovery": False,
         "identity_preserved": False,
+        "recovery_stress": False,
     }
     client_pid = 0
 
@@ -435,7 +667,19 @@ def main() -> int:
             raise FileNotFoundError(executable)
 
         status_path = EVIDENCE / "client_status.json"
-        client_pid = start_client(executable, rendezvous, args.listen_port, status_path)
+        recovery_command_path = EVIDENCE / "recovery_command.json"
+        recovery_status_path = EVIDENCE / "recovery_status.json"
+        if args.recovery_stress:
+            recovery_command_path.unlink(missing_ok=True)
+            recovery_status_path.unlink(missing_ok=True)
+        client_pid = start_client(
+            executable,
+            rendezvous,
+            args.listen_port,
+            status_path,
+            recovery_command_path if args.recovery_stress else None,
+            recovery_status_path if args.recovery_stress else None,
+        )
         status = wait_for_json(status_path, timeout=200)
         result["client_joined"] = True
         result["client_status"] = status
@@ -518,6 +762,15 @@ def main() -> int:
             )
         result["egress_ip_matches"] = True
 
+        if args.recovery_stress:
+            result["recovery_metrics"] = run_recovery_stress(
+                args.listen_port,
+                rendezvous,
+                recovery_command_path,
+                recovery_status_path,
+            )
+            result["recovery_stress"] = True
+
         stale_tunnels: list[socket.socket] = []
         try:
             for _ in range(4):
@@ -535,7 +788,14 @@ def main() -> int:
                     pass
 
         status_path.unlink(missing_ok=True)
-        client_pid = start_client(executable, rendezvous, args.listen_port, status_path)
+        client_pid = start_client(
+            executable,
+            rendezvous,
+            args.listen_port,
+            status_path,
+            recovery_command_path if args.recovery_stress else None,
+            recovery_status_path if args.recovery_stress else None,
+        )
         restarted_status = wait_for_json(status_path, timeout=200)
         result["restart_status"] = restarted_status
         result["identity_preserved"] = restarted_status.get("node_id") == first_node_id
@@ -566,6 +826,19 @@ def main() -> int:
     finally:
         if client_pid:
             kill_process_tree(client_pid)
+        for path in (
+            EVIDENCE / "client_status.json",
+            EVIDENCE / "recovery_status.json",
+        ):
+            try:
+                if path.exists():
+                    process_id = json.loads(path.read_text(encoding="utf-8")).get(
+                        "process_id"
+                    )
+                    if process_id:
+                        kill_process_tree(int(process_id))
+            except (json.JSONDecodeError, OSError, ValueError, TypeError):
+                pass
         collect_windows_evidence(EVIDENCE / "network")
         (EVIDENCE / "result.json").write_text(
             json.dumps(result, indent=2), encoding="utf-8"

@@ -211,6 +211,7 @@ jobs:
           python ci/csharp_e2e_client.py
           --runtime runtime-csharp
           --rendezvous-artifact "${{ env.RENDEZVOUS_ARTIFACT }}"
+          --recovery-stress
 
       - name: Publish client result for machine A
         if: always()
