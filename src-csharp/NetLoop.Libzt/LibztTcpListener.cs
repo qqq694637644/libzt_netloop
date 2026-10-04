@@ -27,7 +27,7 @@ public sealed class LibztTcpListener : IAsyncDisposable
 
         try
         {
-            var bind = LibztNative.BindEasy(fd, family, bindAddress, port);
+            var bind = LibztNative.BindEasy(fd, bindAddress, port);
             if (bind != LibztNative.Ok)
                 throw new LibztException("zts_bsd_bind_easy", bind, LibztNative.GetLastSocketError(fd));
 
@@ -52,7 +52,7 @@ public sealed class LibztTcpListener : IAsyncDisposable
             var buffer = Marshal.AllocHGlobal(LibztNative.IpStringLength);
             try
             {
-                var port = 0;
+                ushort port = 0;
                 using var registration = cancellationToken.Register(
                     static state => LibztNative.Shutdown((int)state!, LibztNative.ShutReadWrite),
                     fd);

@@ -52,7 +52,7 @@ public sealed class LibztTcpConnector : IProxyConnector
                         AttemptTimeoutMilliseconds);
 
                     var result = await Task.Run(
-                        () => LibztNative.ConnectEasy(fd, family, target.Host, target.Port, attemptTimeout),
+                        () => LibztNative.ConnectEasy(fd, target.Host, target.Port, attemptTimeout),
                         CancellationToken.None).ConfigureAwait(false);
 
                     if (result == LibztNative.Ok)

@@ -97,17 +97,29 @@ internal static class LibztNative
     [DllImport(LibraryName, EntryPoint = "CSharp_zts_bsd_socket")]
     internal static extern int Socket(int family, int type, int protocol);
 
-    [DllImport(LibraryName, CharSet = CharSet.Ansi, EntryPoint = "CSharp_zts_bsd_connect_easy")]
+    [DllImport(
+        LibraryName,
+        CharSet = CharSet.Ansi,
+        EntryPoint = "zts_connect",
+        CallingConvention = CallingConvention.Cdecl)]
     internal static extern int ConnectEasy(int fd, int family, string remoteAddress, ushort remotePort, int timeoutMs);
 
-    [DllImport(LibraryName, CharSet = CharSet.Ansi, EntryPoint = "CSharp_zts_bsd_bind_easy")]
-    internal static extern int BindEasy(int fd, int family, string localAddress, ushort localPort);
+    [DllImport(
+        LibraryName,
+        CharSet = CharSet.Ansi,
+        EntryPoint = "zts_bind",
+        CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int BindEasy(int fd, string localAddress, ushort localPort);
 
     [DllImport(LibraryName, EntryPoint = "CSharp_zts_bsd_listen")]
     internal static extern int Listen(int fd, int backlog);
 
-    [DllImport(LibraryName, CharSet = CharSet.Ansi, EntryPoint = "CSharp_zts_bsd_accept_easy")]
-    internal static extern int AcceptEasy(int fd, nint remoteAddress, int length, ref int remotePort);
+    [DllImport(
+        LibraryName,
+        CharSet = CharSet.Ansi,
+        EntryPoint = "zts_accept",
+        CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int AcceptEasy(int fd, nint remoteAddress, int length, ref ushort remotePort);
 
     [DllImport(LibraryName, EntryPoint = "CSharp_zts_bsd_read")]
     internal static extern int Read(int fd, nint buffer, uint length);
