@@ -222,7 +222,13 @@ class Socks5TestProxy:
         declared: tuple[str, int],
     ) -> None:
         relay = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        relay.bind((self.host, 0))
+        # The TCP test proxy intentionally listens on loopback, but the UDP
+        # relay must not bind its source address to 127.0.0.1. A loopback-bound
+        # UDP socket cannot reach Internet destinations on Windows
+        # (WSAENETUNREACH / 10051). Binding the relay to the IPv4 wildcard still
+        # accepts the NetLoop client's datagrams addressed to 127.0.0.1 while
+        # allowing the OS to choose the runner's real egress interface.
+        relay.bind(("0.0.0.0", 0))
         relay.setblocking(False)
         relay_port = relay.getsockname()[1]
 
