@@ -5,6 +5,11 @@ namespace NetLoop.Host;
 
 internal sealed class RoutingConnector : IProxyConnector
 {
+    private static readonly TimeSpan PeerNegotiationRecoveryWindow =
+        TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan PeerNegotiationAttemptTimeout =
+        TimeSpan.FromMilliseconds(750);
+
     private readonly RouteSelector _selector;
     private readonly bool _overlayIngress;
     private readonly ushort _overlayPort;
@@ -61,7 +66,9 @@ internal sealed class RoutingConnector : IProxyConnector
 
         var proxy = new Socks5ProxyConnector(
             _libztConnector,
-            new ProxyTarget(peer.ToString(), _overlayPort));
+            new ProxyTarget(peer.ToString(), _overlayPort),
+            negotiationRetryWindow: PeerNegotiationRecoveryWindow,
+            negotiationAttemptTimeout: PeerNegotiationAttemptTimeout);
         return proxy.ConnectAsync(target, cancellationToken);
     }
 }

@@ -51,9 +51,16 @@ public sealed class LibztTcpConnector : IProxyConnector
                         250,
                         AttemptTimeoutMilliseconds);
 
+                    using var registration = cancellationToken.Register(
+                        static state =>
+                            LibztNative.Shutdown(
+                                (int)state!,
+                                LibztNative.ShutReadWrite),
+                        fd);
                     var result = await Task.Run(
                         () => LibztNative.ConnectEasy(fd, target.Host, target.Port, attemptTimeout),
                         CancellationToken.None).ConfigureAwait(false);
+                    cancellationToken.ThrowIfCancellationRequested();
 
                     if (result == LibztNative.Ok)
                     {
