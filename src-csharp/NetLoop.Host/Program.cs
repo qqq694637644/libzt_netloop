@@ -169,8 +169,14 @@ internal static class Program
         if (options.Egress == "direct")
             return new DirectUdpTransportFactory();
 
-        return new UnsupportedUdpEgressFactory(
-            "UDP through upstream SOCKS5 requires UDP ASSOCIATE; DIRECT fallback is intentionally disabled.");
+        var direct = new DirectTcpConnector(options.ConnectTimeout);
+        return new Socks5UdpProxyTransportFactory(
+            direct,
+            new ProxyTarget(
+                options.UpstreamHost ?? throw new InvalidOperationException("Missing upstream SOCKS5 host."),
+                options.UpstreamPort),
+            options.UpstreamUsername,
+            options.UpstreamPassword);
     }
 
     private static IPAddress SelectOverlayBindAddress(IReadOnlyList<IPAddress> addresses)
@@ -182,12 +188,4 @@ internal static class Program
             ?? addresses[0];
     }
 
-    private sealed class UnsupportedUdpEgressFactory(string message) : IProxyUdpTransportFactory
-    {
-        public ValueTask<IProxyUdpTransport> CreateAsync(CancellationToken cancellationToken)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            throw new NotSupportedException(message);
-        }
-    }
 }
