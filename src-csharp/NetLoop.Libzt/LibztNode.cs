@@ -74,13 +74,54 @@ public sealed class LibztNode : IAsyncDisposable
 
         ThrowIfError("zts_node_start", LibztNative.NodeStart());
         _started = true;
-        State = await JoinAndWaitAsync(cancellationToken).ConfigureAwait(false);
+        State = await RejoinAndWaitAsync(cancellationToken).ConfigureAwait(false);
         JsonLog.Info("libzt_hard_recovery_ready", new {
             network = _networkId.ToString("x16"),
             node = State.NodeId.ToString("x10"),
-            addresses = State.ManagedAddresses.Select(static x => x.ToString()).ToArray()
+            addresses = State.ManagedAddresses.Select(static x => x.ToString()).ToArray(),
+            node_online = LibztNative.NodeIsOnline() == 1
         });
         return State;
+    }
+
+    private async Task<LibztNetworkState> RejoinAndWaitAsync(
+        CancellationToken cancellationToken)
+    {
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken);
+        timeoutCts.CancelAfter(_startupTimeout);
+        var token = timeoutCts.Token;
+
+        // Do not serialize Hard Recovery behind NodeIsOnline(). The network
+        // join API only requires a started node, and cached/ad-hoc network
+        // transport can become usable before root connectivity reports online.
+        // Business recovery is gated on transport readiness + Managed IP, not
+        // on the broader node-online indicator.
+        JsonLog.Info("libzt_hard_recovery_join_start", new {
+            network = _networkId.ToString("x16"),
+            node = LibztNative.NodeGetId().ToString("x10"),
+            node_online = LibztNative.NodeIsOnline() == 1
+        });
+        ThrowIfError("zts_net_join", LibztNative.NetJoin(_networkId));
+
+        while (LibztNative.NetTransportIsReady(_networkId) != 1)
+        {
+            var status = LibztNative.NetGetStatus(_networkId);
+            if (IsTerminalNetworkStatus(status))
+                throw new LibztException($"network join status={status}", status);
+
+            await Task.Delay(50, token).ConfigureAwait(false);
+        }
+
+        LibztNetworkState state;
+        while (true)
+        {
+            state = QueryNetworkState();
+            if (state.ManagedAddresses.Count != 0)
+                return state;
+
+            await Task.Delay(50, token).ConfigureAwait(false);
+        }
     }
 
     public LibztNetworkState RefreshNetworkState()
