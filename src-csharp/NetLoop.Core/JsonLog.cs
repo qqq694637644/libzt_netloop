@@ -19,7 +19,6 @@ public static class JsonLog
         lock (Gate)
         {
             Console.Out.WriteLine(line);
-            Console.Out.Flush();
         }
     }
 

@@ -50,25 +50,21 @@ internal sealed class RecoveryCommandWatcher : IAsyncDisposable
                 if (command is not null && command.Id > _lastCommandId)
                 {
                     _lastCommandId = command.Id;
-                    JsonLog.Info("recovery_command_received", new {
-                        command_id = command.Id,
-                        command = command.Command
-                    });
-
+                    Task<long>? recoveryTask = null;
                     switch (command.Command)
                     {
                         case "soft":
-                            await _recovery.TriggerSoftRecoveryAsync(
+                            recoveryTask = _recovery.TriggerSoftRecoveryAsync(
                                 $"command:{command.Id}",
                                 command.Id,
-                                cancellationToken).ConfigureAwait(false);
+                                cancellationToken);
                             break;
 
                         case "hard":
-                            await _recovery.TriggerHardRecoveryAsync(
+                            recoveryTask = _recovery.TriggerHardRecoveryAsync(
                                 $"command:{command.Id}",
                                 command.Id,
-                                cancellationToken).ConfigureAwait(false);
+                                cancellationToken);
                             break;
 
                         default:
@@ -78,6 +74,18 @@ internal sealed class RecoveryCommandWatcher : IAsyncDisposable
                             });
                             break;
                     }
+
+                    // Starting an async recovery executes its synchronous fast
+                    // path immediately. In the uncontended case that advances
+                    // the epoch before we do any diagnostic console I/O, so a
+                    // slow redirected stdout cannot delay stale-tunnel abort.
+                    JsonLog.Info("recovery_command_received", new {
+                        command_id = command.Id,
+                        command = command.Command
+                    });
+
+                    if (recoveryTask is not null)
+                        await recoveryTask.ConfigureAwait(false);
                 }
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
