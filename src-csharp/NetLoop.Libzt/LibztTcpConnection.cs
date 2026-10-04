@@ -6,6 +6,7 @@ namespace NetLoop.Libzt;
 public sealed class LibztTcpConnection : IProxyConnection
 {
     private CancellationTokenRegistration _generationRegistration;
+    private CancellationToken _generationToken;
     private int _fd;
     private int _generationBound;
 
@@ -21,6 +22,8 @@ public sealed class LibztTcpConnection : IProxyConnection
 
     public System.Net.EndPoint? RemoteEndPoint => null;
 
+    public CancellationToken LifetimeCancellation => _generationToken;
+
     public void BindGeneration(CancellationToken generationToken)
     {
         if (!generationToken.CanBeCanceled)
@@ -28,6 +31,7 @@ public sealed class LibztTcpConnection : IProxyConnection
         if (Interlocked.Exchange(ref _generationBound, 1) != 0)
             throw new InvalidOperationException("libzt connection is already bound to a network generation.");
 
+        _generationToken = generationToken;
         _generationRegistration = generationToken.Register(
             static state => ((LibztTcpConnection)state!).AbortGeneration(),
             this);

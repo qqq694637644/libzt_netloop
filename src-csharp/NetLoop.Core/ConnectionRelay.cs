@@ -12,7 +12,10 @@ public static class ConnectionRelay
         TimeSpan halfCloseTimeout,
         CancellationToken cancellationToken)
     {
-        using var relayCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        using var relayCts = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            left.LifetimeCancellation,
+            right.LifetimeCancellation);
         var leftToRight = PumpAsync(left, right, relayCts.Token);
         var rightToLeft = PumpAsync(right, left, relayCts.Token);
 
