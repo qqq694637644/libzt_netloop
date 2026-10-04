@@ -42,7 +42,7 @@ add_subdirectory(external/libzt EXCLUDE_FROM_ALL)
 if(MSVC)
     set(LIBZT_METRICS_HEADER
         "${CMAKE_CURRENT_SOURCE_DIR}/external/libzt/ext/ZeroTierOne/node/Metrics.hpp")
-    foreach(LIBZT_TARGET zto_obj libzt_obj zto_pic zt_pic zt-static)
+    foreach(LIBZT_TARGET zto_obj libzt_obj zto_pic zt_pic zt-static zt-shared)
         if(TARGET ${LIBZT_TARGET})
             target_compile_options(
                 ${LIBZT_TARGET}
