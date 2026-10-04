@@ -151,7 +151,7 @@ jobs:
           path: package
 
       - name: Deploy runtime
-        run: python ci/deploy.py --source package --destination runtime-csharp
+        run: python ci/deploy.py --source package --destination runtime-csharp --all-files
 
       - name: Join ad-hoc network and prepare exit
         run: python ci/csharp_e2e_server.py prepare --runtime runtime-csharp
@@ -200,7 +200,7 @@ jobs:
           path: package
 
       - name: Deploy runtime
-        run: python ci/deploy.py --source package --destination runtime-csharp
+        run: python ci/deploy.py --source package --destination runtime-csharp --all-files
 
       - name: Cross-machine peer-local and default-exit E2E
         id: e2e
