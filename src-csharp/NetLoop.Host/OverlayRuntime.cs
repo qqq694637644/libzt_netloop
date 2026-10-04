@@ -66,6 +66,11 @@ internal sealed class OverlayRuntimeController : IAsyncDisposable
         NetLoop.Libzt.LibztNetworkState state,
         CancellationToken cancellationToken)
     {
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        JsonLog.Info("overlay_runtime_replace_start", new {
+            epoch = _generations.CurrentEpoch
+        });
+
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
@@ -74,9 +79,21 @@ internal sealed class OverlayRuntimeController : IAsyncDisposable
             var previous = _current;
             _current = null;
             if (previous is not null)
+            {
+                JsonLog.Info("overlay_runtime_previous_dispose_start", new {
+                    epoch = _generations.CurrentEpoch
+                });
                 await previous.DisposeAsync().ConfigureAwait(false);
+                JsonLog.Info("overlay_runtime_previous_dispose_ready", new {
+                    epoch = _generations.CurrentEpoch
+                });
+            }
 
             _current = Create(state);
+            JsonLog.Info("overlay_runtime_replace_ready", new {
+                epoch = _generations.CurrentEpoch,
+                elapsed_ms = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds
+            });
         }
         finally
         {
