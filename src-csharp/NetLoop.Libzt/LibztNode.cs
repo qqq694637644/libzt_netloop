@@ -10,6 +10,8 @@ public sealed class LibztNode : IAsyncDisposable
     private readonly string _stateDirectory;
     private readonly TimeSpan _startupTimeout;
     private readonly LibztNative.EventCallback _eventCallback;
+    private readonly TaskCompletionSource _nodeUp = new(
+        TaskCreationOptions.RunContinuationsAsynchronously);
     private bool _started;
     private bool _freed;
 
@@ -73,6 +75,7 @@ public sealed class LibztNode : IAsyncDisposable
         timeoutCts.CancelAfter(_startupTimeout);
         var token = timeoutCts.Token;
 
+        await _nodeUp.Task.WaitAsync(token).ConfigureAwait(false);
         var nodeId = LibztNative.NodeGetId();
         JsonLog.Info("libzt_network_join_start", new {
             network = _networkId.ToString("x16"),
@@ -216,7 +219,7 @@ public sealed class LibztNode : IAsyncDisposable
             throw new LibztException(operation, result, LibztNative.GetErrno());
     }
 
-    private static void OnNativeEvent(nint message)
+    private void OnNativeEvent(nint message)
     {
         if (message == 0)
             return;
@@ -225,6 +228,13 @@ public sealed class LibztNode : IAsyncDisposable
         {
             var native = Marshal.PtrToStructure<LibztNative.EventMessage>(message);
             JsonLog.Info("libzt_event", new { event_code = native.EventCode });
+            if (native.EventCode == LibztNative.EventNodeUp)
+                _nodeUp.TrySetResult();
+            else if (native.EventCode == LibztNative.EventNodeFatalError)
+                _nodeUp.TrySetException(
+                    new LibztException(
+                        "libzt node initialization fatal event",
+                        LibztNative.ErrService));
         }
         catch (Exception ex)
         {
