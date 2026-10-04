@@ -102,7 +102,7 @@ internal static class LibztNative
         CharSet = CharSet.Ansi,
         EntryPoint = "zts_connect",
         CallingConvention = CallingConvention.Cdecl)]
-    internal static extern int ConnectEasy(int fd, int family, string remoteAddress, ushort remotePort, int timeoutMs);
+    internal static extern int ConnectEasy(int fd, string remoteAddress, ushort remotePort, int timeoutMs);
 
     [DllImport(
         LibraryName,
