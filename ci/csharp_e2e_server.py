@@ -87,6 +87,7 @@ def prepare(args: argparse.Namespace) -> int:
     )
 
     netloop_pid = 0
+    upstream_pid = 0
     try:
         wait_for_tcp("::1", args.local_service_port, timeout=20)
         wait_for_udp_echo("::1", args.local_udp_service_port, timeout=20)
@@ -99,30 +100,63 @@ def prepare(args: argparse.Namespace) -> int:
             expected_udp_ip + "\n", encoding="utf-8"
         )
 
+        netloop_command = [
+            str(executable),
+            "--network",
+            network_id,
+            "--state-dir",
+            str(state_dir),
+            "--socks-host",
+            "127.0.0.1",
+            "--socks-port",
+            str(args.socks_port),
+            "--overlay-port",
+            str(args.overlay_port),
+            "--overlay-udp-port",
+            str(args.overlay_udp_port),
+            "--status-file",
+            str(status_path),
+            "--startup-timeout",
+            "180",
+            "--connect-timeout",
+            "20",
+        ]
+        if args.upstream_socks_port:
+            upstream_pid = start_detached(
+                [
+                    sys.executable,
+                    str(ROOT / "ci" / "socks5_test_proxy.py"),
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(args.upstream_socks_port),
+                    "--username",
+                    args.upstream_username,
+                    "--password",
+                    args.upstream_password,
+                ],
+                EVIDENCE / "upstream_socks.log",
+            )
+            wait_for_tcp("127.0.0.1", args.upstream_socks_port, timeout=20)
+            netloop_command.extend(
+                [
+                    "--egress",
+                    "upstream-socks5",
+                    "--upstream-host",
+                    "127.0.0.1",
+                    "--upstream-port",
+                    str(args.upstream_socks_port),
+                    "--upstream-user",
+                    args.upstream_username,
+                    "--upstream-password",
+                    args.upstream_password,
+                ]
+            )
+        else:
+            netloop_command.extend(["--egress", "direct"])
+
         netloop_pid = start_detached(
-            [
-                str(executable),
-                "--network",
-                network_id,
-                "--state-dir",
-                str(state_dir),
-                "--socks-host",
-                "127.0.0.1",
-                "--socks-port",
-                str(args.socks_port),
-                "--overlay-port",
-                str(args.overlay_port),
-                "--overlay-udp-port",
-                str(args.overlay_udp_port),
-                "--egress",
-                "direct",
-                "--status-file",
-                str(status_path),
-                "--startup-timeout",
-                "180",
-                "--connect-timeout",
-                "20",
-            ],
+            netloop_command,
             EVIDENCE / "netloop_process.log",
         )
 
@@ -132,6 +166,7 @@ def prepare(args: argparse.Namespace) -> int:
                     "netloop_pid": netloop_pid,
                     "http_pid": http_pid,
                     "udp_pid": udp_pid,
+                    "upstream_pid": upstream_pid,
                 },
                 indent=2,
             ),
@@ -155,6 +190,9 @@ def prepare(args: argparse.Namespace) -> int:
             "expected_udp_public_ip": expected_udp_ip,
             "stun_host": "stun.l.google.com",
             "stun_port": 19302,
+            "server_egress": (
+                "upstream-socks5" if args.upstream_socks_port else "direct"
+            ),
             "github_run_id": os.environ.get("GITHUB_RUN_ID", ""),
             "github_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
         }
@@ -168,6 +206,7 @@ def prepare(args: argparse.Namespace) -> int:
         kill_process_tree(netloop_pid)
         kill_process_tree(http_pid)
         kill_process_tree(udp_pid)
+        kill_process_tree(upstream_pid)
         raise
 
 
@@ -192,6 +231,7 @@ def hold(args: argparse.Namespace) -> int:
             kill_process_tree(int(pids.get("netloop_pid", 0)))
             kill_process_tree(int(pids.get("http_pid", 0)))
             kill_process_tree(int(pids.get("udp_pid", 0)))
+            kill_process_tree(int(pids.get("upstream_pid", 0)))
     return exit_code
 
 
@@ -206,6 +246,9 @@ def main() -> int:
     prep.add_argument("--socks-port", type=int, default=18080)
     prep.add_argument("--local-service-port", type=int, default=18181)
     prep.add_argument("--local-udp-service-port", type=int, default=18182)
+    prep.add_argument("--upstream-socks-port", type=int)
+    prep.add_argument("--upstream-username", default="netloop-ci")
+    prep.add_argument("--upstream-password", default="netloop-ci-password")
 
     wait = subparsers.add_parser("hold")
     wait.add_argument("--client-artifact", required=True)
@@ -225,6 +268,7 @@ def main() -> int:
             kill_process_tree(int(pids.get("netloop_pid", 0)))
             kill_process_tree(int(pids.get("http_pid", 0)))
             kill_process_tree(int(pids.get("udp_pid", 0)))
+            kill_process_tree(int(pids.get("upstream_pid", 0)))
         print(traceback.format_exc(), file=sys.stderr)
         return 1
 
