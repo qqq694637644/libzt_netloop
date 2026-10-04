@@ -77,7 +77,17 @@ internal sealed class RecoveryCoordinator : IOverlayRecoveryObserver, IAsyncDisp
         long? commandId,
         CancellationToken cancellationToken)
     {
+        var gateStarted = Stopwatch.GetTimestamp();
         await _recoveryGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        var gateWait = Stopwatch.GetElapsedTime(gateStarted);
+        if (gateWait > TimeSpan.FromMilliseconds(25))
+        {
+            JsonLog.Info("recovery_soft_gate_wait", new {
+                reason,
+                command_id = commandId,
+                elapsed_ms = gateWait.TotalMilliseconds
+            });
+        }
         OverlayGeneration generation;
         long sequence;
         Exception? runtimeReplaceFailure = null;
@@ -407,6 +417,12 @@ internal sealed class RecoveryCoordinator : IOverlayRecoveryObserver, IAsyncDisp
         string reason,
         CancellationToken cancellationToken)
     {
+        // Overlay success is reported for every successful peer TCP connect.
+        // Do not queue those normal data-plane events behind the recovery gate
+        // unless this exact epoch actually has a pending soft recovery.
+        if (Volatile.Read(ref _pendingSoftEpoch) != epoch)
+            return;
+
         await _recoveryGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
