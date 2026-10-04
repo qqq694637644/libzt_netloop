@@ -32,13 +32,20 @@ internal static class LibztNative
     internal const int NetworkStatusPortError = 4;
     internal const int NetworkStatusClientTooOld = 5;
     internal const int EAgain = 11;
+    internal const int EIsConn = 106;
     internal const int ETimedOut = 110;
+    internal const int EAlready = 114;
+    internal const int EInProgress = 115;
     // The pinned Windows libzt/lwIP build uses UCRT errno values for
     // SO_RCVTIMEO. Keep these explicit until the native ABI is normalized.
     internal const int WindowsETimedOut = 138;
     internal const int WindowsEWouldBlock = 140;
 
     internal const int IpStringLength = 46;
+    internal const short PollOut = 0x002;
+    internal const short PollErr = 0x004;
+    internal const short PollNval = 0x008;
+    internal const short PollHup = 0x200;
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate void EventCallback(nint message);
@@ -110,6 +117,9 @@ internal static class LibztNative
         EntryPoint = "zts_connect",
         CallingConvention = CallingConvention.Cdecl)]
     internal static extern int ConnectEasy(int fd, string remoteAddress, ushort remotePort, int timeoutMs);
+
+    [DllImport(LibraryName, EntryPoint = "CSharp_zts_bsd_connect")]
+    internal static extern int Connect(int fd, nint address, ushort addressLength);
 
     [DllImport(
         LibraryName,
@@ -184,6 +194,9 @@ internal static class LibztNative
     [DllImport(LibraryName, EntryPoint = "CSharp_zts_set_blocking")]
     internal static extern int SetBlocking(int fd, int enabled);
 
+    [DllImport(LibraryName, EntryPoint = "CSharp_zts_bsd_poll")]
+    internal static extern int Poll(nint pollDescriptors, uint count, int timeoutMilliseconds);
+
     [DllImport(LibraryName, EntryPoint = "CSharp_zts_bsd_setsockopt")]
     internal static extern int SetSocketOption(int fd, int level, int option, nint value, ushort valueLength);
 
@@ -231,5 +244,13 @@ internal static class LibztNative
         internal nint Address;
         internal nint Cache;
         internal int Length;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct PollDescriptor
+    {
+        internal int FileDescriptor;
+        internal short Events;
+        internal short ReturnedEvents;
     }
 }
