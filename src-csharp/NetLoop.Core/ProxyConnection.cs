@@ -7,6 +7,10 @@ public interface IProxyConnection : IAsyncDisposable
 {
     string Description { get; }
 
+    EndPoint? LocalEndPoint { get; }
+
+    EndPoint? RemoteEndPoint { get; }
+
     ValueTask<int> ReadAsync(byte[] buffer, int count, CancellationToken cancellationToken);
 
     ValueTask WriteAsync(byte[] buffer, int count, CancellationToken cancellationToken);
@@ -32,6 +36,10 @@ public sealed class SystemTcpConnection : IProxyConnection
     }
 
     public string Description { get; }
+
+    public EndPoint? LocalEndPoint => _client.Client.LocalEndPoint;
+
+    public EndPoint? RemoteEndPoint => _client.Client.RemoteEndPoint;
 
     public async ValueTask<int> ReadAsync(byte[] buffer, int count, CancellationToken cancellationToken)
         => await _stream.ReadAsync(buffer.AsMemory(0, count), cancellationToken).ConfigureAwait(false);

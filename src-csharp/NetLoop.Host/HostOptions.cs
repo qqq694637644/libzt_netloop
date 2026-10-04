@@ -9,6 +9,7 @@ internal sealed class HostOptions
     internal IPAddress SocksAddress { get; init; } = IPAddress.Loopback;
     internal ushort SocksPort { get; init; } = 1080;
     internal ushort OverlayPort { get; init; } = 42042;
+    internal ushort OverlayUdpPort { get; init; } = 42043;
     internal IPAddress? DefaultExit { get; init; }
     internal IReadOnlyList<IPAddress> Peers { get; init; } = [];
     internal string Egress { get; init; } = "direct";
@@ -19,6 +20,7 @@ internal sealed class HostOptions
     internal string? StatusFile { get; init; }
     internal TimeSpan StartupTimeout { get; init; } = TimeSpan.FromSeconds(120);
     internal TimeSpan ConnectTimeout { get; init; } = TimeSpan.FromSeconds(20);
+    internal TimeSpan UdpIdleTimeout { get; init; } = TimeSpan.FromSeconds(60);
     internal bool ShowHelp { get; init; }
     internal bool ShowVersion { get; init; }
 
@@ -75,6 +77,7 @@ internal sealed class HostOptions
             SocksAddress = IPAddress.Parse(Optional(values, "--socks-host") ?? "127.0.0.1"),
             SocksPort = ParsePort(Optional(values, "--socks-port") ?? "1080", "--socks-port"),
             OverlayPort = ParsePort(Optional(values, "--overlay-port") ?? "42042", "--overlay-port"),
+            OverlayUdpPort = ParsePort(Optional(values, "--overlay-udp-port") ?? "42043", "--overlay-udp-port"),
             DefaultExit = defaultExit,
             Peers = peers,
             Egress = egress,
@@ -84,7 +87,8 @@ internal sealed class HostOptions
             UpstreamPassword = Optional(values, "--upstream-password"),
             StatusFile = Optional(values, "--status-file"),
             StartupTimeout = TimeSpan.FromSeconds(ParsePositiveInt(Optional(values, "--startup-timeout") ?? "120", "--startup-timeout")),
-            ConnectTimeout = TimeSpan.FromSeconds(ParsePositiveInt(Optional(values, "--connect-timeout") ?? "20", "--connect-timeout"))
+            ConnectTimeout = TimeSpan.FromSeconds(ParsePositiveInt(Optional(values, "--connect-timeout") ?? "20", "--connect-timeout")),
+            UdpIdleTimeout = TimeSpan.FromSeconds(ParsePositiveInt(Optional(values, "--udp-idle-timeout") ?? "60", "--udp-idle-timeout"))
         };
     }
 
@@ -119,6 +123,7 @@ internal sealed class HostOptions
           --socks-host <ip>           Local SOCKS5 address (default 127.0.0.1)
           --socks-port <port>         Local SOCKS5 port (default 1080)
           --overlay-port <port>       NetLoop peer Agent TCP port (default 42042)
+          --overlay-udp-port <port>   NetLoop peer Agent UDP port (default 42043)
           --peer <managed-ip>         Explicit peer Managed IP; repeatable
           --default-exit <managed-ip> Default egress peer; also treated as a peer
           --egress <mode>             direct | upstream-socks5 (default direct)
@@ -129,6 +134,7 @@ internal sealed class HostOptions
           --status-file <path>        Atomic readiness/status JSON output
           --startup-timeout <sec>     libzt startup timeout (default 120)
           --connect-timeout <sec>     Peer/egress connect timeout (default 20)
+          --udp-idle-timeout <sec>    UDP association idle timeout (default 60)
           --version
           --help
         """;

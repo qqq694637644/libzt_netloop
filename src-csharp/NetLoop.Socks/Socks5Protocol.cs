@@ -49,7 +49,8 @@ internal static class Socks5Protocol
     internal static async ValueTask<ProxyTarget> ReadTargetAsync(
         IProxyConnection connection,
         byte addressType,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool allowZeroPort = false)
     {
         string host;
         switch (addressType)
@@ -87,7 +88,7 @@ internal static class Socks5Protocol
         var portBytes = new byte[2];
         await ReadExactlyAsync(connection, portBytes, 2, cancellationToken).ConfigureAwait(false);
         var port = checked((ushort)((portBytes[0] << 8) | portBytes[1]));
-        if (port == 0)
+        if (port == 0 && !allowZeroPort)
             throw new ProtocolViolationException("SOCKS5 target port cannot be zero.");
 
         return new ProxyTarget(host, port);
@@ -122,6 +123,20 @@ internal static class Socks5Protocol
 
     internal static byte[] BuildReply(byte reply)
         => [Version, reply, 0, Ipv4, 0, 0, 0, 0, 0, 0];
+
+    internal static byte[] BuildReply(byte reply, IPEndPoint endpoint)
+    {
+        var addressBytes = endpoint.Address.GetAddressBytes();
+        var result = new byte[4 + addressBytes.Length + 2];
+        result[0] = Version;
+        result[1] = reply;
+        result[2] = 0;
+        result[3] = addressBytes.Length == 4 ? Ipv4 : Ipv6;
+        addressBytes.CopyTo(result, 4);
+        result[^2] = (byte)(endpoint.Port >> 8);
+        result[^1] = (byte)(endpoint.Port & 0xFF);
+        return result;
+    }
 
     internal static async ValueTask ConsumeReplyAddressAsync(
         IProxyConnection connection,

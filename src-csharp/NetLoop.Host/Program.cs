@@ -8,6 +8,7 @@ namespace NetLoop.Host;
 internal static class Program
 {
     private const int MaxTcpTunnels = 128;
+    private const int MaxUdpAssociations = 64;
     private static readonly TimeSpan HalfCloseTimeout = TimeSpan.FromSeconds(15);
 
     internal static async Task<int> Main(string[] args)
@@ -52,6 +53,17 @@ internal static class Program
             var libztConnector = new LibztTcpConnector(options.ConnectTimeout);
             var loopbackConnector = new LoopbackTcpConnector(options.ConnectTimeout);
             IProxyConnector egressConnector = BuildEgressConnector(options);
+            var overlayBind = SelectOverlayBindAddress(state.ManagedAddresses);
+            var udpEgressFactory = BuildUdpEgressFactory(options);
+            var routingUdpFactory = new RoutingUdpTransportFactory(
+                selector,
+                overlayBind,
+                options.OverlayUdpPort,
+                udpEgressFactory);
+            var udpAssociationFactory = new Socks5UdpAssociationFactory(
+                routingUdpFactory,
+                MaxUdpAssociations,
+                options.UdpIdleTimeout);
 
             var localRouter = new RoutingConnector(
                 selector,
@@ -68,16 +80,25 @@ internal static class Program
                 loopbackConnector,
                 egressConnector);
 
-            var overlayBind = SelectOverlayBindAddress(state.ManagedAddresses);
             await using var overlayAgent = new OverlaySocksAgent(
                 overlayBind.ToString(),
                 options.OverlayPort,
                 new Socks5ConnectionHandler(overlayRouter, HalfCloseTimeout),
                 MaxTcpTunnels);
+            await using var overlayUdpAgent = new OverlayUdpAgent(
+                overlayBind,
+                options.OverlayUdpPort,
+                selector,
+                udpEgressFactory,
+                MaxUdpAssociations,
+                options.UdpIdleTimeout);
 
             await using var localSocks = new LocalSocksServer(
                 new IPEndPoint(options.SocksAddress, options.SocksPort),
-                new Socks5ConnectionHandler(localRouter, HalfCloseTimeout),
+                new Socks5ConnectionHandler(
+                    localRouter,
+                    HalfCloseTimeout,
+                    udpAssociationFactory),
                 MaxTcpTunnels);
             localSocks.Start();
 
@@ -90,6 +111,7 @@ internal static class Program
                     managed_addresses = state.ManagedAddresses.Select(static x => x.ToString()).ToArray(),
                     overlay_host = overlayBind.ToString(),
                     overlay_port = options.OverlayPort,
+                    overlay_udp_port = options.OverlayUdpPort,
                     socks_host = options.SocksAddress.ToString(),
                     socks_port = options.SocksPort,
                     peers = peers.Select(static x => x.ToString()).Order().ToArray(),
@@ -102,6 +124,7 @@ internal static class Program
                 network = options.NetworkId.ToString("x16"),
                 node = state.NodeId.ToString("x10"),
                 overlay = $"{overlayBind}:{options.OverlayPort}",
+                overlay_udp = $"{overlayBind}:{options.OverlayUdpPort}",
                 socks = $"{options.SocksAddress}:{options.SocksPort}"
             });
 
@@ -141,6 +164,15 @@ internal static class Program
             options.UpstreamPassword);
     }
 
+    private static IProxyUdpTransportFactory BuildUdpEgressFactory(HostOptions options)
+    {
+        if (options.Egress == "direct")
+            return new DirectUdpTransportFactory();
+
+        return new UnsupportedUdpEgressFactory(
+            "UDP through upstream SOCKS5 requires UDP ASSOCIATE; DIRECT fallback is intentionally disabled.");
+    }
+
     private static IPAddress SelectOverlayBindAddress(IReadOnlyList<IPAddress> addresses)
     {
         if (addresses.Count == 0)
@@ -148,5 +180,14 @@ internal static class Program
 
         return addresses.FirstOrDefault(static x => x.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
             ?? addresses[0];
+    }
+
+    private sealed class UnsupportedUdpEgressFactory(string message) : IProxyUdpTransportFactory
+    {
+        public ValueTask<IProxyUdpTransport> CreateAsync(CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            throw new NotSupportedException(message);
+        }
     }
 }

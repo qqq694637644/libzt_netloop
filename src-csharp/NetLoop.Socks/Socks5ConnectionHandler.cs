@@ -8,11 +8,16 @@ public sealed class Socks5ConnectionHandler
 {
     private readonly IProxyConnector _connector;
     private readonly TimeSpan _halfCloseTimeout;
+    private readonly ISocks5UdpAssociationFactory? _udpAssociationFactory;
 
-    public Socks5ConnectionHandler(IProxyConnector connector, TimeSpan halfCloseTimeout)
+    public Socks5ConnectionHandler(
+        IProxyConnector connector,
+        TimeSpan halfCloseTimeout,
+        ISocks5UdpAssociationFactory? udpAssociationFactory = null)
     {
         _connector = connector;
         _halfCloseTimeout = halfCloseTimeout;
+        _udpAssociationFactory = udpAssociationFactory;
     }
 
     public async Task HandleAsync(IProxyConnection client, CancellationToken cancellationToken)
@@ -38,6 +43,35 @@ public sealed class Socks5ConnectionHandler
         await Socks5Protocol.ReadExactlyAsync(client, header, 4, cancellationToken).ConfigureAwait(false);
         if (header[0] != Socks5Protocol.Version || header[2] != 0)
             throw new ProtocolViolationException("Invalid SOCKS5 request header.");
+
+        if (header[1] == Socks5Protocol.UdpAssociate)
+        {
+            if (_udpAssociationFactory is null)
+            {
+                var unsupported = Socks5Protocol.BuildReply(Socks5Protocol.ReplyCommandNotSupported);
+                await client.WriteAsync(unsupported, unsupported.Length, cancellationToken).ConfigureAwait(false);
+                return;
+            }
+
+            ProxyTarget declaredEndpoint;
+            try
+            {
+                declaredEndpoint = await Socks5Protocol.ReadTargetAsync(
+                    client,
+                    header[3],
+                    cancellationToken,
+                    allowZeroPort: true).ConfigureAwait(false);
+            }
+            catch (NotSupportedException)
+            {
+                var unsupported = Socks5Protocol.BuildReply(Socks5Protocol.ReplyAddressTypeNotSupported);
+                await client.WriteAsync(unsupported, unsupported.Length, cancellationToken).ConfigureAwait(false);
+                return;
+            }
+
+            await HandleUdpAssociationAsync(client, declaredEndpoint, cancellationToken).ConfigureAwait(false);
+            return;
+        }
 
         if (header[1] != Socks5Protocol.Connect)
         {
@@ -92,6 +126,85 @@ public sealed class Socks5ConnectionHandler
         {
             if (remote is not null)
                 await remote.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    private async Task HandleUdpAssociationAsync(
+        IProxyConnection client,
+        ProxyTarget declaredEndpoint,
+        CancellationToken cancellationToken)
+    {
+        ISocks5UdpAssociation association;
+        try
+        {
+            association = await _udpAssociationFactory!.CreateAsync(
+                client,
+                declaredEndpoint,
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            var failed = Socks5Protocol.BuildReply(Socks5Protocol.ReplyGeneralFailure);
+            await client.WriteAsync(failed, failed.Length, cancellationToken).ConfigureAwait(false);
+            JsonLog.Error("socks_udp_associate_failed", new {
+                client = client.RemoteEndPoint?.ToString(),
+                declared = declaredEndpoint.ToString(),
+                error_type = ex.GetType().Name,
+                error = ex.Message
+            });
+            return;
+        }
+
+        await using var associationLifetime = association;
+
+        var reply = Socks5Protocol.BuildReply(
+            Socks5Protocol.ReplySucceeded,
+            association.RelayEndPoint);
+        await client.WriteAsync(reply, reply.Length, cancellationToken).ConfigureAwait(false);
+
+        JsonLog.Info("socks_udp_associate_ready", new {
+            client = client.RemoteEndPoint?.ToString(),
+            declared = declaredEndpoint.ToString(),
+            relay = association.RelayEndPoint.ToString()
+        });
+
+        using var controlWaitCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var controlClosed = WaitForControlCloseAsync(client, controlWaitCts.Token);
+        var completed = await Task.WhenAny(
+            controlClosed,
+            association.Completion).ConfigureAwait(false);
+
+        if (ReferenceEquals(completed, association.Completion))
+        {
+            await controlWaitCts.CancelAsync().ConfigureAwait(false);
+            await association.Completion.ConfigureAwait(false);
+            try
+            {
+                await controlClosed.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (controlWaitCts.IsCancellationRequested)
+            {
+            }
+        }
+        else
+        {
+            await controlClosed.ConfigureAwait(false);
+        }
+    }
+
+    private static async Task WaitForControlCloseAsync(
+        IProxyConnection client,
+        CancellationToken cancellationToken)
+    {
+        var oneByte = new byte[1];
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            var read = await client.ReadAsync(
+                oneByte,
+                oneByte.Length,
+                cancellationToken).ConfigureAwait(false);
+            if (read == 0)
+                return;
         }
     }
 

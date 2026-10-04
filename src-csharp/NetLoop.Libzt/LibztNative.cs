@@ -16,6 +16,7 @@ internal static class LibztNative
     internal const int AfInet = 2;
     internal const int AfInet6 = 10;
     internal const int SockStream = 1;
+    internal const int SockDatagram = 2;
     internal const int IpProtoTcp = 6;
     internal const int ShutWrite = 1;
     internal const int ShutReadWrite = 2;
@@ -30,6 +31,7 @@ internal static class LibztNative
     internal const int NetworkStatusNotFound = 3;
     internal const int NetworkStatusPortError = 4;
     internal const int NetworkStatusClientTooOld = 5;
+    internal const int EAgain = 11;
 
     internal const int IpStringLength = 46;
 
@@ -127,6 +129,24 @@ internal static class LibztNative
     [DllImport(LibraryName, EntryPoint = "CSharp_zts_bsd_write")]
     internal static extern int Write(int fd, nint buffer, uint length);
 
+    [DllImport(LibraryName, EntryPoint = "CSharp_zts_bsd_sendto")]
+    internal static extern int SendTo(
+        int fd,
+        nint buffer,
+        uint length,
+        int flags,
+        nint address,
+        ushort addressLength);
+
+    [DllImport(LibraryName, EntryPoint = "CSharp_zts_bsd_recvfrom")]
+    internal static extern int ReceiveFrom(
+        int fd,
+        nint buffer,
+        uint length,
+        int flags,
+        nint address,
+        nint addressLength);
+
     [DllImport(LibraryName, EntryPoint = "CSharp_zts_bsd_shutdown")]
     internal static extern int Shutdown(int fd, int how);
 
@@ -139,6 +159,9 @@ internal static class LibztNative
     [DllImport(LibraryName, EntryPoint = "CSharp_zts_set_keepalive")]
     internal static extern int SetKeepAlive(int fd, int enabled);
 
+    [DllImport(LibraryName, EntryPoint = "CSharp_zts_set_recv_timeout")]
+    internal static extern int SetReceiveTimeout(int fd, int seconds, int microseconds);
+
     [DllImport(LibraryName, EntryPoint = "CSharp_zts_bsd_setsockopt")]
     internal static extern int SetSocketOption(int fd, int level, int option, nint value, ushort valueLength);
 
@@ -150,6 +173,29 @@ internal static class LibztNative
 
     [DllImport(LibraryName, EntryPoint = "CSharp_zts_errno_get")]
     internal static extern int GetErrno();
+
+    [DllImport(
+        LibraryName,
+        CharSet = CharSet.Ansi,
+        EntryPoint = "zts_util_ipstr_to_saddr",
+        CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int IpStringToSocketAddress(
+        string address,
+        ushort port,
+        nint socketAddress,
+        ref uint addressLength);
+
+    [DllImport(
+        LibraryName,
+        CharSet = CharSet.Ansi,
+        EntryPoint = "zts_util_ntop",
+        CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int SocketAddressToString(
+        nint socketAddress,
+        uint addressLength,
+        nint destination,
+        int destinationLength,
+        ref ushort port);
 
     [StructLayout(LayoutKind.Sequential)]
     internal struct EventMessage

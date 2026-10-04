@@ -15,6 +15,10 @@ public sealed class LibztTcpConnection : IProxyConnection
 
     public string Description { get; }
 
+    public System.Net.EndPoint? LocalEndPoint => null;
+
+    public System.Net.EndPoint? RemoteEndPoint => null;
+
     public ValueTask<int> ReadAsync(byte[] buffer, int count, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(buffer);
