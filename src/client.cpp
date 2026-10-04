@@ -22,7 +22,8 @@ void usage()
         << "  --listen-port <port>   Local listen port (default 1080)\n"
         << "  --status-file <path>   Write machine-readable readiness state\n"
         << "  --log-file <path>      Append diagnostic logs\n"
-        << "  --timeout <seconds>    ZeroTier startup timeout (default 120)\n";
+        << "  --timeout <seconds>    ZeroTier startup timeout (default 120)\n"
+        << "  --connect-timeout <s>  Per local-flow recovery window (default 20)\n";
 }
 
 } // namespace
@@ -56,6 +57,8 @@ int main(int argc, char** argv)
             netloop::optional_arg(args, "--log-file", "");
         const auto timeout =
             std::chrono::seconds(std::stoul(netloop::optional_arg(args, "--timeout", "120")));
+        const auto connect_timeout = std::chrono::seconds(
+            std::stoul(netloop::optional_arg(args, "--connect-timeout", "20")));
 
         netloop::Logger log("client", log_file);
         netloop::WinsockRuntime winsock;
@@ -100,30 +103,33 @@ int main(int argc, char** argv)
 
             const std::uint64_t connection_id = next_id.fetch_add(1);
             std::thread(
-                [local, remote_host, remote_port, zt_family, connection_id, &log]() {
-                    int zt = zts_socket(zt_family, ZTS_SOCK_STREAM, 0);
-                    if (zt < 0) {
-                        log.error(
-                            "conn=" + std::to_string(connection_id)
-                            + " zts_socket failed, zts_errno=" + std::to_string(zts_errno));
-                        closesocket(local);
-                        return;
-                    }
-
+                [local,
+                    remote_host,
+                    remote_port,
+                    zt_family,
+                    connect_timeout,
+                    connection_id,
+                    &log]() {
                     log.info(
                         "conn=" + std::to_string(connection_id) + " connecting " + remote_host
                         + ":" + std::to_string(remote_port));
-                    if (zts_connect(zt, remote_host.c_str(), remote_port, 0) != ZTS_ERR_OK) {
+
+                    try {
+                        const int zt = netloop::connect_zt_stream_with_retry(
+                            remote_host,
+                            remote_port,
+                            zt_family,
+                            connect_timeout,
+                            log,
+                            connection_id);
+                        log.info("conn=" + std::to_string(connection_id) + " connected");
+                        netloop::relay_native_and_zt(local, zt, log, connection_id);
+                    } catch (const std::exception& ex) {
                         log.error(
                             "conn=" + std::to_string(connection_id)
-                            + " zts_connect failed, zts_errno=" + std::to_string(zts_errno));
-                        zts_close(zt);
+                            + " connect failure: " + ex.what());
                         closesocket(local);
-                        return;
                     }
-
-                    log.info("conn=" + std::to_string(connection_id) + " connected");
-                    netloop::relay_native_and_zt(local, zt, log, connection_id);
                 })
                 .detach();
         }

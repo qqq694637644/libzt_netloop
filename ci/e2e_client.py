@@ -108,6 +108,7 @@ def main() -> int:
         "client_joined": False,
         "socks_handshake": False,
         "egress_ip_matches": False,
+        "restart_recovery": False,
     }
     client_pid = 0
 
@@ -193,6 +194,83 @@ def main() -> int:
                 f"egress IP mismatch: through tunnel={observed_ip}, "
                 f"server={expected_ip}"
             )
+
+        # Reproduce the important mobility failure mode: leave several overlay
+        # TCP streams live, kill the client abruptly, then restart it with the
+        # same identity while the server remains untouched. The restarted A
+        # side must establish fresh streams without requiring a B-side restart.
+        stale_tunnels: list[socket.socket] = []
+        try:
+            for _ in range(4):
+                stale_tunnels.append(
+                    socks_connect("127.0.0.1", args.listen_port, "api.ipify.org", 443)
+                )
+
+            kill_process_tree(client_pid)
+            client_pid = 0
+            time.sleep(1)
+        finally:
+            for stale in stale_tunnels:
+                try:
+                    stale.close()
+                except OSError:
+                    pass
+
+        status_path.unlink(missing_ok=True)
+        client_pid = start_detached(
+            [
+                str(client_exe),
+                "--network",
+                rendezvous["network_id"],
+                "--state-dir",
+                str(ROOT / "state" / "ci-client"),
+                "--remote-host",
+                rendezvous["server_ip"],
+                "--remote-port",
+                str(rendezvous["zt_port"]),
+                "--listen-host",
+                "127.0.0.1",
+                "--listen-port",
+                str(args.listen_port),
+                "--status-file",
+                str(status_path),
+                "--log-file",
+                str(EVIDENCE / "client.log"),
+                "--timeout",
+                "180",
+            ],
+            EVIDENCE / "client_process.log",
+        )
+        wait_for_json(status_path, timeout=200)
+
+        restarted_ip: str | None = None
+        restart_error: Exception | None = None
+        for attempt in range(1, 9):
+            try:
+                restarted_ip = https_public_ip_via_socks(
+                    "127.0.0.1", args.listen_port
+                )
+                break
+            except Exception as exc:
+                restart_error = exc
+                with (EVIDENCE / "restart_attempts.log").open(
+                    "a", encoding="utf-8"
+                ) as log:
+                    log.write(f"attempt={attempt} error={exc!r}\n")
+                time.sleep(3)
+
+        if restarted_ip is None:
+            raise RuntimeError(
+                "client restart recovery failed while server stayed up: "
+                f"{restart_error}"
+            )
+        if restarted_ip != expected_ip:
+            raise AssertionError(
+                f"restart egress IP mismatch: through tunnel={restarted_ip}, "
+                f"server={expected_ip}"
+            )
+        result["restart_observed_public_ip"] = restarted_ip
+        result["restart_recovery"] = True
 
         result["success"] = True
         print(json.dumps(result, indent=2))

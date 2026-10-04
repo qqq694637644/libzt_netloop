@@ -57,6 +57,17 @@ void write_status_json(
 
 SOCKET native_listen(const std::string& host, std::uint16_t port);
 SOCKET native_connect(const std::string& host, std::uint16_t port);
+int zt_socket_error(int fd);
+void configure_zt_stream_socket(int fd);
+int connect_zt_stream_with_retry(
+    const std::string& remote_host,
+    std::uint16_t remote_port,
+    int family,
+    std::chrono::seconds timeout,
+    Logger& log,
+    std::uint64_t connection_id);
+void register_zt_stream(int fd);
+void unregister_zt_stream(int fd);
 void relay_native_and_zt(SOCKET native_socket, int zt_socket, Logger& log, std::uint64_t connection_id);
 
 std::map<std::string, std::string> parse_cli(int argc, char** argv);

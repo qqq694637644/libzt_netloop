@@ -404,6 +404,7 @@ void relay_native_and_zt(
     asio::io_context io;
     auto native = std::make_unique<asio::ip::tcp::socket>(io);
     bool asio_owns_native = false;
+    register_zt_stream(zt_socket);
 
     try {
         const asio::ip::tcp protocol = native_protocol(native_socket);
@@ -429,6 +430,7 @@ void relay_native_and_zt(
         zts_bsd_shutdown(zt_socket, ZTS_SHUT_RDWR);
     }
 
+    unregister_zt_stream(zt_socket);
     zts_close(zt_socket);
     log.info("conn=" + std::to_string(connection_id) + " closed");
 }

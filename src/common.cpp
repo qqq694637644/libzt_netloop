@@ -4,11 +4,13 @@
 
 #include <WS2tcpip.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <ctime>
 #include <iomanip>
 #include <iostream>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -17,6 +19,25 @@ namespace netloop {
 namespace {
 
 Logger* g_zt_event_log = nullptr;
+std::uint64_t g_network_controller_id = 0;
+
+struct PeerPathState {
+    bool had_direct = false;
+    int event_code = 0;
+    std::uint64_t generation = 0;
+};
+
+std::mutex g_peer_path_mutex;
+std::map<std::uint64_t, PeerPathState> g_peer_path_states;
+std::mutex g_zt_stream_mutex;
+std::set<int> g_zt_streams;
+
+constexpr auto kMobilityResetDelay = std::chrono::seconds(3);
+constexpr int kKeepAliveIdleSeconds = 5;
+constexpr int kKeepAliveIntervalSeconds = 2;
+constexpr int kKeepAliveProbeCount = 3;
+constexpr int kConnectAttemptTimeoutMs = 2000;
+constexpr auto kConnectRetryDelay = std::chrono::milliseconds(250);
 
 std::string timestamp()
 {
@@ -154,6 +175,65 @@ std::string peer_event_name(int event_code)
     }
 }
 
+void reset_active_streams_for_peer(std::uint64_t peer_id, std::uint64_t generation)
+{
+    std::this_thread::sleep_for(kMobilityResetDelay);
+
+    {
+        std::lock_guard<std::mutex> lock(g_peer_path_mutex);
+        const auto it = g_peer_path_states.find(peer_id);
+        if (it == g_peer_path_states.end() || it->second.generation != generation
+            || it->second.event_code == ZTS_EVENT_PEER_DIRECT) {
+            return;
+        }
+    }
+
+    std::lock_guard<std::mutex> stream_lock(g_zt_stream_mutex);
+    if (g_zt_event_log != nullptr) {
+        g_zt_event_log->info(
+            "peer=" + hex_u64(peer_id)
+            + " mobility recovery: transport remained degraded for "
+            + std::to_string(kMobilityResetDelay.count())
+            + "s; resetting active ZeroTier streams count="
+            + std::to_string(g_zt_streams.size()));
+    }
+
+    // Hold the registry lock so a descriptor cannot be closed and reused
+    // between lookup and shutdown.
+    for (const int fd : g_zt_streams) {
+        zts_bsd_shutdown(fd, ZTS_SHUT_RDWR);
+    }
+}
+
+void update_peer_path_state(std::uint64_t peer_id, int event_code)
+{
+    // A network ID embeds the controller's 40-bit node ID in its upper bits.
+    // Controller path changes must not tear down application streams.
+    if (peer_id == g_network_controller_id) {
+        return;
+    }
+
+    bool schedule_reset = false;
+    std::uint64_t generation = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_peer_path_mutex);
+        auto& state = g_peer_path_states[peer_id];
+        state.event_code = event_code;
+        generation = ++state.generation;
+        if (event_code == ZTS_EVENT_PEER_DIRECT) {
+            state.had_direct = true;
+        } else if ((event_code == ZTS_EVENT_PEER_RELAY
+                       || event_code == ZTS_EVENT_PEER_UNREACHABLE)
+                   && state.had_direct) {
+            schedule_reset = true;
+        }
+    }
+
+    if (schedule_reset) {
+        std::thread(reset_active_streams_for_peer, peer_id, generation).detach();
+    }
+}
+
 void on_zts_event(void* message_ptr)
 {
     if (g_zt_event_log == nullptr || message_ptr == nullptr) {
@@ -178,6 +258,18 @@ void on_zts_event(void* message_ptr)
         + " transport=" + peer_event_name(message->event_code)
         + " role=" + peer_role_name(peer.role)
         + " latency_ms=" + std::to_string(peer.latency));
+    update_peer_path_state(peer.peer_id, message->event_code);
+}
+
+void set_zt_tcp_option_or_throw(int fd, int option, int value, const char* option_name)
+{
+    const int rc = zts_bsd_setsockopt(
+        fd, ZTS_IPPROTO_TCP, option, &value, static_cast<zts_socklen_t>(sizeof(value)));
+    if (rc != ZTS_ERR_OK) {
+        throw std::runtime_error(
+            std::string("unable to set ") + option_name + ", api_rc=" + std::to_string(rc)
+            + ", socket_error=" + std::to_string(zt_socket_error(fd)));
+    }
 }
 
 } // namespace
@@ -253,13 +345,42 @@ NetworkStatus start_libzt_network(
     Logger& log)
 {
     std::filesystem::create_directories(state_dir);
+
+    // Keep the persistent node identity and network membership, but discard
+    // cached physical peer paths. They are optional ZeroTier state and become
+    // stale when a roaming endpoint changes Wi-Fi, hotspot, or public IP.
+    const std::filesystem::path peer_cache = state_dir / "peers.d";
+    std::error_code peer_cache_error;
+    const std::uintmax_t removed_peer_cache_entries =
+        std::filesystem::remove_all(peer_cache, peer_cache_error);
+    if (peer_cache_error) {
+        log.error(
+            "unable to clear peer path cache " + peer_cache.string() + ": "
+            + peer_cache_error.message());
+    } else if (removed_peer_cache_entries != 0) {
+        log.info(
+            "cleared stale peer path cache entries="
+            + std::to_string(removed_peer_cache_entries));
+    }
+
     const std::string storage = state_dir.string();
     int rc = zts_init_from_storage(storage.c_str());
     if (rc != ZTS_ERR_OK) {
         throw std::runtime_error("zts_init_from_storage failed: " + std::to_string(rc));
     }
 
+    rc = zts_init_allow_peer_cache(0);
+    if (rc != ZTS_ERR_OK) {
+        throw std::runtime_error("zts_init_allow_peer_cache failed: " + std::to_string(rc));
+    }
+    log.info("peer path cache disabled for network mobility");
+
     g_zt_event_log = &log;
+    g_network_controller_id = network_id >> 24;
+    {
+        std::lock_guard<std::mutex> lock(g_peer_path_mutex);
+        g_peer_path_states.clear();
+    }
     rc = zts_init_set_event_handler(&on_zts_event);
     if (rc != ZTS_ERR_OK) {
         throw std::runtime_error("zts_init_set_event_handler failed: " + std::to_string(rc));
@@ -449,6 +570,133 @@ SOCKET native_connect(const std::string& host, std::uint16_t port)
         throw std::runtime_error("native connect failed, WSA=" + std::to_string(WSAGetLastError()));
     }
     return connected;
+}
+
+int zt_socket_error(int fd)
+{
+    if (fd < 0) {
+        return ZTS_ERR_ARG;
+    }
+    return zts_get_last_socket_error(fd);
+}
+
+void configure_zt_stream_socket(int fd)
+{
+    if (fd < 0) {
+        throw std::invalid_argument("invalid ZeroTier stream socket");
+    }
+
+    int rc = zts_set_no_delay(fd, 1);
+    if (rc != ZTS_ERR_OK) {
+        throw std::runtime_error(
+            "unable to enable TCP_NODELAY, api_rc=" + std::to_string(rc)
+            + ", socket_error=" + std::to_string(zt_socket_error(fd)));
+    }
+
+    rc = zts_set_keepalive(fd, 1);
+    if (rc != ZTS_ERR_OK) {
+        throw std::runtime_error(
+            "unable to enable SO_KEEPALIVE, api_rc=" + std::to_string(rc)
+            + ", socket_error=" + std::to_string(zt_socket_error(fd)));
+    }
+
+    set_zt_tcp_option_or_throw(
+        fd, ZTS_TCP_KEEPIDLE, kKeepAliveIdleSeconds, "TCP_KEEPIDLE");
+    set_zt_tcp_option_or_throw(
+        fd, ZTS_TCP_KEEPINTVL, kKeepAliveIntervalSeconds, "TCP_KEEPINTVL");
+    set_zt_tcp_option_or_throw(
+        fd, ZTS_TCP_KEEPCNT, kKeepAliveProbeCount, "TCP_KEEPCNT");
+}
+
+int connect_zt_stream_with_retry(
+    const std::string& remote_host,
+    std::uint16_t remote_port,
+    int family,
+    std::chrono::seconds timeout,
+    Logger& log,
+    std::uint64_t connection_id)
+{
+    const auto started = std::chrono::steady_clock::now();
+    const auto deadline = started + timeout;
+    int attempts = 0;
+    int last_api_rc = ZTS_ERR_SOCKET;
+    int last_socket_error = 0;
+
+    do {
+        ++attempts;
+        const int fd = zts_socket(family, ZTS_SOCK_STREAM, 0);
+        if (fd >= 0) {
+            try {
+                configure_zt_stream_socket(fd);
+            } catch (...) {
+                zts_close(fd);
+                throw;
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline > now ? deadline - now : std::chrono::steady_clock::duration::zero());
+            const int attempt_timeout_ms = static_cast<int>(std::max<std::int64_t>(
+                250,
+                std::min<std::int64_t>(kConnectAttemptTimeoutMs, remaining.count())));
+
+            last_api_rc =
+                zts_connect(fd, remote_host.c_str(), remote_port, attempt_timeout_ms);
+            if (last_api_rc == ZTS_ERR_OK) {
+                if (attempts > 1) {
+                    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - started);
+                    log.info(
+                        "conn=" + std::to_string(connection_id)
+                        + " connected after retry attempts=" + std::to_string(attempts)
+                        + " elapsed_ms=" + std::to_string(elapsed.count()));
+                }
+                return fd;
+            }
+
+            last_socket_error = zt_socket_error(fd);
+            zts_close(fd);
+        } else {
+            last_api_rc = fd;
+            last_socket_error = 0;
+        }
+
+        if (attempts == 1) {
+            log.info(
+                "conn=" + std::to_string(connection_id)
+                + " connect failed; retrying with fresh ZeroTier socket, api_rc="
+                + std::to_string(last_api_rc)
+                + ", socket_error=" + std::to_string(last_socket_error));
+        }
+
+        if (std::chrono::steady_clock::now() >= deadline) {
+            break;
+        }
+        std::this_thread::sleep_for(kConnectRetryDelay);
+    } while (std::chrono::steady_clock::now() < deadline);
+
+    throw std::runtime_error(
+        "ZeroTier connect timed out after attempts=" + std::to_string(attempts)
+        + ", api_rc=" + std::to_string(last_api_rc)
+        + ", socket_error=" + std::to_string(last_socket_error));
+}
+
+void register_zt_stream(int fd)
+{
+    if (fd < 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_zt_stream_mutex);
+    g_zt_streams.insert(fd);
+}
+
+void unregister_zt_stream(int fd)
+{
+    if (fd < 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_zt_stream_mutex);
+    g_zt_streams.erase(fd);
 }
 
 std::map<std::string, std::string> parse_cli(int argc, char** argv)

@@ -89,6 +89,18 @@ zt_netloop_client.exe ^
 Point the laptop application at \`127.0.0.1:1080\` as SOCKS5. The SOCKS5 handshake and
 subsequent traffic are transported to the v2rayN SOCKS5 listener unchanged.
 
+The client defaults to a 20-second per-flow recovery window (\`--connect-timeout\`) and
+retries failed libzt connects with a fresh virtual TCP socket instead of relying on libzt's
+global \`zts_errno\`. Both endpoints enable TCP keepalive (5-second idle, 2-second interval,
+3 probes) and TCP_NODELAY on tunnel streams so an abruptly disconnected peer is retired
+quickly after a physical-network switch.
+
+For mobility, \`peers.d\` is cleared at process startup and libzt peer-path caching is disabled;
+the persistent identity and \`networks.d\` membership are not touched. If an application peer
+that was previously DIRECT remains RELAY/UNREACHABLE for three seconds, active tunnel streams
+are reset so applications reconnect over the peer's newly discovered physical path instead of
+leaving stale virtual TCP sessions on the server.
+
 During ZeroTier network join, the process logs the actual libzt network status every five seconds. Failures such as `ACCESS_DENIED`, `NOT_FOUND`, `PORT_ERROR`, and `CLIENT_TOO_OLD` fail immediately. A timeout includes the network status plus whether IPv4/IPv6 addresses were actually assigned inside libzt.
 
 ## CI
@@ -97,7 +109,9 @@ During ZeroTier network join, the process logs the actual libzt network status e
 
 1. Build and smoke-test both executables.
 2. Machine A starts the server and a Python SOCKS5 fixture.
-3. Machine B starts the client and performs a real SOCKS5 HTTPS request through the tunnel.
+3. Machine B starts the client, performs a real SOCKS5 HTTPS request, kills the client with
+   live tunnels, restarts the same client identity, and verifies recovery while the server
+   remains running.
 
 The two E2E jobs are separate GitHub-hosted Windows machines. For CI only, they use a
 controller-less ZeroTier ad-hoc IPv6 network, so no ZeroTier Central API token is required.

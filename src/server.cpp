@@ -77,13 +77,31 @@ int main(int argc, char** argv)
 
         const int listener = zts_socket(zt_family, ZTS_SOCK_STREAM, 0);
         if (listener < 0) {
-            throw std::runtime_error("zts_socket failed, zts_errno=" + std::to_string(zts_errno));
+            throw std::runtime_error("zts_socket(listener) failed, api_rc=" + std::to_string(listener));
         }
-        if (zts_bind(listener, bind_host.c_str(), zt_port) != ZTS_ERR_OK) {
-            throw std::runtime_error("zts_bind failed, zts_errno=" + std::to_string(zts_errno));
+        const int reuse_rc = zts_set_reuse_addr(listener, 1);
+        if (reuse_rc != ZTS_ERR_OK) {
+            const int socket_error = netloop::zt_socket_error(listener);
+            zts_close(listener);
+            throw std::runtime_error(
+                "zts_set_reuse_addr(listener) failed, api_rc=" + std::to_string(reuse_rc)
+                + ", socket_error=" + std::to_string(socket_error));
         }
-        if (zts_listen(listener, 128) != ZTS_ERR_OK) {
-            throw std::runtime_error("zts_listen failed, zts_errno=" + std::to_string(zts_errno));
+        const int bind_rc = zts_bind(listener, bind_host.c_str(), zt_port);
+        if (bind_rc != ZTS_ERR_OK) {
+            const int socket_error = netloop::zt_socket_error(listener);
+            zts_close(listener);
+            throw std::runtime_error(
+                "zts_bind failed, api_rc=" + std::to_string(bind_rc)
+                + ", socket_error=" + std::to_string(socket_error));
+        }
+        const int listen_rc = zts_listen(listener, 128);
+        if (listen_rc != ZTS_ERR_OK) {
+            const int socket_error = netloop::zt_socket_error(listener);
+            zts_close(listener);
+            throw std::runtime_error(
+                "zts_listen failed, api_rc=" + std::to_string(listen_rc)
+                + ", socket_error=" + std::to_string(socket_error));
         }
 
         log.info(
@@ -114,7 +132,10 @@ int main(int argc, char** argv)
             const int accepted =
                 zts_accept(listener, remote_ip, sizeof(remote_ip), &remote_port);
             if (accepted < 0) {
-                log.error("zts_accept failed, zts_errno=" + std::to_string(zts_errno));
+                log.error(
+                    "zts_accept failed, api_rc=" + std::to_string(accepted)
+                    + ", socket_error=" + std::to_string(netloop::zt_socket_error(listener)));
+                zts_util_delay(100);
                 continue;
             }
 
@@ -125,6 +146,7 @@ int main(int argc, char** argv)
             std::thread(
                 [accepted, forward_host, forward_port, connection_id, &log]() {
                     try {
+                        netloop::configure_zt_stream_socket(accepted);
                         SOCKET target = netloop::native_connect(forward_host, forward_port);
                         log.info(
                             "conn=" + std::to_string(connection_id) + " forward connected "
