@@ -141,9 +141,12 @@ public sealed class LibztTcpConnection : IProxyConnection
 
     private void AbortGeneration()
     {
-        var fd = Volatile.Read(ref _fd);
-        if (fd >= 0)
-            _ = LibztNative.Shutdown(fd, LibztNative.ShutReadWrite);
+        var fd = Interlocked.Exchange(ref _fd, -1);
+        if (fd < 0)
+            return;
+
+        _ = LibztNative.Shutdown(fd, LibztNative.ShutReadWrite);
+        _ = LibztNative.Close(fd);
     }
 
     private int GetFd()

@@ -80,6 +80,7 @@ internal sealed class RecoveryCoordinator : IOverlayRecoveryObserver, IAsyncDisp
         await _recoveryGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         OverlayGeneration generation;
         long sequence;
+        Exception? runtimeReplaceFailure = null;
         try
         {
             ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
@@ -94,12 +95,6 @@ internal sealed class RecoveryCoordinator : IOverlayRecoveryObserver, IAsyncDisp
             _pendingSoftSequence = sequence;
             _pendingSoftCommandId = commandId;
             _pendingSoftReason = reason;
-
-            // Soft Recovery keeps the libzt node/identity alive, but replaces
-            // all overlay listeners and their native sockets immediately.
-            await _overlayRuntime.ReplaceAsync(
-                state,
-                cancellationToken).ConfigureAwait(false);
 
             JsonLog.Info("recovery_soft_start", new {
                 sequence,
@@ -118,10 +113,41 @@ internal sealed class RecoveryCoordinator : IOverlayRecoveryObserver, IAsyncDisp
                 elapsedMilliseconds: 0,
                 error: null,
                 cancellationToken: cancellationToken).ConfigureAwait(false);
+
+            // Soft Recovery keeps the libzt node/identity alive, but replaces
+            // all overlay listeners and their native sockets immediately.
+            try
+            {
+                await _overlayRuntime.ReplaceAsync(
+                    state,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                runtimeReplaceFailure = ex;
+                JsonLog.Error("recovery_soft_runtime_replace_failed", new {
+                    sequence,
+                    epoch = generation.Epoch.Value,
+                    reason,
+                    command_id = commandId,
+                    error_type = ex.GetType().Name,
+                    error = ex.Message
+                });
+            }
         }
         finally
         {
             _recoveryGate.Release();
+        }
+
+        if (runtimeReplaceFailure is not null)
+        {
+            return await TriggerHardRecoveryCoreAsync(
+                reason: "soft_runtime_replace_failed",
+                commandId: commandId,
+                expectedSoftEpoch: generation.Epoch.Value,
+                force: false,
+                cancellationToken: cancellationToken).ConfigureAwait(false);
         }
 
         _ = ValidateSoftRecoveryAsync(
