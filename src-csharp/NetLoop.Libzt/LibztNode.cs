@@ -73,13 +73,12 @@ public sealed class LibztNode : IAsyncDisposable
         timeoutCts.CancelAfter(_startupTimeout);
         var token = timeoutCts.Token;
 
-        JsonLog.Info("libzt_wait_node_online", new { network = _networkId.ToString("x16") });
-        while (LibztNative.NodeIsOnline() != 1)
-            await Task.Delay(100, token).ConfigureAwait(false);
-
         var nodeId = LibztNative.NodeGetId();
-        JsonLog.Info("libzt_node_online", new { node = nodeId.ToString("x10") });
-
+        JsonLog.Info("libzt_network_join_start", new {
+            network = _networkId.ToString("x16"),
+            node = nodeId.ToString("x10"),
+            node_online = LibztNative.NodeIsOnline() == 1
+        });
         ThrowIfError("zts_net_join", LibztNative.NetJoin(_networkId));
 
         while (LibztNative.NetTransportIsReady(_networkId) != 1)
@@ -104,6 +103,7 @@ public sealed class LibztNode : IAsyncDisposable
         JsonLog.Info("libzt_network_ready", new {
             network = _networkId.ToString("x16"),
             node = state.NodeId.ToString("x10"),
+            node_online = LibztNative.NodeIsOnline() == 1,
             addresses = state.ManagedAddresses.Select(static x => x.ToString()).ToArray(),
             routes = state.Routes
         });
