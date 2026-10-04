@@ -391,10 +391,14 @@ internal sealed class RecoveryCoordinator : IOverlayRecoveryObserver, IAsyncDisp
                 target,
                 generation.Epoch.CancellationToken,
                 timeout.Token).ConfigureAwait(false);
+            await ProbeSocksAgentAsync(
+                connection,
+                timeout.Token).ConfigureAwait(false);
 
             JsonLog.Info("recovery_soft_probe_success", new {
                 epoch = expectedEpoch,
-                peer = _probePeers[0].ToString()
+                peer = _probePeers[0].ToString(),
+                layer = "socks5"
             });
             return true;
         }
@@ -409,6 +413,75 @@ internal sealed class RecoveryCoordinator : IOverlayRecoveryObserver, IAsyncDisp
                 error = ex.Message
             });
             return false;
+        }
+    }
+
+    private static async Task ProbeSocksAgentAsync(
+        LibztTcpConnection connection,
+        CancellationToken cancellationToken)
+    {
+        // A raw TCP connect is not enough after a libzt restart: lwIP can
+        // briefly accept a connection before bidirectional application I/O is
+        // stable. Complete a tiny SOCKS5 request/response exchange instead.
+        var greeting = new byte[] { 0x05, 0x01, 0x00 };
+        await connection.WriteAsync(
+            greeting,
+            greeting.Length,
+            cancellationToken).ConfigureAwait(false);
+
+        var methodReply = new byte[2];
+        await ReadProbeExactlyAsync(
+            connection,
+            methodReply,
+            cancellationToken).ConfigureAwait(false);
+        if (methodReply[0] != 0x05 || methodReply[1] != 0x00)
+        {
+            throw new IOException(
+                $"Recovery SOCKS5 probe method reply was {Convert.ToHexString(methodReply)}.");
+        }
+
+        // BIND (0x02) is intentionally unsupported by NetLoop. The server
+        // replies deterministically without opening a downstream connection,
+        // which makes this a side-effect-free full-duplex health check.
+        var unsupportedRequestHeader = new byte[] { 0x05, 0x02, 0x00, 0x01 };
+        await connection.WriteAsync(
+            unsupportedRequestHeader,
+            unsupportedRequestHeader.Length,
+            cancellationToken).ConfigureAwait(false);
+
+        var commandReply = new byte[10];
+        await ReadProbeExactlyAsync(
+            connection,
+            commandReply,
+            cancellationToken).ConfigureAwait(false);
+        if (commandReply[0] != 0x05 || commandReply[1] != 0x07)
+        {
+            throw new IOException(
+                $"Recovery SOCKS5 probe command reply was {Convert.ToHexString(commandReply)}.");
+        }
+    }
+
+    private static async Task ReadProbeExactlyAsync(
+        LibztTcpConnection connection,
+        byte[] buffer,
+        CancellationToken cancellationToken)
+    {
+        var offset = 0;
+        while (offset < buffer.Length)
+        {
+            var scratch = offset == 0
+                ? buffer
+                : new byte[buffer.Length - offset];
+            var read = await connection.ReadAsync(
+                scratch,
+                buffer.Length - offset,
+                cancellationToken).ConfigureAwait(false);
+            if (read == 0)
+                throw new EndOfStreamException("Recovery SOCKS5 probe reached EOF.");
+
+            if (offset != 0)
+                Buffer.BlockCopy(scratch, 0, buffer, offset, read);
+            offset += read;
         }
     }
 
