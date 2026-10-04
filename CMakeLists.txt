@@ -71,6 +71,7 @@ target_link_libraries(netloop_common
         zt-static
         ws2_32
 )
+target_compile_definitions(netloop_common PUBLIC ADD_EXPORTS=1)
 target_compile_definitions(
     netloop_common
     PRIVATE
