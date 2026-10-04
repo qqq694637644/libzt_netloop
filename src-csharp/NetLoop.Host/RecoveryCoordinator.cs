@@ -533,6 +533,26 @@ internal sealed class RecoveryCoordinator : IOverlayRecoveryObserver, IAsyncDisp
             await _overlayRuntime.StartAsync(state, timeout.Token).ConfigureAwait(false);
             _generations.CompleteHard(hardGeneration, state);
 
+            // NetTransportIsReady can become true before a fresh peer TCP path
+            // is actually usable. Do not publish Hard Recovery ready until the
+            // real overlay Agent port can be connected. This makes the hard
+            // recovery metric represent business readiness rather than an
+            // internal libzt state flag.
+            while (!await ProbeCurrentGenerationAsync(
+                       hardGeneration.Epoch.Value,
+                       timeout.Token).ConfigureAwait(false))
+            {
+                await Task.Delay(
+                    TimeSpan.FromMilliseconds(100),
+                    timeout.Token).ConfigureAwait(false);
+            }
+
+            JsonLog.Info("recovery_hard_probe_ready", new {
+                sequence,
+                epoch = hardGeneration.Epoch.Value,
+                peer = _probePeers.FirstOrDefault()?.ToString()
+            });
+
             var elapsed = Stopwatch.GetElapsedTime(started);
             _ignoreNetworkEventsUntil =
                 DateTimeOffset.UtcNow + _options.RecoveryCooldown;
