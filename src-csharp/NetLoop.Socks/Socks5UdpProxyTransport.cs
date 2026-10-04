@@ -39,21 +39,23 @@ public sealed class Socks5UdpProxyTransportFactory : IProxyUdpTransportFactory
                 _password,
                 cancellationToken).ConfigureAwait(false);
 
-            var controlLocal = control.LocalEndPoint as IPEndPoint
-                ?? throw new InvalidOperationException(
-                    "SOCKS5 UDP upstream requires a TCP local endpoint.");
             var controlRemote = control.RemoteEndPoint as IPEndPoint
                 ?? throw new InvalidOperationException(
                     "SOCKS5 UDP upstream requires a TCP remote endpoint.");
 
-            udp = new UdpClient(new IPEndPoint(controlLocal.Address, 0));
-            var localUdp = (IPEndPoint)udp.Client.LocalEndPoint!;
+            var proxyAddress = NormalizeAddress(controlRemote.Address);
+            var udpFamily = proxyAddress.AddressFamily;
+            var wildcard = udpFamily == AddressFamily.InterNetwork
+                ? IPAddress.Any
+                : IPAddress.IPv6Any;
+            udp = new UdpClient(udpFamily);
+            udp.Client.Bind(new IPEndPoint(wildcard, 0));
 
             var request = Socks5Protocol.BuildTargetRequest(
                 Socks5Protocol.UdpAssociate,
                 new ProxyTarget(
-                    localUdp.Address.ToString(),
-                    checked((ushort)localUdp.Port)));
+                    wildcard.ToString(),
+                    0));
             await control.WriteAsync(
                 request,
                 request.Length,
@@ -86,7 +88,7 @@ public sealed class Socks5UdpProxyTransportFactory : IProxyUdpTransportFactory
 
             var relay = await ResolveRelayAsync(
                 relayTarget,
-                controlRemote,
+                new IPEndPoint(proxyAddress, controlRemote.Port),
                 udp.Client.AddressFamily,
                 cancellationToken).ConfigureAwait(false);
 
@@ -146,6 +148,9 @@ public sealed class Socks5UdpProxyTransportFactory : IProxyUdpTransportFactory
             resolved ?? throw new SocketException((int)SocketError.HostNotFound),
             relayTarget.Port);
     }
+
+    private static IPAddress NormalizeAddress(IPAddress address)
+        => address.IsIPv4MappedToIPv6 ? address.MapToIPv4() : address;
 }
 
 internal sealed class Socks5UdpProxyTransport : IProxyUdpTransport
