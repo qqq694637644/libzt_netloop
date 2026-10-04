@@ -46,14 +46,14 @@ def prepare(args: argparse.Namespace) -> int:
             "http.server",
             str(args.local_service_port),
             "--bind",
-            "127.0.0.1",
+            "::1",
         ],
         EVIDENCE / "local_service.log",
     )
 
     netloop_pid = 0
     try:
-        wait_for_tcp("127.0.0.1", args.local_service_port, timeout=20)
+        wait_for_tcp("::1", args.local_service_port, timeout=20)
         expected_ip = public_ip()
         (EVIDENCE / "expected_public_ip.txt").write_text(
             expected_ip + "\n", encoding="utf-8"
