@@ -14,6 +14,8 @@ public sealed class CiAutomationReceiver : BroadcastReceiver
 {
     internal const string ActionReset =
         "com.libzt.netloop.ci.RESET";
+    internal const string ActionUdpProbe =
+        "com.libzt.netloop.ci.UDP_PROBE";
 
     public override void OnReceive(Context? context, Intent? intent)
     {
@@ -28,6 +30,71 @@ public sealed class CiAutomationReceiver : BroadcastReceiver
             context.StartService(
                 new Intent(context, typeof(NetLoopService))
                     .SetAction(NetLoopService.ActionCiReset));
+            return;
+        }
+
+        if (string.Equals(
+                intent.Action,
+                ActionUdpProbe,
+                StringComparison.Ordinal))
+        {
+            CiUdpProbeRequest? request = null;
+            Exception? requestError = null;
+            try
+            {
+                request = CiUdpProbeRequest.FromIntent(intent);
+            }
+            catch (Exception ex)
+            {
+                requestError = ex;
+            }
+
+            var pending = GoAsync();
+            var applicationContext =
+                context.ApplicationContext ?? context;
+            var requestId = (
+                intent.GetStringExtra("request_id")
+                ?? "unknown")
+                .Trim();
+            var mode = (
+                intent.GetStringExtra("mode")
+                ?? "unknown")
+                .Trim();
+
+            _ = Task.Run(
+                () =>
+                {
+                    CiUdpProbeResult result;
+                    if (requestError is not null)
+                    {
+                        result = new CiUdpProbeResult {
+                            request_id = requestId,
+                            mode = mode,
+                            success = false,
+                            error_type =
+                                requestError.GetType().FullName,
+                            error = requestError.Message
+                        };
+                    }
+                    else
+                    {
+                        result = CiUdpProbe.Run(
+                            request
+                            ?? throw new InvalidOperationException(
+                                "CI UDP probe request is unavailable."));
+                    }
+
+                    try
+                    {
+                        CiUdpProbeStatus.Write(
+                            applicationContext,
+                            result);
+                    }
+                    finally
+                    {
+                        pending.Finish();
+                    }
+                });
         }
     }
 

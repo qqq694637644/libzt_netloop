@@ -22,8 +22,12 @@ PACKAGE = "com.libzt.netloop"
 ACTIVITY = f"{PACKAGE}/com.libzt.netloop.MainActivity"
 CI_RECEIVER = f"{PACKAGE}/com.libzt.netloop.CiAutomationReceiver"
 ACTION_RESET = "com.libzt.netloop.ci.RESET"
+ACTION_UDP_PROBE = "com.libzt.netloop.ci.UDP_PROBE"
 STATUS_PATH = (
     f"/sdcard/Android/data/{PACKAGE}/files/netloop-ci-status.json"
+)
+UDP_PROBE_STATUS_PATH = (
+    f"/sdcard/Android/data/{PACKAGE}/files/netloop-ci-udp-probe.json"
 )
 RESET_BUDGET_SECONDS = 3.0
 RESET_RETRY_INTERVAL_SECONDS = 0.05
@@ -79,10 +83,14 @@ def write_adb_diagnostics() -> None:
 
 
 def read_status() -> dict | None:
+    return read_device_json(STATUS_PATH)
+
+
+def read_device_json(path: str) -> dict | None:
     result = adb(
         "exec-out",
         "cat",
-        STATUS_PATH,
+        path,
         timeout=10,
         check=False,
     )
@@ -92,7 +100,7 @@ def read_status() -> dict | None:
             "run-as",
             PACKAGE,
             "cat",
-            STATUS_PATH,
+            path,
             timeout=10,
             check=False,
         )
@@ -105,6 +113,137 @@ def read_status() -> dict | None:
         return json.loads(text)
     except json.JSONDecodeError:
         return None
+
+
+def trigger_udp_probe(
+    *,
+    request_id: str,
+    mode: str,
+    rendezvous: dict,
+    timeout_ms: int,
+    payload: str | None = None,
+) -> None:
+    command = [
+        "shell",
+        "am",
+        "broadcast",
+        "-a",
+        ACTION_UDP_PROBE,
+        "-n",
+        CI_RECEIVER,
+        "--es",
+        "request_id",
+        request_id,
+        "--es",
+        "mode",
+        mode,
+        "--es",
+        "peer_ip",
+        str(rendezvous["server_ip"]),
+        "--ei",
+        "peer_port",
+        str(int(rendezvous["local_udp_service_port"])),
+        "--es",
+        "stun_host",
+        str(rendezvous["stun_host"]),
+        "--ei",
+        "stun_port",
+        str(int(rendezvous["stun_port"])),
+        "--es",
+        "expected_public_ip",
+        str(rendezvous["expected_udp_public_ip"]),
+        "--ei",
+        "timeout_ms",
+        str(timeout_ms),
+    ]
+    if payload is not None:
+        command.extend(["--es", "payload", payload])
+    adb(*command, timeout=15)
+
+
+def wait_for_udp_probe(
+    request_id: str,
+    *,
+    timeout: float,
+) -> dict:
+    deadline = time.monotonic() + timeout
+    last: dict | None = None
+    while time.monotonic() < deadline:
+        status = read_device_json(UDP_PROBE_STATUS_PATH)
+        if status is not None:
+            last = status
+            if status.get("request_id") == request_id:
+                return status
+        time.sleep(0.05)
+    raise TimeoutError(
+        "timed out waiting for Android UDP probe; "
+        f"request_id={request_id}, last={last}"
+    )
+
+
+def run_device_udp_probe(
+    *,
+    request_id: str,
+    mode: str,
+    rendezvous: dict,
+    timeout_ms: int,
+    wait_timeout: float,
+    payload: str | None = None,
+) -> dict:
+    trigger_udp_probe(
+        request_id=request_id,
+        mode=mode,
+        rendezvous=rendezvous,
+        timeout_ms=timeout_ms,
+        payload=payload,
+    )
+    return wait_for_udp_probe(
+        request_id,
+        timeout=wait_timeout,
+    )
+
+
+def run_device_udp_suite_with_retry(
+    rendezvous: dict,
+    *,
+    attempts: int = 4,
+    delay: float = 1.0,
+) -> dict:
+    last: dict | None = None
+    for attempt in range(1, attempts + 1):
+        request_id = f"initial-suite-{attempt}"
+        try:
+            probe = run_device_udp_probe(
+                request_id=request_id,
+                mode="suite",
+                rendezvous=rendezvous,
+                timeout_ms=5000,
+                wait_timeout=20.0,
+            )
+            last = probe
+            if probe.get("success") is True:
+                return probe
+            error = (
+                f"{probe.get('error_type')}: "
+                f"{probe.get('error')}"
+            )
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+
+        with (
+            EVIDENCE / "android_device_udp_suite_attempts.log"
+        ).open("a", encoding="utf-8") as log:
+            log.write(
+                f"attempt={attempt} request_id={request_id} "
+                f"error={error}\n"
+            )
+        if attempt < attempts:
+            time.sleep(delay)
+
+    raise RuntimeError(
+        "Android device-side UDP suite failed after "
+        f"{attempts} attempts: {last}"
+    )
 
 
 def wait_for_status(
@@ -312,57 +451,48 @@ def probe_udp_after_abort(
         )
         return
 
-    payload = f"netloop-android-reset-{cycle}".encode("ascii")
+    del proxy_port
+    payload = f"netloop-android-reset-{cycle}"
     association_attempts = 0
     attempts = 0
     last_error: str | None = None
 
     while time.monotonic() < deadline:
         remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        if remaining < 0.15:
             break
         association_attempts += 1
+        attempts += 1
+        request_id = f"reset-{cycle}-{attempts}"
         try:
-            with desktop_e2e.SocksUdpAssociation(
-                "127.0.0.1",
-                proxy_port,
-                timeout=min(0.5, remaining),
-            ) as association:
-                while time.monotonic() < deadline:
-                    attempts += 1
-                    association.send(
-                        str(rendezvous["server_ip"]),
-                        int(rendezvous["local_udp_service_port"]),
-                        payload,
-                    )
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    try:
-                        _, _, response = association.receive(
-                            timeout=min(0.25, remaining)
-                        )
-                    except (
-                        TimeoutError,
-                        socket.timeout,
-                        ConnectionResetError,
-                        OSError,
-                    ) as exc:
-                        last_error = f"{type(exc).__name__}: {exc}"
-                        continue
-
-                    if response == payload:
-                        state.update(
-                            ok=True,
-                            association_attempts=association_attempts,
-                            attempts=attempts,
-                            ms=(time.monotonic() - started) * 1000.0,
-                            error=last_error,
-                        )
-                        return
-                    last_error = (
-                        f"UDP mismatch expected={payload!r} observed={response!r}"
-                    )
+            timeout_ms = max(
+                100,
+                min(600, int(remaining * 1000.0)),
+            )
+            probe = run_device_udp_probe(
+                request_id=request_id,
+                mode="peer",
+                rendezvous=rendezvous,
+                timeout_ms=timeout_ms,
+                wait_timeout=min(
+                    remaining,
+                    max(0.25, timeout_ms / 1000.0 + 0.35),
+                ),
+                payload=payload,
+            )
+            if probe.get("success") is True:
+                state.update(
+                    ok=True,
+                    association_attempts=association_attempts,
+                    attempts=attempts,
+                    ms=(time.monotonic() - started) * 1000.0,
+                    error=last_error,
+                    device_elapsed_ms=probe.get("elapsed_ms"),
+                )
+                return
+            last_error = (
+                f"{probe.get('error_type')}: {probe.get('error')}"
+            )
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
 
@@ -645,60 +775,36 @@ def main() -> int:
         )
         result["peer_local_service"] = True
 
-        desktop_e2e.retry(
-            "android_peer_local_udp",
-            lambda: desktop_e2e.verify_peer_local_udp(
-                args.listen_port,
-                str(rendezvous["server_ip"]),
-                int(rendezvous["local_udp_service_port"]),
-            ),
+        udp_suite = run_device_udp_suite_with_retry(rendezvous)
+        result["device_udp_suite"] = udp_suite
+        (EVIDENCE / "device_udp_suite.json").write_text(
+            json.dumps(udp_suite, indent=2),
+            encoding="utf-8",
         )
-        result["peer_local_udp"] = True
-
-        desktop_e2e.retry(
-            "android_udp_frag_rejected",
-            lambda: desktop_e2e.verify_udp_frag_rejected(
-                args.listen_port,
-                str(rendezvous["server_ip"]),
-                int(rendezvous["local_udp_service_port"]),
-            ),
-            attempts=3,
-            delay=1.0,
+        result["peer_local_udp"] = bool(
+            udp_suite.get("peer_local_udp")
         )
-        result["udp_frag_rejected"] = True
-
-        observed_udp_ip = desktop_e2e.retry(
-            "android_udp_default_exit",
-            lambda: desktop_e2e.udp_public_ip_via_socks(
-                args.listen_port,
-                str(rendezvous["stun_host"]),
-                int(rendezvous["stun_port"]),
-            ),
-            attempts=4,
-            delay=2.0,
+        result["udp_frag_rejected"] = bool(
+            udp_suite.get("udp_frag_rejected")
         )
-        result["observed_udp_public_ip"] = observed_udp_ip
+        result["observed_udp_public_ip"] = udp_suite.get(
+            "observed_public_ip"
+        )
         result["expected_udp_public_ip"] = rendezvous[
             "expected_udp_public_ip"
         ]
-        if observed_udp_ip != rendezvous["expected_udp_public_ip"]:
-            raise AssertionError(
-                "Android UDP default_exit public IP mismatch: "
-                f"{observed_udp_ip} != {rendezvous['expected_udp_public_ip']}"
-            )
-        result["udp_default_exit_matches"] = True
-
-        desktop_e2e.retry(
-            "android_udp_control_close_cleanup",
-            lambda: desktop_e2e.verify_udp_control_close_cleanup(
-                args.listen_port,
-                str(rendezvous["server_ip"]),
-                int(rendezvous["local_udp_service_port"]),
-            ),
-            attempts=3,
-            delay=1.0,
+        result["udp_default_exit_matches"] = bool(
+            udp_suite.get("udp_default_exit_matches")
         )
-        result["udp_control_close_cleanup"] = True
+        result["udp_control_close_cleanup"] = bool(
+            udp_suite.get("udp_control_close_cleanup")
+        )
+        if udp_suite.get("success") is not True:
+            raise RuntimeError(
+                "Android device-side UDP suite failed: "
+                f"{udp_suite.get('error_type')}: "
+                f"{udp_suite.get('error')}"
+            )
 
         observed_ip = desktop_e2e.retry(
             "android_egress",
