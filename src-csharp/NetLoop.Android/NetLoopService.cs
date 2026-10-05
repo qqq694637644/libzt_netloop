@@ -122,6 +122,7 @@ public sealed class NetLoopService : Service
             CiAutomationStatus.WriteReady(
                 this,
                 runtime.State,
+                runtime.OverlayBindAddress.ToString(),
                 resetCount,
                 null);
 #endif
@@ -166,6 +167,7 @@ public sealed class NetLoopService : Service
                 CiAutomationStatus.WriteReady(
                     this,
                     runtime.State,
+                    runtime.OverlayBindAddress.ToString(),
                     resetCount,
                     reason);
 #endif

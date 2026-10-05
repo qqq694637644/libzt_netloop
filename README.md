@@ -21,6 +21,12 @@ The repository no longer contains the original NetLoop C++ client/server impleme
 
 Android CI also builds an x86_64-only test APK for the GitHub-hosted Android emulator. This x86_64 artifact is for CI only and is not a release target.
 
+## Overlay addresses
+
+Each runtime chooses one **primary overlay address** for its peer TCP/UDP listeners: IPv4 is preferred when the ZeroTier network assigns one; otherwise the first Managed IPv6 address is used. The selected value is published as `primary_overlay_address` and `overlay_host` in the readiness status.
+
+Configure `--peer` and `--default-exit` with the other node's `primary_overlay_address`/`overlay_host`. A node may have additional Managed IPs, but NetLoop v1 intentionally does not create a listener for every address.
+
 ## Build
 
 Desktop builds are orchestrated by:
@@ -44,8 +50,30 @@ Active GitHub Actions workflows:
 - `.github/workflows/csharp-windows-ci.yml`
 - `.github/workflows/csharp-linux-ci.yml`
 - `.github/workflows/csharp-android-ci.yml`
+- `.github/workflows/release.yml` (tag/manual release builds)
 
-The workflows build the C# runtime and exercise TCP, UDP, peer-local routing, exit-node behavior, and runtime-reset recovery on their supported test platforms.
+The workflows build the C# runtime and exercise TCP, UDP, peer-local routing, exit-node behavior, and runtime-reset recovery:
+
+| Platform | Build | Runtime E2E | Reset stress |
+| --- | --- | --- | --- |
+| Windows x64 | yes | two GitHub-hosted runners | 10 cycles |
+| Linux x64 | yes | two GitHub-hosted runners | 10 cycles |
+| Linux arm64 | yes | two native arm64 GitHub-hosted runners | 10 cycles |
+| Android x86_64 | CI-only APK | x86_64 emulator + Linux peer | 3 cycles |
+| Android arm64-v8a | release APK | not available on hosted emulator | not run |
+
+The reset tests are deterministic fault injection. They prove that once a reset is triggered, the old runtime is discarded and fresh TCP/UDP traffic can recover inside the configured budget. They do **not** replace physical-device testing of Wi-Fi -> hotspot/cellular handover, where the host interface, NAT mapping, and ZeroTier physical path actually change.
+
+## Releases
+
+`.github/workflows/release.yml` builds these release artifacts:
+
+- `netloop-win-x64.zip`
+- `netloop-linux-x64.tar.gz`
+- `netloop-linux-arm64.tar.gz`
+- `netloop-android-arm64.apk`
+
+Tag pushes matching `v*` create/update the corresponding GitHub Release. Manual workflow dispatch builds the same artifacts without publishing a release.
 
 ## Native dependency
 

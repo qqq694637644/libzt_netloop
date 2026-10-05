@@ -27,7 +27,9 @@
 - 不做旧 TCP 连接跨物理网络无缝迁移。
 - 不做企业级用户系统、ACL、计费、QoS、控制台。
 - 不重写 NAT 穿透、加密或 ZeroTier 节点发现。
-- 不手写完整 SOCKS5 UDP ASSOCIATE 协议和生命周期。
+- 不把 SOCKS5 层扩展成通用代理库；只维护 NetLoop 需要的最小 CONNECT /
+  UDP ASSOCIATE、source validation、timeout/cancellation 行为，并用协议级
+  E2E 冻结语义。
 - 不为了等待 P2P DIRECT 而阻塞业务恢复。
 
 只有显式使用本地 SOCKS5 的应用进入 NetLoop。
@@ -73,6 +75,12 @@ A 上应用配置本地 SOCKS5 为 127.0.0.1:1080。应用请求 172.26.0.254:80
 
 IPv4 默认映射到 127.0.0.1，IPv6 默认映射到 ::1。后续可以提供简单配置覆盖本机服务映射地址，但不扩展为远端 LAN 路由。
 
+一个 Node 可能同时得到多个 Managed IP。第一版明确选择一个 canonical /
+primary overlay address：**优先 IPv4，否则使用第一个 Managed IPv6**。TCP/UDP
+Agent 只监听这个地址；status 中同时暴露 `primary_overlay_address` 和兼容字段
+`overlay_host`。`--peer` 与 `default_exit` 必须填写对端的 primary overlay
+address，不把其余 Managed IP 当作可连接的 Agent 地址。
+
 ## 5. 统一出网
 
 统一出网是核心功能，不是附加功能。
@@ -112,26 +120,22 @@ SOCKS5 请求中的 DOMAIN 类型尽量保持域名不变，交给最终出口�
 
 这样可以保留当前统一出口习惯，又不会把节点间服务访问强制塞进 v2rayN。
 
-## 6. SOCKS5 协议复用策略
+## 6. SOCKS5 协议实现策略
 
-不从零实现 SOCKS5 server、UDP ASSOCIATE 生命周期和报文细节。
+Phase 0 已验证 `VpnHood.Core.Proxies 8.1.851` 的 SOCKS5 server 行为成熟，但
+其出站路径直接创建 `TcpClient/UdpClient`，没有可注入 libzt transport 的边界，
+因此无法直接作为 NetLoop 的 peer server。
 
-首选候选库为 VpnHood.Core.Proxies。Phase 0 必须验证：
+当前实现据此保留一个**范围受限的项目内 SOCKS 层**：
 
-1. SOCKS5 server 是否完整支持 CONNECT。
-2. 是否完整支持 UDP ASSOCIATE。
-3. TCP control connection 与 UDP association 生命周期是否正确绑定。
-4. 是否允许注入或替换 outbound transport。
-5. Windows、Linux、Android 是否均可运行。
-6. 许可证是否符合最终分发方式。
+- TCP：标准 SOCKS5 CONNECT、NO AUTH / RFC1929 client auth、half-close。
+- UDP：UDP ASSOCIATE、control TCP 生命周期、source validation、idle cleanup、
+  FRAG != 0 拒绝。
+- outbound transport 统一通过 NetLoop 的 TCP/UDP abstraction 注入。
+- 不增加 BIND、UDP fragmentation、通用 ACL 等与 NetLoop 无关的 SOCKS5 能力。
 
-如果 outbound transport 无法直接接入 libzt：
-
-- 不重新手写 SOCKS5 UDP 协议。
-- 优先 fork 或抽取其成熟的 parser、UDP ASSOCIATE、validation、timeout/cancellation 层。
-- 在边界处接入 NetLoop 自己的 ITransport / IUdpTransport。
-
-只有验证现有实现不可复用时，才重新评估其他成熟 SOCKS5 库。
+这套行为不再为了“形式复用”而推翻；后续通过 Windows/Linux/Android E2E 和
+协议断言冻结，包括 peer-local UDP response 的逻辑 Managed-IP source。
 
 ## 7. TCP 数据面
 
@@ -159,7 +163,9 @@ UDP 必须支持 SOCKS5 UDP ASSOCIATE。
 
 ### 8.1 本地 Association
 
-成熟 SOCKS5 库负责 UDP ASSOCIATE 握手、control TCP 生命周期、UDP source validation、SOCKS5 UDP header 编解码、cancellation、timeout 和 association dispose。NetLoop 不复制这套状态机。
+项目内 `NetLoop.Socks` 负责 UDP ASSOCIATE 握手、control TCP 生命周期、UDP
+source validation、SOCKS5 UDP header 编解码、cancellation、timeout 和
+association dispose；范围只覆盖 NetLoop 实际需要的行为。
 
 ### 8.2 节点间 UDP
 
@@ -167,7 +173,8 @@ Overlay UDP Agent 使用固定 libzt UDP 端口，例如 42043。
 
 第一版优先保持 SOCKS5 UDP Datagram 语义。每个本地 SOCKS5 UDP association 可以使用独立的 libzt UDP socket，使远端用 source Managed IP + source UDP port 作为内部转发表 key，避免第一版引入 association-id multiplexing 协议。
 
-远端 UDP relay table 只负责 NetLoop 内部转发映射，不重新实现 SOCKS5 association 生命周期；其状态使用短 idle timeout，并在 transport generation 变化时整体失效。
+远端 UDP relay table 只负责 NetLoop 内部转发映射，不重新实现 SOCKS5
+association 生命周期；其状态使用短 idle timeout，并在 runtime reset 时整体丢弃。
 
 访问 B 本机 UDP 服务：
 
@@ -212,7 +219,9 @@ C# 不重新实现 libzt，只建立薄封装层：
 
 最低目标平台：Windows x64、Linux x64、Linux arm64、Android arm64-v8a。
 
-Android 第一版**只支持 arm64-v8a**，不构建、不发布、也不承诺 x86/x86_64/armeabi-v7a。
+Android 第一版的**发布与支持目标只有 arm64-v8a**。GitHub-hosted Android
+emulator 无法可靠运行 arm64 native E2E，因此 CI 额外构建一个 x86_64-only
+测试 APK；该 APK 只用于 emulator E2E，不发布、不作为产品支持 ABI。
 
 固定一个 libzt commit，由 CI 构建各平台原生库，禁止开发机手工拷贝未知版本二进制。
 
@@ -257,7 +266,7 @@ Windows/Linux/Android 使用同一语义：只重建 NetLoop 业务 runtime；li
 
 ## 13. C# 项目结构
 
-新实现与旧 C++ 并存一段时间：
+当前主实现已经完全迁移到 C#；旧 NetLoop C++ 业务实现已删除：
 
     src-csharp/
       NetLoop.Core/
@@ -360,12 +369,13 @@ Windows 错误同时记录数值错误码；文本日志统一 UTF-8。
 
 ### Phase 4 - 跨平台交付
 
-- Windows x64 发布包。
-- Linux x64 发布包。
-- Linux arm64 发布包。
-- Android arm64 应用。
-- native libzt 自动构建和打包。
-- CI smoke/E2E。
+- Windows x64 发布包：`netloop-win-x64.zip`。
+- Linux x64 发布包：`netloop-linux-x64.tar.gz`。
+- Linux arm64 发布包：`netloop-linux-arm64.tar.gz`。
+- Android arm64 应用：`netloop-android-arm64.apk`。
+- native libzt 自动构建、缓存和打包。
+- CI smoke/E2E；`v*` tag 由 release workflow 自动创建/更新 GitHub Release，
+  workflow_dispatch 只构建 artifacts。
 - identity/state 升级兼容策略。
 
 ## 19. 最低测试矩阵
@@ -378,13 +388,23 @@ Mobility：触发 runtime reset 后旧业务 runtime 被整体丢弃；libzt nod
 
 Identity：runtime reset 后 Node ID 不变，不删除 identity 和 network membership。
 
-当前自动 E2E 范围只做 **Windows x64 <-> Windows x64**，且两个节点必须运行在两个独立 GitHub-hosted runner 上。Linux/Android runtime E2E 暂不作为当前 gate。
+当前自动 E2E：
+
+- Windows x64：两个独立 GitHub-hosted runner，TCP/UDP/default-exit + 10 次 reset。
+- Linux x64：两个独立 GitHub-hosted runner，TCP/UDP/default-exit + 10 次 reset。
+- Linux arm64：两个原生 arm64 GitHub-hosted runner，TCP/UDP/default-exit + 10 次 reset。
+- Android：x86_64 emulator + Linux peer，TCP/UDP/default-exit + 3 次 reset；
+  arm64-v8a 只做真实发布 APK 的 native ABI/打包验证。
+
+这些 deterministic reset 验证“reset 一旦触发后的恢复”，不等价于真实
+Wi-Fi/热点/蜂窝切换。真实物理网络切换仍需要 Windows 笔记本和 Android 真机验证。
 
 ## 20. 旧 C++ 清理
 
 C++ 实现不作为 C# 的 recovery 设计依据。
 
-在 C# 完成当前计划的 Windows/Linux/Android 构建与既定 E2E 后，删除旧 C++ 业务实现、旧 C++ CMake target、旧 C++ CI/发布路径和仅为 C++ 服务的脚本；保留仍被 C# native libzt 构建所必需的第三方源码/构建入口。
+旧 C++ 业务实现、旧 C++ CI/发布路径和仅为 C++ 服务的脚本已经删除。仓库只保留
+C# native libzt 构建所需要的第三方源码、最小 CMake 入口和补丁。
 
 ## 21. 第一版完成定义
 
@@ -407,7 +427,8 @@ C++ 实现不作为 C# 的 recovery 设计依据。
 2. 新连接优先于保活旧连接。
 3. OS network event 优先于 TCP timeout。
 4. libzt 负责 overlay；NetLoop 不复制 ZeroTier。
-5. SOCKS5 使用成熟实现；NetLoop 不重复造协议状态机。
+5. SOCKS5 只维护 NetLoop 所需的受限协议层，不扩展为通用 SOCKS server；行为由
+   跨平台协议/E2E 测试冻结。
 6. Managed IP 是 Node 身份和逻辑服务地址，不是 OS 虚拟网卡。
 7. 非 Overlay 目标默认走统一出口。
 8. 不访问远端 LAN，因此不引入 CIDR 路由系统。
@@ -436,6 +457,8 @@ C++ 实现不作为 C# 的 recovery 设计依据。
 - Overlay Agent 收到请求后是最终处理节点：本机 Managed IP 访问 loopback；非 overlay 目标执行本机 egress；**不得再次转发给第三个 NetLoop 节点**。
 - 对某个 overlay Managed IP 的 Agent 连接失败时明确失败，不改走 `default_exit`。
 - `default_exit` 不可达时 fail closed，不自动 DIRECT。
+- 每个 Node 只选择一个 primary overlay address：IPv4 优先，否则第一个 IPv6；
+  `--peer` / `default_exit` 必须使用对端 status 暴露的 primary address。
 
 ### 23.3 SOCKS5 与 Egress
 
@@ -464,10 +487,13 @@ C++ 实现不作为 C# 的 recovery 设计依据。
 
 - 编译结果以 GitHub Actions 为权威；本地构建仅用于开发便利，不替代 CI。
 - 自动 E2E 使用 GitHub-hosted runner，并且每个节点必须位于独立 runner；禁止在一个 runner 上启动多个进程冒充跨机测试。
-- 当前完整 E2E 只做 Windows x64 <-> Windows x64。
+- Windows x64、Linux x64、Linux arm64 都运行真实跨 runner TCP/UDP E2E 和
+  10-cycle deterministic reset；Android 使用 CI-only x86_64 APK 在 hosted
+  emulator 上运行 E2E/3-cycle reset，arm64-v8a 只做 release build/package gate。
 - 普通 push/PR/fork CI 继续使用无 secret 的 controller-less ZeroTier ad-hoc network。
 - 暂不建设需要 ZeroTier controller/私有 network secret 的 trusted E2E。
-- 暂不把真实 Wi-Fi/热点/蜂窝物理切网纳入自动或人工 release gate。
+- GitHub CI 无法证明真实物理网络 handover；发布前仍需在 Windows 笔记本与 Android
+  真机执行 Wi-Fi -> 热点 / Wi-Fi -> 蜂窝连续切换测试并记录恢复时间。
 - Build job 只构建一次，E2E jobs 只下载同一不可变 artifact，不重新编译。
 - workflow 使用 `concurrency` + `cancel-in-progress: true` 取消同一 branch/PR 的过时 run。
 - native libzt 使用 Ninja + sccache；同时缓存按 libzt commit + OS/arch + toolchain/build-input hash 生成的 native bundle。native bundle cache 命中时不递归拉取 native submodules、不重新配置/编译 libzt。

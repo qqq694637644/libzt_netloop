@@ -192,6 +192,8 @@ internal static class Program
                 managed_addresses = runtime.State.ManagedAddresses
                     .Select(static address => address.ToString())
                     .ToArray(),
+                primary_overlay_address =
+                    runtime.OverlayBindAddress.ToString(),
                 overlay_host = runtime.OverlayBindAddress.ToString(),
                 overlay_port = options.OverlayPort,
                 overlay_udp_port = options.OverlayUdpPort,

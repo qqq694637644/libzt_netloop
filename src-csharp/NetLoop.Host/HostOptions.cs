@@ -128,8 +128,8 @@ internal sealed class HostOptions
           --socks-port <port>         Local SOCKS5 port (default 1080)
           --overlay-port <port>       NetLoop peer Agent TCP port (default 42042)
           --overlay-udp-port <port>   NetLoop peer Agent UDP port (default 42043)
-          --peer <managed-ip>         Explicit peer Managed IP; repeatable
-          --default-exit <managed-ip> Default egress peer; also treated as a peer
+          --peer <managed-ip>         Peer primary Managed IP (overlay_host); repeatable
+          --default-exit <managed-ip> Primary Managed IP of default egress peer
           --egress <mode>             direct | upstream-socks5 (default direct)
           --upstream-host <host>      Upstream SOCKS5 host
           --upstream-port <port>      Upstream SOCKS5 port (default 1080)
