@@ -472,8 +472,8 @@ def wait_for_reset_ready(
 
 
 RESET_BUDGET_SECONDS = 3.0
-RESET_PROBE_TIMEOUT_SECONDS = 0.30
-RESET_PROBE_INTERVAL_SECONDS = 0.05
+RESET_RETRY_INTERVAL_SECONDS = 0.05
+RESET_UDP_RESPONSE_SLICE_SECONDS = 0.20
 
 
 def nearest_rank_percentile(values: list[float], percentile: int) -> float | None:
@@ -490,62 +490,13 @@ def format_exception(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
-def run_reset_probe_loop(
+def wait_for_old_runtime_abort(
     *,
-    started: float,
     deadline: float,
     old_runtime_closed: threading.Event,
-    old_runtime_state: dict[str, object],
-    action,
-) -> dict[str, object]:
-    attempts = 0
-    pre_abort_successes = 0
-    last_error: str | None = None
-
-    while time.monotonic() < deadline:
-        attempt_started = time.monotonic()
-        remaining = deadline - attempt_started
-        if remaining <= 0:
-            break
-
-        attempts += 1
-        attempt_timeout = min(RESET_PROBE_TIMEOUT_SECONDS, remaining)
-        try:
-            action(attempt_timeout)
-        except Exception as exc:
-            last_error = format_exception(exc)
-        else:
-            closed_at = old_runtime_state.get("closed_at")
-            if (
-                old_runtime_closed.is_set()
-                and isinstance(closed_at, float)
-                and attempt_started >= closed_at
-            ):
-                return {
-                    "ok": True,
-                    "ms": (time.monotonic() - started) * 1000.0,
-                    "attempts": attempts,
-                    "pre_abort_successes": pre_abort_successes,
-                    "last_error": last_error,
-                }
-
-            pre_abort_successes += 1
-            last_error = "probe completed before old runtime abort"
-
-        sleep_for = min(
-            RESET_PROBE_INTERVAL_SECONDS,
-            max(0.0, deadline - time.monotonic()),
-        )
-        if sleep_for > 0:
-            time.sleep(sleep_for)
-
-    return {
-        "ok": False,
-        "ms": None,
-        "attempts": attempts,
-        "pre_abort_successes": pre_abort_successes,
-        "last_error": last_error or "no successful post-abort probe before deadline",
-    }
+) -> bool:
+    remaining = deadline - time.monotonic()
+    return remaining > 0 and old_runtime_closed.wait(remaining)
 
 
 def write_reset_timing_matrix(rows: list[dict[str, object]]) -> None:
@@ -555,6 +506,7 @@ def write_reset_timing_matrix(rows: list[dict[str, object]]) -> None:
         "tcp_ms",
         "udp_ms",
         "tcp_attempts",
+        "udp_assoc_attempts",
         "udp_attempts",
         "status_ms",
         "result",
@@ -571,6 +523,7 @@ def write_reset_timing_matrix(rows: list[dict[str, object]]) -> None:
                     "" if row.get("tcp_ms") is None else f"{row['tcp_ms']:.1f}",
                     "" if row.get("udp_ms") is None else f"{row['udp_ms']:.1f}",
                     str(row.get("tcp_attempts", 0)),
+                    str(row.get("udp_assoc_attempts", 0)),
                     str(row.get("udp_attempts", 0)),
                     "" if row.get("status_ms") is None else f"{row['status_ms']:.1f}",
                     "PASS" if row.get("passed") else "FAIL",
@@ -609,6 +562,7 @@ def run_reset_stress(
             "tcp_ms": None,
             "udp_ms": None,
             "tcp_attempts": 0,
+            "udp_assoc_attempts": 0,
             "udp_attempts": 0,
             "status_ms": None,
             "status_ok": False,
@@ -673,49 +627,160 @@ def run_reset_stress(
             )
 
         def probe_tcp() -> None:
-            tcp_state.update(
-                run_reset_probe_loop(
-                    started=started,
-                    deadline=deadline,
-                    old_runtime_closed=stale_closed,
-                    old_runtime_state=stale_state,
-                    action=lambda timeout: verify_peer_local_service(
+            if not wait_for_old_runtime_abort(
+                deadline=deadline,
+                old_runtime_closed=stale_closed,
+            ):
+                tcp_state.update(
+                    {
+                        "ok": False,
+                        "ms": None,
+                        "attempts": 0,
+                        "last_error": "old runtime was not discarded before deadline",
+                    }
+                )
+                return
+
+            attempts = 0
+            last_error: str | None = None
+            while time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                attempts += 1
+                try:
+                    verify_peer_local_service(
                         proxy_port,
                         rendezvous["server_ip"],
                         int(rendezvous["local_service_port"]),
-                        timeout=timeout,
-                    ),
+                        timeout=remaining,
+                    )
+                    tcp_state.update(
+                        {
+                            "ok": True,
+                            "ms": (time.monotonic() - started) * 1000.0,
+                            "attempts": attempts,
+                            "last_error": last_error,
+                        }
+                    )
+                    return
+                except Exception as exc:
+                    last_error = format_exception(exc)
+
+                sleep_for = min(
+                    RESET_RETRY_INTERVAL_SECONDS,
+                    max(0.0, deadline - time.monotonic()),
                 )
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+
+            tcp_state.update(
+                {
+                    "ok": False,
+                    "ms": None,
+                    "attempts": attempts,
+                    "last_error": last_error or "fresh TCP did not recover before deadline",
+                }
             )
 
         def probe_udp() -> None:
             payload = f"netloop-reset-{cycle}".encode("ascii")
+            if not wait_for_old_runtime_abort(
+                deadline=deadline,
+                old_runtime_closed=stale_closed,
+            ):
+                udp_state.update(
+                    {
+                        "ok": False,
+                        "ms": None,
+                        "association_attempts": 0,
+                        "attempts": 0,
+                        "last_error": "old runtime was not discarded before deadline",
+                    }
+                )
+                return
 
-            def udp_attempt(timeout: float) -> None:
-                with SocksUdpAssociation(
-                    "127.0.0.1",
-                    proxy_port,
-                    timeout=timeout,
-                ) as association:
-                    _, _, response = association.roundtrip(
-                        rendezvous["server_ip"],
-                        int(rendezvous["local_udp_service_port"]),
-                        payload,
-                        timeout=timeout,
-                    )
-                if response != payload:
-                    raise AssertionError(
-                        f"fresh UDP mismatch: expected={payload!r}, observed={response!r}"
-                    )
+            association_attempts = 0
+            datagram_attempts = 0
+            last_error: str | None = None
+            while time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                association_attempts += 1
+                try:
+                    with SocksUdpAssociation(
+                        "127.0.0.1",
+                        proxy_port,
+                        timeout=min(0.5, remaining),
+                    ) as association:
+                        while time.monotonic() < deadline:
+                            datagram_attempts += 1
+                            association.send(
+                                rendezvous["server_ip"],
+                                int(rendezvous["local_udp_service_port"]),
+                                payload,
+                            )
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                break
+                            try:
+                                _, _, response = association.receive(
+                                    timeout=min(
+                                        RESET_UDP_RESPONSE_SLICE_SECONDS,
+                                        remaining,
+                                    )
+                                )
+                            except (
+                                TimeoutError,
+                                socket.timeout,
+                                ConnectionResetError,
+                                OSError,
+                            ) as exc:
+                                last_error = format_exception(exc)
+                                sleep_for = min(
+                                    RESET_RETRY_INTERVAL_SECONDS,
+                                    max(0.0, deadline - time.monotonic()),
+                                )
+                                if sleep_for > 0:
+                                    time.sleep(sleep_for)
+                                continue
+
+                            if response != payload:
+                                last_error = (
+                                    "fresh UDP mismatch: "
+                                    f"expected={payload!r}, observed={response!r}"
+                                )
+                                continue
+
+                            udp_state.update(
+                                {
+                                    "ok": True,
+                                    "ms": (time.monotonic() - started) * 1000.0,
+                                    "association_attempts": association_attempts,
+                                    "attempts": datagram_attempts,
+                                    "last_error": last_error,
+                                }
+                            )
+                            return
+                except Exception as exc:
+                    last_error = format_exception(exc)
+
+                sleep_for = min(
+                    RESET_RETRY_INTERVAL_SECONDS,
+                    max(0.0, deadline - time.monotonic()),
+                )
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
 
             udp_state.update(
-                run_reset_probe_loop(
-                    started=started,
-                    deadline=deadline,
-                    old_runtime_closed=stale_closed,
-                    old_runtime_state=stale_state,
-                    action=udp_attempt,
-                )
+                {
+                    "ok": False,
+                    "ms": None,
+                    "association_attempts": association_attempts,
+                    "attempts": datagram_attempts,
+                    "last_error": last_error or "fresh UDP did not recover before deadline",
+                }
             )
 
         threads: list[threading.Thread] = []
@@ -750,7 +815,7 @@ def run_reset_stress(
             for thread in threads:
                 thread.start()
 
-            join_deadline = deadline + RESET_PROBE_TIMEOUT_SECONDS + 0.1
+            join_deadline = deadline + 0.5
             for thread in threads:
                 thread.join(max(0.0, join_deadline - time.monotonic()))
 
@@ -767,6 +832,10 @@ def run_reset_stress(
                 )
 
             row["udp_ms"] = udp_state.get("ms")
+            row["udp_assoc_attempts"] = udp_state.get(
+                "association_attempts",
+                0,
+            )
             row["udp_attempts"] = udp_state.get("attempts", 0)
             if not udp_state.get("ok"):
                 row["errors"].append(
