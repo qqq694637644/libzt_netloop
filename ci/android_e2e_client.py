@@ -175,6 +175,12 @@ def configure_and_start(rendezvous: dict) -> dict:
         "--es",
         "default_exit",
         server_ip,
+        "--ei",
+        "overlay_port",
+        str(int(rendezvous["overlay_port"])),
+        "--ei",
+        "overlay_udp_port",
+        str(int(rendezvous["overlay_udp_port"])),
         timeout=30,
     )
     return wait_for_status(timeout=200)

@@ -13,6 +13,8 @@ internal sealed record AndroidConfig(
     internal const string NetworkIdKey = "network_id";
     internal const string PeersKey = "peers";
     internal const string DefaultExitKey = "default_exit";
+    internal const string OverlayPortKey = "overlay_port";
+    internal const string OverlayUdpPortKey = "overlay_udp_port";
     internal const string UpstreamHostKey = "upstream_host";
     internal const string UpstreamPortKey = "upstream_port";
     internal const string UpstreamUserKey = "upstream_user";
@@ -44,6 +46,14 @@ internal sealed record AndroidConfig(
         var defaultExit = defaultExitText.Length == 0
             ? null
             : IPAddress.Parse(defaultExitText);
+        var overlayPort = ParsePort(
+            preferences.GetString(OverlayPortKey, "42042"),
+            "overlay TCP",
+            42042);
+        var overlayUdpPort = ParsePort(
+            preferences.GetString(OverlayUdpPortKey, "42043"),
+            "overlay UDP",
+            42043);
 
         var upstreamHost = (preferences.GetString(UpstreamHostKey, string.Empty)
             ?? string.Empty).Trim();
@@ -66,8 +76,8 @@ internal sealed record AndroidConfig(
             StateDirectory = stateDirectory,
             SocksAddress = IPAddress.Loopback,
             SocksPort = 1080,
-            OverlayPort = 42042,
-            OverlayUdpPort = 42043,
+            OverlayPort = overlayPort,
+            OverlayUdpPort = overlayUdpPort,
             DefaultExit = defaultExit,
             Peers = peers,
             Egress = upstreamHost.Length == 0
@@ -105,4 +115,25 @@ internal sealed record AndroidConfig(
 
     private static string? EmptyToNull(string? value)
         => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+
+    private static int ParsePort(
+        string? value,
+        string label,
+        int defaultValue)
+    {
+        var text = string.IsNullOrWhiteSpace(value)
+            ? defaultValue.ToString(CultureInfo.InvariantCulture)
+            : value.Trim();
+        if (!ushort.TryParse(
+                text,
+                NumberStyles.None,
+                CultureInfo.InvariantCulture,
+                out var port)
+            || port == 0)
+        {
+            throw new InvalidOperationException(
+                $"Invalid {label} port: {text}");
+        }
+        return port;
+    }
 }

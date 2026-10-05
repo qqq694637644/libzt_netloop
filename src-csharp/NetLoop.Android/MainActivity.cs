@@ -167,6 +167,16 @@ public sealed class MainActivity : Activity
         editor.PutString(
             AndroidConfig.DefaultExitKey,
             intent.GetStringExtra("default_exit") ?? string.Empty);
+        editor.PutString(
+            AndroidConfig.OverlayPortKey,
+            intent.GetIntExtra("overlay_port", 42042)
+                .ToString(
+                    System.Globalization.CultureInfo.InvariantCulture));
+        editor.PutString(
+            AndroidConfig.OverlayUdpPortKey,
+            intent.GetIntExtra("overlay_udp_port", 42043)
+                .ToString(
+                    System.Globalization.CultureInfo.InvariantCulture));
         editor.PutString(AndroidConfig.UpstreamHostKey, string.Empty);
         editor.PutString(AndroidConfig.UpstreamUserKey, string.Empty);
         editor.PutString(AndroidConfig.UpstreamPasswordKey, string.Empty);
