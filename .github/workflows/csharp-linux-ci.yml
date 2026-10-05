@@ -134,3 +134,150 @@ jobs:
               echo '~~~'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+  e2e-server:
+    name: C# Linux E2E ${{ matrix.runtime }} machine A (exit/server)
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runtime: linux-x64
+            runner: ubuntu-24.04
+            overlay_port: 42042
+            overlay_udp_port: 42043
+          - runtime: linux-arm64
+            runner: ubuntu-24.04-arm
+            overlay_port: 42142
+            overlay_udp_port: 42143
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: csharp-${{ matrix.runtime }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: package
+
+      - name: Deploy runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          python ci/deploy.py --source package --destination runtime-csharp --all-files
+          chmod +x runtime-csharp/netloop
+
+      - name: Join ad-hoc network and prepare exit
+        run: >
+          python ci/csharp_e2e_server.py prepare
+          --runtime runtime-csharp
+          --overlay-port ${{ matrix.overlay_port }}
+          --overlay-udp-port ${{ matrix.overlay_udp_port }}
+
+      - name: Publish rendezvous
+        uses: actions/upload-artifact@v4
+        with:
+          name: csharp-linux-${{ matrix.runtime }}-zt-rendezvous-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/csharp-server/rendezvous.json
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Hold server until client finishes
+        run: >
+          python ci/csharp_e2e_server.py hold
+          --client-artifact "csharp-linux-${{ matrix.runtime }}-zt-client-result-${{ github.run_id }}-${{ github.run_attempt }}"
+
+      - name: Preserve server evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: csharp-linux-${{ matrix.runtime }}-server-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/csharp-server/
+          if-no-files-found: warn
+          retention-days: 14
+
+  e2e-client:
+    name: C# Linux E2E ${{ matrix.runtime }} machine B (client)
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runtime: linux-x64
+            runner: ubuntu-24.04
+          - runtime: linux-arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: csharp-${{ matrix.runtime }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: package
+
+      - name: Deploy runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          python ci/deploy.py --source package --destination runtime-csharp --all-files
+          chmod +x runtime-csharp/netloop
+
+      - name: Cross-machine peer-local and default-exit E2E
+        id: e2e
+        continue-on-error: true
+        run: >
+          python ci/csharp_e2e_client.py
+          --runtime runtime-csharp
+          --rendezvous-artifact "csharp-linux-${{ matrix.runtime }}-zt-rendezvous-${{ github.run_id }}-${{ github.run_attempt }}"
+          --reset-stress
+          --reset-cycles 10
+
+      - name: Publish reset timing summary
+        if: always()
+        shell: bash
+        run: |
+          path="evidence/csharp-client/reset_timing.tsv"
+          if [[ -f "$path" ]]; then
+            {
+              echo "### ${{ matrix.runtime }} runtime reset timing"
+              echo '~~~text'
+              cat "$path"
+              echo '~~~'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Publish client result for machine A
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: csharp-linux-${{ matrix.runtime }}-zt-client-result-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/csharp-client/result.json
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Preserve client evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: csharp-linux-${{ matrix.runtime }}-client-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/csharp-client/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Fail job when E2E failed
+        if: steps.e2e.outcome != 'success'
+        run: python -c "raise SystemExit('C# Linux cross-machine E2E failed; inspect evidence artifacts')"

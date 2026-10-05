@@ -1039,7 +1039,7 @@ def main() -> int:
         result["rendezvous"] = rendezvous
 
         runtime = Path(args.runtime).resolve()
-        executable = runtime / "netloop.exe"
+        executable = runtime / ("netloop.exe" if os.name == "nt" else "netloop")
         if not executable.exists():
             raise FileNotFoundError(executable)
 

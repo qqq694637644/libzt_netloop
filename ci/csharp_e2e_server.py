@@ -55,7 +55,7 @@ def wait_for_udp_echo(host: str, port: int, timeout: float = 20.0) -> None:
 def prepare(args: argparse.Namespace) -> int:
     EVIDENCE.mkdir(parents=True, exist_ok=True)
     runtime = Path(args.runtime).resolve()
-    executable = runtime / "netloop.exe"
+    executable = runtime / ("netloop.exe" if os.name == "nt" else "netloop")
     if not executable.exists():
         raise FileNotFoundError(executable)
 
