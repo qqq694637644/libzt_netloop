@@ -52,16 +52,15 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
         if (options.DefaultExit is not null)
             peers.Add(options.DefaultExit);
 
+        var overlayBind = SelectOverlayBindAddress(state.ManagedAddresses);
         var snapshot = new OverlayNetworkSnapshot(
-            state.ManagedAddresses,
-            peers,
-            Array.Empty<ManagedRoute>());
+            overlayBind,
+            peers);
         var selector = new RouteSelector(snapshot, options.DefaultExit);
 
         var libztConnector = new LibztTcpConnector(PeerConnectTimeout);
         var loopbackConnector = new LoopbackTcpConnector(options.ConnectTimeout);
         var egressConnector = BuildEgressConnector(options);
-        var overlayBind = SelectOverlayBindAddress(state.ManagedAddresses);
         var udpEgressFactory = BuildUdpEgressFactory(options);
         var routingUdpFactory = new RoutingUdpTransportFactory(
             selector,

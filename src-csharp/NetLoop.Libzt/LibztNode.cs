@@ -121,8 +121,7 @@ public sealed class LibztNode : IAsyncDisposable
             network = _networkId.ToString("x16"),
             node = state.NodeId.ToString("x10"),
             node_online = LibztNative.NodeIsOnline() == 1,
-            addresses = state.ManagedAddresses.Select(static x => x.ToString()).ToArray(),
-            routes = state.Routes
+            addresses = state.ManagedAddresses.Select(static x => x.ToString()).ToArray()
         });
         return state;
     }
@@ -133,8 +132,10 @@ public sealed class LibztNode : IAsyncDisposable
         try
         {
             var addresses = QueryAddresses();
-            var routes = QueryRoutes();
-            return new LibztNetworkState(_networkId, LibztNative.NodeGetId(), addresses, routes);
+            return new LibztNetworkState(
+                _networkId,
+                LibztNative.NodeGetId(),
+                addresses);
         }
         finally
         {
@@ -169,50 +170,6 @@ public sealed class LibztNode : IAsyncDisposable
         finally
         {
             Marshal.FreeHGlobal(buffer);
-        }
-
-        return result;
-    }
-
-    private IReadOnlyList<LibztRouteInfo> QueryRoutes()
-    {
-        var count = LibztNative.CoreQueryRouteCount(_networkId);
-        if (count < 0)
-            throw new LibztException("zts_core_query_route_count", count);
-
-        var result = new List<LibztRouteInfo>(count);
-        var target = Marshal.AllocHGlobal(LibztNative.IpStringLength);
-        var via = Marshal.AllocHGlobal(LibztNative.IpStringLength);
-        try
-        {
-            for (var index = 0; index < count; index++)
-            {
-                ZeroBuffer(target, LibztNative.IpStringLength);
-                ZeroBuffer(via, LibztNative.IpStringLength);
-                ushort flags = 0;
-                ushort metric = 0;
-                ThrowIfError(
-                    "zts_core_query_route",
-                    LibztNative.CoreQueryRoute(
-                        _networkId,
-                        index,
-                        target,
-                        via,
-                        LibztNative.IpStringLength,
-                        ref flags,
-                        ref metric));
-
-                result.Add(new LibztRouteInfo(
-                    Marshal.PtrToStringAnsi(target) ?? string.Empty,
-                    Marshal.PtrToStringAnsi(via) ?? string.Empty,
-                    flags,
-                    metric));
-            }
-        }
-        finally
-        {
-            Marshal.FreeHGlobal(target);
-            Marshal.FreeHGlobal(via);
         }
 
         return result;

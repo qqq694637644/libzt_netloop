@@ -6,16 +6,11 @@ namespace NetLoop.Android;
 
 internal sealed class AndroidNetworkMonitor : ConnectivityManager.NetworkCallback, IAsyncDisposable
 {
-    private static readonly TimeSpan StartupGrace = TimeSpan.FromSeconds(1);
-
     private readonly ConnectivityManager _manager;
     private readonly TimeSpan _debounce;
     private readonly Action<string> _onNetworkChanged;
     private readonly CancellationTokenSource _stop = new();
     private readonly object _gate = new();
-    private readonly DateTimeOffset _acceptEventsAfter =
-        DateTimeOffset.UtcNow + StartupGrace;
-
     private CancellationTokenSource? _debounceCts;
     private string? _defaultNetwork;
     private string? _linkPropertiesFingerprint;
@@ -152,8 +147,7 @@ internal sealed class AndroidNetworkMonitor : ConnectivityManager.NetworkCallbac
 
     private void Schedule(string reason)
     {
-        if (Volatile.Read(ref _disposed) != 0
-            || DateTimeOffset.UtcNow < _acceptEventsAfter)
+        if (Volatile.Read(ref _disposed) != 0)
             return;
 
         CancellationTokenSource debounce;

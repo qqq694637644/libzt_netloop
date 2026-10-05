@@ -104,14 +104,6 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
         ThrowIfDisposed();
         var decision = _selector.Select(target, overlayIngress: false);
 
-        JsonLog.Info("udp_route_decision", new {
-            target = target.ToString(),
-            ingress = "local",
-            route = decision.Kind.ToString(),
-            peer = decision.PeerAddress?.ToString(),
-            decision.Reason
-        });
-
         switch (decision.Kind)
         {
             case RouteKind.LocalLoopback:
@@ -208,11 +200,6 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
         {
             var datagram = await transport.ReceiveAsync(cancellationToken).ConfigureAwait(false);
             await _received.Writer.WriteAsync(datagram, cancellationToken).ConfigureAwait(false);
-            JsonLog.Info("udp_response_received", new {
-                transport = source,
-                source_endpoint = datagram.Source.ToString(),
-                bytes = datagram.Payload.Length
-            });
         }
     }
 

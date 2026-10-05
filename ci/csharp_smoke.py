@@ -10,6 +10,7 @@ import subprocess
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--runtime", default="dist-csharp")
+    parser.add_argument("--expected-version")
     args = parser.parse_args()
 
     runtime = Path(args.runtime).resolve()
@@ -35,6 +36,35 @@ def main() -> int:
         print(f"$ {executable_name} {flag}\n{result.stdout}{result.stderr}")
         if result.returncode != 0:
             return result.returncode
+        if (
+            flag == "--version"
+            and args.expected_version
+            and result.stdout.strip() != f"netloop {args.expected_version}"
+        ):
+            raise AssertionError(
+                "unexpected NetLoop version: "
+                f"expected={args.expected_version!r}, "
+                f"observed={result.stdout.strip()!r}"
+            )
+
+    invalid = subprocess.run(
+        [str(executable), "--definitely-unknown", "1"],
+        cwd=runtime,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=20,
+    )
+    print(
+        f"$ {executable_name} --definitely-unknown 1\n"
+        f"{invalid.stdout}{invalid.stderr}"
+    )
+    if invalid.returncode == 0 or "Unknown option" not in (
+        invalid.stdout + invalid.stderr
+    ):
+        raise AssertionError("unknown CLI option was not rejected")
+
     return 0
 
 

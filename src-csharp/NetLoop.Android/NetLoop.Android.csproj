@@ -5,8 +5,8 @@
     <OutputType>Exe</OutputType>
     <ApplicationId>com.libzt.netloop</ApplicationId>
     <ApplicationTitle>NetLoop</ApplicationTitle>
-    <ApplicationVersion>1</ApplicationVersion>
-    <ApplicationDisplayVersion>0.1.0</ApplicationDisplayVersion>
+    <ApplicationVersion Condition="'$(ApplicationVersion)' == ''">1</ApplicationVersion>
+    <ApplicationDisplayVersion Condition="'$(ApplicationDisplayVersion)' == ''">0.0.0-dev</ApplicationDisplayVersion>
     <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">android-arm64</RuntimeIdentifier>
     <NetLoopAndroidAbi Condition="'$(NetLoopAndroidAbi)' == ''">arm64-v8a</NetLoopAndroidAbi>
     <AndroidPackageFormat>apk</AndroidPackageFormat>

@@ -77,9 +77,9 @@ IPv4 默认映射到 127.0.0.1，IPv6 默认映射到 ::1。后续可以提供�
 
 一个 Node 可能同时得到多个 Managed IP。第一版明确选择一个 canonical /
 primary overlay address：**优先 IPv4，否则使用第一个 Managed IPv6**。TCP/UDP
-Agent 只监听这个地址；status 中同时暴露 `primary_overlay_address` 和兼容字段
-`overlay_host`。`--peer` 与 `default_exit` 必须填写对端的 primary overlay
-address，不把其余 Managed IP 当作可连接的 Agent 地址。
+Agent 和 RouteSelector 都只使用这个地址；status 只暴露
+`primary_overlay_address`。`--peer` 与 `default_exit` 必须填写对端的
+primary overlay address；其它 Managed IP 不进入 NetLoop 路由模型。
 
 ## 5. 统一出网
 
@@ -373,10 +373,13 @@ Windows 错误同时记录数值错误码；文本日志统一 UTF-8。
 - Linux x64 发布包：`netloop-linux-x64.tar.gz`。
 - Linux arm64 发布包：`netloop-linux-arm64.tar.gz`。
 - Android arm64 应用：`netloop-android-arm64.apk`。
+- Desktop 正式 release 为 self-contained，目标机器无需预装 .NET runtime。
+- `vMAJOR.MINOR.PATCH` tag 是正式发布的唯一版本源；Desktop assembly version /
+  `--version` 与 Android display version 由 workflow 注入，Android versionCode
+  使用 `major * 1_000_000 + minor * 1_000 + patch`。
 - native libzt 自动构建、缓存和打包。
-- CI smoke/E2E；`v*` tag 由 release workflow 自动创建/更新 GitHub Release，
+- CI smoke/E2E；`vMAJOR.MINOR.PATCH` tag 由 release workflow 自动创建/更新 GitHub Release，
   workflow_dispatch 只构建 artifacts。
-- identity/state 升级兼容策略。
 
 ## 19. 最低测试矩阵
 
@@ -449,16 +452,16 @@ C# native libzt 构建所需要的第三方源码、最小 CMake 入口和补丁
 
 ### 23.2 Overlay 路由
 
-- 只把当前 ZeroTier network 的**直接 Managed Route**视为 overlay 地址空间。
-- 带 gateway/`via` 的 managed route 不作为 NetLoop overlay peer 路由；NetLoop 第一版不访问远端 LAN。
-- Phase 0 已验证固定 libzt 的 `zts_core_query_route()`：它能返回 target/via，但当前实现只把 route target 转成裸 IP 字符串，不返回 prefix/netmask，因此无法可靠用 managed route 判断任意目标 IP 是否属于 overlay CIDR。第一版据此启用已批准的 fallback：使用**显式 peer Managed-IP 列表**，并把 `default_exit` 自动加入 peer 集合；禁止根据缺失的 CIDR 信息猜测。route query 仍用于诊断 direct/via，不作为地址空间归属的唯一判据。
-- 本机 Managed IP -> 本机 loopback。
-- 其他 overlay Managed IP -> 直接连接该 peer Agent。
-- Overlay Agent 收到请求后是最终处理节点：本机 Managed IP 访问 loopback；非 overlay 目标执行本机 egress；**不得再次转发给第三个 NetLoop 节点**。
-- 对某个 overlay Managed IP 的 Agent 连接失败时明确失败，不改走 `default_exit`。
+- NetLoop 不做 CIDR / Managed Route routing，也不查询 libzt route table。
+- 每个 Node 只使用一个 primary overlay address：IPv4 优先，否则第一个 IPv6。
+- 本机 primary address -> 本机 loopback；其它本机 Managed IP 对 NetLoop 不存在。
+- overlay peer 只由显式 `--peer` primary addresses 定义；`default_exit` 自动加入
+  peer 集合。
+- 其他显式 peer primary address -> 直接连接该 peer Agent。
+- Overlay Agent 收到请求后是最终处理节点：本机 primary address 访问 loopback；
+  非 overlay 目标执行本机 egress；**不得再次转发给第三个 NetLoop 节点**。
+- 对某个 peer primary address 的 Agent 连接失败时明确失败，不改走 `default_exit`。
 - `default_exit` 不可达时 fail closed，不自动 DIRECT。
-- 每个 Node 只选择一个 primary overlay address：IPv4 优先，否则第一个 IPv6；
-  `--peer` / `default_exit` 必须使用对端 status 暴露的 primary address。
 
 ### 23.3 SOCKS5 与 Egress
 
@@ -467,12 +470,15 @@ C# native libzt 构建所需要的第三方源码、最小 CMake 入口和补丁
 - `UPSTREAM_SOCKS5` 支持 no-auth 和 username/password。
 - upstream TCP 使用 CONNECT。
 - upstream UDP 必须使用 UDP ASSOCIATE；若 upstream 不支持 UDP，明确失败，禁止回退 DIRECT。
-- Phase 0 对 `VpnHood.Core.Proxies 8.1.851` 的验证结论：其 SOCKS5 server 已具备 CONNECT、UDP ASSOCIATE、source validation、bounded state、half-close 等成熟行为，但 server 出站路径直接创建 `TcpClient/UdpClient`，没有可注入 libzt transport 的接口。因此 NetLoop 不直接套用 server；TCP 先实现最小标准 CONNECT adapter，UDP Phase 复用/抽取其成熟 association、validation、timeout/cancellation 语义并接入 NetLoop transport abstraction。
+- 项目内只维护 NetLoop 所需的最小 CONNECT / UDP ASSOCIATE、source validation、
+  bounded state、half-close、timeout/cancellation 行为；不扩展成通用 SOCKS 框架。
 
 ### 23.4 Runtime Reset
 
 - 不实现 Soft Recovery / Hard Recovery / NetworkEpoch / transport generation migration。
 - 网络变化统一触发一次 runtime reset；OS 事件做约 250ms debounce。
+- Desktop/Android reset request queue 都只保留一个 pending 事件，切网风暴不会排队
+  连续重建 runtime。
 - Desktop/Android 都只重建 NetLoop 业务 runtime，不重启 libzt node。
 - reset 时关闭并等待所有 active TCP handler、UDP association 和 overlay listener 退出；不测试远端何时观察到 TCP RST。
 - libzt 接收 host-network-changed 通知后立即执行 ZeroTierOne 1.12 同等的 binder refresh / local-interface rescan；identity 和 Node ID 保持不变。

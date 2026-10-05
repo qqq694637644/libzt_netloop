@@ -174,9 +174,12 @@ def prepare(args: argparse.Namespace) -> int:
         )
 
         status = wait_for_json(status_path, timeout=200)
-        server_ip = status.get("overlay_host")
+        server_ip = status.get("primary_overlay_address")
         if not server_ip:
-            raise RuntimeError(f"server did not publish overlay_host: {status}")
+            raise RuntimeError(
+                "server did not publish primary_overlay_address: "
+                f"{status}"
+            )
 
         rendezvous = {
             "network_id": network_id,

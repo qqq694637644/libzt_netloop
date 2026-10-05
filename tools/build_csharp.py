@@ -166,8 +166,17 @@ def build_managed(args: argparse.Namespace) -> None:
         shutil.rmtree(dist)
     dist.mkdir(parents=True, exist_ok=True)
 
-    run(["dotnet", "restore", str(project), "--runtime", args.runtime])
-    run([
+    restore = [
+        "dotnet",
+        "restore",
+        str(project),
+        "--runtime",
+        args.runtime,
+    ]
+    if args.self_contained:
+        restore.append("-p:SelfContained=true")
+    run(restore)
+    publish = [
         "dotnet",
         "publish",
         str(project),
@@ -176,11 +185,18 @@ def build_managed(args: argparse.Namespace) -> None:
         "--runtime",
         args.runtime,
         "--self-contained",
-        "false",
+        "true" if args.self_contained else "false",
         "--no-restore",
         "--output",
         str(dist),
-    ])
+    ]
+    if args.version:
+        publish.extend([
+            f"-p:Version={args.version.split('+', 1)[0]}",
+            f"-p:InformationalVersion={args.version}",
+            "-p:IncludeSourceRevisionInInformationalVersion=false",
+        ])
+    run(publish)
 
     native_name = "libzt.dll" if args.runtime.startswith("win-") else "libzt.so"
     shutil.copy2(native_input, dist / native_name)
@@ -189,6 +205,8 @@ def build_managed(args: argparse.Namespace) -> None:
         **native_cache_identity(),
         "runtime": args.runtime,
         "native_file": native_name,
+        "self_contained": bool(args.self_contained),
+        "version": args.version,
         "duration_seconds": round(time.monotonic() - started, 3),
     }
     (dist / "build-manifest.json").write_text(
@@ -208,6 +226,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--native-input", default=str(ROOT / "native-cache" / "libzt.dll"))
     parser.add_argument("--output", default=str(DEFAULT_DIST))
     parser.add_argument("--runtime", default="win-x64")
+    parser.add_argument("--self-contained", action="store_true")
+    parser.add_argument("--version")
     parser.add_argument("--parallel", type=int)
     parser.add_argument("--use-sccache", action="store_true")
     parser.add_argument("--clean-native", action="store_true")

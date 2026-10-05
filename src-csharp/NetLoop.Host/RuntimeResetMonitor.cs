@@ -7,14 +7,12 @@ namespace NetLoop.Host;
 internal sealed class RuntimeResetMonitor : IAsyncDisposable
 {
     private static readonly TimeSpan CommandPollInterval = TimeSpan.FromMilliseconds(50);
-    private static readonly TimeSpan StartupGrace = TimeSpan.FromSeconds(1);
 
     private readonly string? _commandFile;
     private readonly TimeSpan _debounce;
     private readonly Action<string> _requestReset;
     private readonly CancellationTokenSource _stop = new();
     private readonly object _debounceGate = new();
-    private readonly DateTimeOffset _acceptNetworkEventsAfter;
     private CancellationTokenSource? _debounceCts;
     private Task? _commandLoop;
     private int _started;
@@ -30,7 +28,6 @@ internal sealed class RuntimeResetMonitor : IAsyncDisposable
             : Path.GetFullPath(commandFile);
         _debounce = debounce;
         _requestReset = requestReset;
-        _acceptNetworkEventsAfter = DateTimeOffset.UtcNow + StartupGrace;
     }
 
     internal void Start()
@@ -64,8 +61,7 @@ internal sealed class RuntimeResetMonitor : IAsyncDisposable
 
     private void ScheduleNetworkReset(string reason)
     {
-        if (Volatile.Read(ref _disposed) != 0
-            || DateTimeOffset.UtcNow < _acceptNetworkEventsAfter)
+        if (Volatile.Read(ref _disposed) != 0)
             return;
 
         CancellationTokenSource current;

@@ -95,11 +95,12 @@ public sealed class NetLoopService : Service
         var state = await node.StartAsync(cancellationToken)
             .ConfigureAwait(false);
 
-        var resets = Channel.CreateUnbounded<string>(
-            new UnboundedChannelOptions {
+        var resets = Channel.CreateBounded<string>(
+            new BoundedChannelOptions(1) {
                 SingleReader = true,
                 SingleWriter = false,
-                AllowSynchronousContinuations = false
+                AllowSynchronousContinuations = false,
+                FullMode = BoundedChannelFullMode.DropOldest
             });
 #if NETLOOP_CI
         _ciResets = resets;

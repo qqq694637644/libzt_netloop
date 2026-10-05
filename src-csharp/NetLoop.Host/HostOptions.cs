@@ -4,6 +4,30 @@ namespace NetLoop.Host;
 
 internal sealed class HostOptions
 {
+    private static readonly HashSet<string> KnownValueOptions = new(
+        [
+            "--network",
+            "--state-dir",
+            "--socks-host",
+            "--socks-port",
+            "--overlay-port",
+            "--overlay-udp-port",
+            "--peer",
+            "--default-exit",
+            "--egress",
+            "--upstream-host",
+            "--upstream-port",
+            "--upstream-user",
+            "--upstream-password",
+            "--status-file",
+            "--startup-timeout",
+            "--connect-timeout",
+            "--udp-idle-timeout",
+            "--reset-debounce-ms",
+            "--reset-command-file"
+        ],
+        StringComparer.Ordinal);
+
     internal ulong NetworkId { get; init; }
     internal required string StateDirectory { get; init; }
     internal IPAddress SocksAddress { get; init; } = IPAddress.Loopback;
@@ -42,6 +66,8 @@ internal sealed class HostOptions
 
             if (!key.StartsWith("--", StringComparison.Ordinal))
                 throw new ArgumentException($"Unexpected argument: {key}");
+            if (!KnownValueOptions.Contains(key))
+                throw new ArgumentException($"Unknown option: {key}");
             if (++index >= args.Length)
                 throw new ArgumentException($"Missing value for {key}");
 
@@ -128,7 +154,7 @@ internal sealed class HostOptions
           --socks-port <port>         Local SOCKS5 port (default 1080)
           --overlay-port <port>       NetLoop peer Agent TCP port (default 42042)
           --overlay-udp-port <port>   NetLoop peer Agent UDP port (default 42043)
-          --peer <managed-ip>         Peer primary Managed IP (overlay_host); repeatable
+          --peer <managed-ip>         Peer primary Managed IP; repeatable
           --default-exit <managed-ip> Primary Managed IP of default egress peer
           --egress <mode>             direct | upstream-socks5 (default direct)
           --upstream-host <host>      Upstream SOCKS5 host

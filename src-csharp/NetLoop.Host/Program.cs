@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Reflection;
 using System.Threading.Channels;
 using NetLoop.Core;
 using NetLoop.Libzt;
@@ -20,7 +21,7 @@ internal static class Program
 
             if (options.ShowVersion)
             {
-                Console.WriteLine("netloop 0.1.0");
+                Console.WriteLine($"netloop {GetVersion()}");
                 return 0;
             }
 
@@ -52,6 +53,13 @@ internal static class Program
             return 1;
         }
     }
+
+    private static string GetVersion()
+        => typeof(Program).Assembly
+               .GetCustomAttribute<AssemblyInformationalVersionAttribute>()
+               ?.InformationalVersion
+           ?? typeof(Program).Assembly.GetName().Version?.ToString()
+           ?? "unknown";
 
     private static async Task<int> RunAsync(
         HostOptions options,
@@ -194,7 +202,6 @@ internal static class Program
                     .ToArray(),
                 primary_overlay_address =
                     runtime.OverlayBindAddress.ToString(),
-                overlay_host = runtime.OverlayBindAddress.ToString(),
                 overlay_port = options.OverlayPort,
                 overlay_udp_port = options.OverlayUdpPort,
                 socks_host = options.SocksAddress.ToString(),

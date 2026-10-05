@@ -33,11 +33,7 @@ public sealed class MainActivity : Activity
         ApplyCiConfigurationFromIntent();
 #endif
 
-        var preferences = GetSharedPreferences(
-            AndroidConfig.PreferencesName,
-            FileCreationMode.Private)
-            ?? throw new InvalidOperationException(
-                "Unable to open NetLoop preferences.");
+        var config = AndroidConfig.LoadSnapshotOrDefault(this);
 
         var root = new LinearLayout(this) {
             Orientation = Orientation.Vertical
@@ -54,31 +50,31 @@ public sealed class MainActivity : Activity
         _networkId = AddField(
             root,
             "ZeroTier network ID (hex)",
-            preferences.GetString(AndroidConfig.NetworkIdKey, string.Empty));
+            config.NetworkId);
         _peers = AddField(
             root,
             "Peer Managed IPs (comma/space separated)",
-            preferences.GetString(AndroidConfig.PeersKey, string.Empty));
+            config.Peers);
         _defaultExit = AddField(
             root,
             "Default exit Managed IP (optional)",
-            preferences.GetString(AndroidConfig.DefaultExitKey, string.Empty));
+            config.DefaultExit);
         _upstreamHost = AddField(
             root,
             "Upstream SOCKS5 host (optional)",
-            preferences.GetString(AndroidConfig.UpstreamHostKey, string.Empty));
+            config.UpstreamHost);
         _upstreamPort = AddField(
             root,
             "Upstream SOCKS5 port",
-            preferences.GetString(AndroidConfig.UpstreamPortKey, "1080"));
+            config.UpstreamPort);
         _upstreamUser = AddField(
             root,
             "Upstream SOCKS5 username (optional)",
-            preferences.GetString(AndroidConfig.UpstreamUserKey, string.Empty));
+            config.UpstreamUser);
         _upstreamPassword = AddField(
             root,
             "Upstream SOCKS5 password (optional)",
-            preferences.GetString(AndroidConfig.UpstreamPasswordKey, string.Empty));
+            config.UpstreamPassword);
         _upstreamPassword.InputType =
             global::Android.Text.InputTypes.ClassText
             | global::Android.Text.InputTypes.TextVariationPassword;
@@ -151,37 +147,22 @@ public sealed class MainActivity : Activity
         if (networkId.Length == 0)
             throw new InvalidOperationException("CI start requires network_id.");
 
-        var preferences = GetSharedPreferences(
-            AndroidConfig.PreferencesName,
-            FileCreationMode.Private)
-            ?? throw new InvalidOperationException(
-                "Unable to open NetLoop CI preferences.");
-        var editor = preferences.Edit()
-            ?? throw new InvalidOperationException(
-                "Unable to edit NetLoop CI preferences.");
-
-        editor.PutString(AndroidConfig.NetworkIdKey, networkId);
-        editor.PutString(
-            AndroidConfig.PeersKey,
-            intent.GetStringExtra("peers") ?? string.Empty);
-        editor.PutString(
-            AndroidConfig.DefaultExitKey,
-            intent.GetStringExtra("default_exit") ?? string.Empty);
-        editor.PutString(
-            AndroidConfig.OverlayPortKey,
-            intent.GetIntExtra("overlay_port", 42042)
-                .ToString(
-                    System.Globalization.CultureInfo.InvariantCulture));
-        editor.PutString(
-            AndroidConfig.OverlayUdpPortKey,
-            intent.GetIntExtra("overlay_udp_port", 42043)
-                .ToString(
-                    System.Globalization.CultureInfo.InvariantCulture));
-        editor.PutString(AndroidConfig.UpstreamHostKey, string.Empty);
-        editor.PutString(AndroidConfig.UpstreamUserKey, string.Empty);
-        editor.PutString(AndroidConfig.UpstreamPasswordKey, string.Empty);
-        if (!editor.Commit())
-            throw new IOException("Unable to persist NetLoop CI preferences.");
+        AndroidConfig.SaveSnapshot(
+            this,
+            new AndroidConfig.Snapshot(
+                networkId,
+                intent.GetStringExtra("peers") ?? string.Empty,
+                intent.GetStringExtra("default_exit") ?? string.Empty,
+                intent.GetIntExtra("overlay_port", 42042)
+                    .ToString(
+                        System.Globalization.CultureInfo.InvariantCulture),
+                intent.GetIntExtra("overlay_udp_port", 42043)
+                    .ToString(
+                        System.Globalization.CultureInfo.InvariantCulture),
+                string.Empty,
+                "1080",
+                string.Empty,
+                string.Empty));
 
         CiAutomationStatus.Delete(this);
     }
@@ -205,41 +186,19 @@ public sealed class MainActivity : Activity
             return;
         }
 
-        var preferences = GetSharedPreferences(
-            AndroidConfig.PreferencesName,
-            FileCreationMode.Private)
-            ?? throw new InvalidOperationException(
-                "Unable to open NetLoop preferences.");
-        var editor = preferences.Edit()
-            ?? throw new InvalidOperationException(
-                "Unable to edit NetLoop preferences.");
-
-        editor.PutString(AndroidConfig.NetworkIdKey, networkId);
-        editor.PutString(
-            AndroidConfig.PeersKey,
-            _peers?.Text ?? string.Empty);
-        editor.PutString(
-            AndroidConfig.DefaultExitKey,
-            _defaultExit?.Text ?? string.Empty);
-        editor.PutString(
-            AndroidConfig.UpstreamHostKey,
-            _upstreamHost?.Text ?? string.Empty);
-        editor.PutString(
-            AndroidConfig.UpstreamPortKey,
-            _upstreamPort?.Text ?? "1080");
-        editor.PutString(
-            AndroidConfig.UpstreamUserKey,
-            _upstreamUser?.Text ?? string.Empty);
-        editor.PutString(
-            AndroidConfig.UpstreamPasswordKey,
-            _upstreamPassword?.Text ?? string.Empty);
-        if (!editor.Commit())
-            throw new IOException("Unable to persist NetLoop preferences.");
-
-        // SharedPreferences remains a UI convenience only. The foreground
-        // service runs in :netloop, so cross-process configuration is carried
-        // by an atomically replaced app-private JSON snapshot instead.
-        AndroidConfig.SaveSnapshot(this, preferences);
+        var current = AndroidConfig.LoadSnapshotOrDefault(this);
+        AndroidConfig.SaveSnapshot(
+            this,
+            new AndroidConfig.Snapshot(
+                networkId,
+                _peers?.Text ?? string.Empty,
+                _defaultExit?.Text ?? string.Empty,
+                current.OverlayPort,
+                current.OverlayUdpPort,
+                _upstreamHost?.Text ?? string.Empty,
+                _upstreamPort?.Text ?? "1080",
+                _upstreamUser?.Text ?? string.Empty,
+                _upstreamPassword?.Text ?? string.Empty));
 
         if (OperatingSystem.IsAndroidVersionAtLeast(33)
             && CheckSelfPermission(Manifest.Permission.PostNotifications)

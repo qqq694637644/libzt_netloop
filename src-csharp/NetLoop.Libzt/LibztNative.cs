@@ -100,19 +100,6 @@ internal static class LibztNative
     [DllImport(LibraryName, EntryPoint = "CSharp_zts_core_query_addr")]
     internal static extern int CoreQueryAddress(ulong networkId, int index, nint destination, int length);
 
-    [DllImport(LibraryName, EntryPoint = "CSharp_zts_core_query_route_count")]
-    internal static extern int CoreQueryRouteCount(ulong networkId);
-
-    [DllImport(LibraryName, EntryPoint = "CSharp_zts_core_query_route")]
-    internal static extern int CoreQueryRoute(
-        ulong networkId,
-        int index,
-        nint target,
-        nint via,
-        int length,
-        ref ushort flags,
-        ref ushort metric);
-
     [DllImport(LibraryName, EntryPoint = "CSharp_zts_bsd_socket")]
     internal static extern int Socket(int family, int type, int protocol);
 

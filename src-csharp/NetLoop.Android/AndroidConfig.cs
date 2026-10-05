@@ -10,23 +10,38 @@ internal sealed record AndroidConfig(
     HostOptions RuntimeOptions,
     string NetworkIdText)
 {
-    internal const string PreferencesName = "netloop";
-    internal const string NetworkIdKey = "network_id";
-    internal const string PeersKey = "peers";
-    internal const string DefaultExitKey = "default_exit";
-    internal const string OverlayPortKey = "overlay_port";
-    internal const string OverlayUdpPortKey = "overlay_udp_port";
-    internal const string UpstreamHostKey = "upstream_host";
-    internal const string UpstreamPortKey = "upstream_port";
-    internal const string UpstreamUserKey = "upstream_user";
-    internal const string UpstreamPasswordKey = "upstream_password";
     private const string ConfigFileName = "netloop-config.json";
+
+    internal sealed record Snapshot(
+        string NetworkId,
+        string Peers,
+        string DefaultExit,
+        string OverlayPort,
+        string OverlayUdpPort,
+        string UpstreamHost,
+        string UpstreamPort,
+        string UpstreamUser,
+        string UpstreamPassword)
+    {
+        internal static Snapshot Empty { get; } = new(
+            string.Empty,
+            string.Empty,
+            string.Empty,
+            "42042",
+            "42043",
+            string.Empty,
+            "1080",
+            string.Empty,
+            string.Empty);
+    }
 
     internal static AndroidConfig Load(Context context)
     {
-        var config = ReadSnapshot(context);
+        var config = ReadSnapshot(context)
+            ?? throw new InvalidOperationException(
+                "NetLoop configuration is missing. Use Save & Start first.");
 
-        var networkText = (config.NetworkId ?? string.Empty).Trim();
+        var networkText = config.NetworkId.Trim();
         if (networkText.Length == 0
             || !ulong.TryParse(
                 networkText,
@@ -39,7 +54,7 @@ internal sealed record AndroidConfig(
         }
 
         var peers = ParsePeers(config.Peers);
-        var defaultExitText = (config.DefaultExit ?? string.Empty).Trim();
+        var defaultExitText = config.DefaultExit.Trim();
         var defaultExit = defaultExitText.Length == 0
             ? null
             : IPAddress.Parse(defaultExitText);
@@ -52,8 +67,8 @@ internal sealed record AndroidConfig(
             "overlay UDP",
             42043);
 
-        var upstreamHost = (config.UpstreamHost ?? string.Empty).Trim();
-        var upstreamPortText = (config.UpstreamPort ?? "1080").Trim();
+        var upstreamHost = config.UpstreamHost.Trim();
+        var upstreamPortText = config.UpstreamPort.Trim();
         if (!ushort.TryParse(upstreamPortText, out var upstreamPort)
             || upstreamPort == 0)
         {
@@ -63,7 +78,8 @@ internal sealed record AndroidConfig(
 
         var stateDirectory = Path.Combine(
             context.FilesDir?.AbsolutePath
-            ?? throw new InvalidOperationException("Android FilesDir is unavailable."),
+            ?? throw new InvalidOperationException(
+                "Android FilesDir is unavailable."),
             "netloop-state");
 
         var options = new HostOptions {
@@ -80,10 +96,8 @@ internal sealed record AndroidConfig(
                 : "upstream-socks5",
             UpstreamHost = upstreamHost.Length == 0 ? null : upstreamHost,
             UpstreamPort = upstreamPort,
-            UpstreamUsername = EmptyToNull(
-                config.UpstreamUser),
-            UpstreamPassword = EmptyToNull(
-                config.UpstreamPassword),
+            UpstreamUsername = EmptyToNull(config.UpstreamUser),
+            UpstreamPassword = EmptyToNull(config.UpstreamPassword),
             StartupTimeout = TimeSpan.FromSeconds(120),
             ConnectTimeout = TimeSpan.FromSeconds(20),
             UdpIdleTimeout = TimeSpan.FromSeconds(60),
@@ -93,30 +107,13 @@ internal sealed record AndroidConfig(
         return new AndroidConfig(options, networkText);
     }
 
+    internal static Snapshot LoadSnapshotOrDefault(Context context)
+        => ReadSnapshot(context) ?? Snapshot.Empty;
+
     internal static void SaveSnapshot(
         Context context,
-        ISharedPreferences preferences)
+        Snapshot snapshot)
     {
-        var snapshot = new PersistedConfig {
-            NetworkId = preferences.GetString(NetworkIdKey, string.Empty),
-            Peers = preferences.GetString(PeersKey, string.Empty),
-            DefaultExit = preferences.GetString(DefaultExitKey, string.Empty),
-            OverlayPort = preferences.GetString(OverlayPortKey, "42042"),
-            OverlayUdpPort = preferences.GetString(
-                OverlayUdpPortKey,
-                "42043"),
-            UpstreamHost = preferences.GetString(
-                UpstreamHostKey,
-                string.Empty),
-            UpstreamPort = preferences.GetString(UpstreamPortKey, "1080"),
-            UpstreamUser = preferences.GetString(
-                UpstreamUserKey,
-                string.Empty),
-            UpstreamPassword = preferences.GetString(
-                UpstreamPasswordKey,
-                string.Empty)
-        };
-
         var path = GetConfigPath(context);
         var temp = path + ".tmp";
         File.WriteAllText(
@@ -129,16 +126,13 @@ internal sealed record AndroidConfig(
         File.Move(temp, path, true);
     }
 
-    private static PersistedConfig ReadSnapshot(Context context)
+    private static Snapshot? ReadSnapshot(Context context)
     {
         var path = GetConfigPath(context);
         if (!File.Exists(path))
-        {
-            throw new InvalidOperationException(
-                "NetLoop configuration is missing. Use Save & Start first.");
-        }
+            return null;
 
-        return JsonSerializer.Deserialize<PersistedConfig>(
+        return JsonSerializer.Deserialize<Snapshot>(
                    File.ReadAllText(path),
                    new JsonSerializerOptions {
                        PropertyNameCaseInsensitive = true
@@ -155,7 +149,7 @@ internal sealed record AndroidConfig(
         return Path.Combine(directory, ConfigFileName);
     }
 
-    private static IReadOnlyList<IPAddress> ParsePeers(string? text)
+    private static IReadOnlyList<IPAddress> ParsePeers(string text)
     {
         if (string.IsNullOrWhiteSpace(text))
             return [];
@@ -170,11 +164,13 @@ internal sealed record AndroidConfig(
             .ToArray();
     }
 
-    private static string? EmptyToNull(string? value)
-        => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+    private static string? EmptyToNull(string value)
+        => string.IsNullOrWhiteSpace(value)
+            ? null
+            : value.Trim();
 
     private static ushort ParsePort(
-        string? value,
+        string value,
         string label,
         ushort defaultValue)
     {
@@ -192,18 +188,5 @@ internal sealed record AndroidConfig(
                 $"Invalid {label} port: {text}");
         }
         return port;
-    }
-
-    private sealed class PersistedConfig
-    {
-        public string? NetworkId { get; init; }
-        public string? Peers { get; init; }
-        public string? DefaultExit { get; init; }
-        public string? OverlayPort { get; init; }
-        public string? OverlayUdpPort { get; init; }
-        public string? UpstreamHost { get; init; }
-        public string? UpstreamPort { get; init; }
-        public string? UpstreamUser { get; init; }
-        public string? UpstreamPassword { get; init; }
     }
 }

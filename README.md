@@ -23,9 +23,9 @@ Android CI also builds an x86_64-only test APK for the GitHub-hosted Android emu
 
 ## Overlay addresses
 
-Each runtime chooses one **primary overlay address** for its peer TCP/UDP listeners: IPv4 is preferred when the ZeroTier network assigns one; otherwise the first Managed IPv6 address is used. The selected value is published as `primary_overlay_address` and `overlay_host` in the readiness status.
+Each runtime chooses one **primary overlay address** for its peer TCP/UDP listeners: IPv4 is preferred when the ZeroTier network assigns one; otherwise the first Managed IPv6 address is used. The selected value is published as `primary_overlay_address` in the readiness status.
 
-Configure `--peer` and `--default-exit` with the other node's `primary_overlay_address`/`overlay_host`. A node may have additional Managed IPs, but NetLoop v1 intentionally does not create a listener for every address.
+Configure `--peer` and `--default-exit` with the other node's `primary_overlay_address`. A node may have additional Managed IPs, but NetLoop v1 ignores them for routing and only exposes services on the primary address.
 
 ## Build
 
@@ -73,7 +73,13 @@ The reset tests are deterministic fault injection. They prove that once a reset 
 - `netloop-linux-arm64.tar.gz`
 - `netloop-android-arm64.apk`
 
-Tag pushes matching `v*` create/update the corresponding GitHub Release. Manual workflow dispatch builds the same artifacts without publishing a release.
+Tags matching `vMAJOR.MINOR.PATCH` create/update the corresponding GitHub Release. Manual workflow dispatch builds the same artifacts without publishing a release.
+
+Desktop release archives are self-contained and do not require a separately
+installed .NET runtime. A release tag such as `v0.3.1` is the single version
+source: Desktop `netloop --version` and the Android display version both report
+`0.3.1`. Manual release builds use a development version derived from the
+commit SHA.
 
 ## Native dependency
 

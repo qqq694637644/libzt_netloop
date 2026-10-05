@@ -291,13 +291,6 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
         CancellationToken cancellationToken)
     {
         var decision = _selector.Select(target, overlayIngress: true);
-        JsonLog.Info("udp_route_decision", new {
-            target = target.ToString(),
-            ingress = "overlay",
-            route = decision.Kind.ToString(),
-            peer = _peer.ToString(),
-            decision.Reason
-        });
 
         switch (decision.Kind)
         {
@@ -384,13 +377,6 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
                 : datagram;
             await _responseSender(_peer, response, cancellationToken).ConfigureAwait(false);
             Touch();
-
-            JsonLog.Info("overlay_udp_response_sent", new {
-                peer = _peer.ToString(),
-                transport = source,
-                source_endpoint = response.Source.ToString(),
-                bytes = response.Payload.Length
-            });
         }
     }
 

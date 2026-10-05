@@ -145,7 +145,6 @@ internal static class CiAutomationStatus
                         .Select(static address => address.ToString())
                         .ToArray(),
                 primary_overlay_address = primaryOverlayAddress,
-                overlay_host = primaryOverlayAddress,
                 reset_count = resetCount,
                 reset_reason = resetReason,
                 process_id = global::Android.OS.Process.MyPid()
