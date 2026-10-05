@@ -7,8 +7,7 @@ using NetLoop.Host;
 namespace NetLoop.Android;
 
 internal sealed record AndroidConfig(
-    HostOptions RuntimeOptions,
-    string NetworkIdText)
+    HostOptions RuntimeOptions)
 {
     private const string ConfigFileName = "netloop-config.json";
 
@@ -104,7 +103,7 @@ internal sealed record AndroidConfig(
             ResetEventDebounce = TimeSpan.FromMilliseconds(250)
         };
 
-        return new AndroidConfig(options, networkText);
+        return new AndroidConfig(options);
     }
 
     internal static Snapshot LoadSnapshotOrDefault(Context context)

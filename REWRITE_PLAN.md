@@ -75,11 +75,12 @@ A 上应用配置本地 SOCKS5 为 127.0.0.1:1080。应用请求 172.26.0.254:80
 
 IPv4 默认映射到 127.0.0.1，IPv6 默认映射到 ::1。后续可以提供简单配置覆盖本机服务映射地址，但不扩展为远端 LAN 路由。
 
-一个 Node 可能同时得到多个 Managed IP。第一版明确选择一个 canonical /
-primary overlay address：**优先 IPv4，否则使用第一个 Managed IPv6**。TCP/UDP
+一个 Node 可能同时得到多个 Managed IP。第一版明确选择一个 deterministic canonical /
+primary overlay address：**优先数值最小的 IPv4，否则使用数值最小的 Managed IPv6**。TCP/UDP
 Agent 和 RouteSelector 都只使用这个地址；status 只暴露
-`primary_overlay_address`。`--peer` 与 `default_exit` 必须填写对端的
-primary overlay address；其它 Managed IP 不进入 NetLoop 路由模型。
+`primary_overlay_address`。`--peer` 填写对端 primary overlay address；
+`default_exit` 可以在所有节点共享同一个 primary 值，包括出口节点自己；
+其它 Managed IP 不进入 NetLoop 路由模型。
 
 ## 5. 统一出网
 
@@ -453,13 +454,14 @@ C# native libzt 构建所需要的第三方源码、最小 CMake 入口和补丁
 ### 23.2 Overlay 路由
 
 - NetLoop 不做 CIDR / Managed Route routing，也不查询 libzt route table。
-- 每个 Node 只使用一个 primary overlay address：IPv4 优先，否则第一个 IPv6。
+- 每个 Node 只使用一个 deterministic primary overlay address：数值最小 IPv4 优先，否则数值最小 IPv6。
 - 本机 primary address -> 本机 loopback；其它本机 Managed IP 对 NetLoop 不存在。
-- overlay peer 只由显式 `--peer` primary addresses 定义；`default_exit` 自动加入
-  peer 集合。
+- overlay peer 只由显式 `--peer` primary addresses 定义；非本机的 `default_exit`
+  自动加入 peer 集合；本机 primary 不进入 peer 集合。
 - 其他显式 peer primary address -> 直接连接该 peer Agent。
 - Overlay Agent 收到请求后是最终处理节点：本机 primary address 访问 loopback；
   非 overlay 目标执行本机 egress；**不得再次转发给第三个 NetLoop 节点**。
+- 本机 `default_exit == primary` 时，非 overlay 目标直接执行本机 egress，不经 libzt self-connect。
 - 对某个 peer primary address 的 Agent 连接失败时明确失败，不改走 `default_exit`。
 - `default_exit` 不可达时 fail closed，不自动 DIRECT。
 

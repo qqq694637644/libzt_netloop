@@ -48,11 +48,16 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
         HostOptions options,
         LibztNetworkState state)
     {
-        var peers = options.Peers.ToHashSet();
-        if (options.DefaultExit is not null)
-            peers.Add(options.DefaultExit);
-
         var overlayBind = SelectOverlayBindAddress(state.ManagedAddresses);
+        var peers = options.Peers
+            .Where(address => !overlayBind.Equals(address))
+            .ToHashSet();
+        if (options.DefaultExit is not null
+            && !overlayBind.Equals(options.DefaultExit))
+        {
+            peers.Add(options.DefaultExit);
+        }
+
         var snapshot = new OverlayNetworkSnapshot(
             overlayBind,
             peers);
@@ -204,10 +209,18 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
         if (addresses.Count == 0)
             throw new InvalidOperationException("ZeroTier network has no Managed IP.");
 
-        return addresses.FirstOrDefault(
-                   static address =>
-                       address.AddressFamily
-                       == System.Net.Sockets.AddressFamily.InterNetwork)
-               ?? addresses[0];
+        static string SortKey(IPAddress address)
+            => Convert.ToHexString(address.GetAddressBytes());
+
+        return addresses
+                   .Where(
+                       static address =>
+                           address.AddressFamily
+                           == System.Net.Sockets.AddressFamily.InterNetwork)
+                   .OrderBy(SortKey, StringComparer.Ordinal)
+                   .FirstOrDefault()
+               ?? addresses
+                   .OrderBy(SortKey, StringComparer.Ordinal)
+                   .First();
     }
 }

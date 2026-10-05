@@ -17,6 +17,7 @@ public static class ConnectionRelay
         var rightToLeft = PumpAsync(right, left, relayCts.Token);
 
         var first = await Task.WhenAny(leftToRight, rightToLeft).ConfigureAwait(false);
+        var second = ReferenceEquals(first, leftToRight) ? rightToLeft : leftToRight;
         try
         {
             await first.ConfigureAwait(false);
@@ -24,10 +25,10 @@ public static class ConnectionRelay
         catch
         {
             await relayCts.CancelAsync().ConfigureAwait(false);
+            await AwaitAfterCancelAsync(second, relayCts.Token).ConfigureAwait(false);
             throw;
         }
 
-        var second = ReferenceEquals(first, leftToRight) ? rightToLeft : leftToRight;
         try
         {
             await second.WaitAsync(halfCloseTimeout, cancellationToken).ConfigureAwait(false);
@@ -36,6 +37,26 @@ public static class ConnectionRelay
         {
             JsonLog.Info("relay_half_close_timeout", new { timeout_ms = halfCloseTimeout.TotalMilliseconds });
             await relayCts.CancelAsync().ConfigureAwait(false);
+            await AwaitAfterCancelAsync(second, relayCts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            await relayCts.CancelAsync().ConfigureAwait(false);
+            await AwaitAfterCancelAsync(second, relayCts.Token).ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    private static async Task AwaitAfterCancelAsync(
+        Task pump,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await pump.ConfigureAwait(false);
+        }
+        catch (Exception) when (cancellationToken.IsCancellationRequested)
+        {
         }
     }
 

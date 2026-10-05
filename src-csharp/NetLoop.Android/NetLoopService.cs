@@ -16,7 +16,6 @@ namespace NetLoop.Android;
 public sealed class NetLoopService : Service
 {
     internal const string ActionStart = "com.libzt.netloop.action.START";
-    internal const string ActionStop = "com.libzt.netloop.action.STOP";
 #if NETLOOP_CI
     internal const string ActionCiReset = "com.libzt.netloop.ci.RESET";
 #endif
@@ -40,17 +39,6 @@ public sealed class NetLoopService : Service
         StartCommandFlags flags,
         int startId)
     {
-        if (string.Equals(
-                intent?.Action,
-                ActionStop,
-                StringComparison.Ordinal))
-        {
-            EnsureForeground("Stopping NetLoop...");
-            _stop?.Cancel();
-            StopSelf();
-            return StartCommandResult.NotSticky;
-        }
-
 #if NETLOOP_CI
         if (string.Equals(
                 intent?.Action,
@@ -92,8 +80,6 @@ public sealed class NetLoopService : Service
             options.NetworkId,
             options.StateDirectory,
             options.StartupTimeout);
-        var state = await node.StartAsync(cancellationToken)
-            .ConfigureAwait(false);
 
         var resets = Channel.CreateBounded<string>(
             new BoundedChannelOptions(1) {
@@ -116,9 +102,11 @@ public sealed class NetLoopService : Service
 
         try
         {
+            networkMonitor.Start();
+            var state = await node.StartAsync(cancellationToken)
+                .ConfigureAwait(false);
             runtime = await NetLoopRuntime.CreateAsync(options, state)
                 .ConfigureAwait(false);
-            networkMonitor.Start();
 #if NETLOOP_CI
             CiAutomationStatus.WriteReady(
                 this,

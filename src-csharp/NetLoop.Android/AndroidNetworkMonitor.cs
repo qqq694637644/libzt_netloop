@@ -39,9 +39,22 @@ internal sealed class AndroidNetworkMonitor : ConnectivityManager.NetworkCallbac
             throw new InvalidOperationException(
                 "Android network monitor is already started.");
 
+        var activeNetwork = _manager.ActiveNetwork;
+        var activeProperties = activeNetwork is null
+            ? null
+            : _manager.GetLinkProperties(activeNetwork);
+        lock (_gate)
+        {
+            _defaultNetwork = activeNetwork?.ToString();
+            _linkPropertiesFingerprint = activeProperties is null
+                ? null
+                : BuildLinkPropertiesFingerprint(activeProperties);
+        }
+
         _manager.RegisterDefaultNetworkCallback(this);
         JsonLog.Info("android_network_monitor_ready", new {
-            debounce_ms = _debounce.TotalMilliseconds
+            debounce_ms = _debounce.TotalMilliseconds,
+            default_network = _defaultNetwork
         });
     }
 
@@ -52,15 +65,10 @@ internal sealed class AndroidNetworkMonitor : ConnectivityManager.NetworkCallbac
 
         lock (_gate)
         {
-            if (_defaultNetwork is null)
-            {
-                _defaultNetwork = identity;
-                _linkPropertiesFingerprint = null;
-            }
-            else if (!string.Equals(
-                         _defaultNetwork,
-                         identity,
-                         StringComparison.Ordinal))
+            if (!string.Equals(
+                    _defaultNetwork,
+                    identity,
+                    StringComparison.Ordinal))
             {
                 _defaultNetwork = identity;
                 _linkPropertiesFingerprint = null;

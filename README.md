@@ -23,9 +23,9 @@ Android CI also builds an x86_64-only test APK for the GitHub-hosted Android emu
 
 ## Overlay addresses
 
-Each runtime chooses one **primary overlay address** for its peer TCP/UDP listeners: IPv4 is preferred when the ZeroTier network assigns one; otherwise the first Managed IPv6 address is used. The selected value is published as `primary_overlay_address` in the readiness status.
+Each runtime chooses one **primary overlay address** for its peer TCP/UDP listeners: the numerically lowest Managed IPv4 address is preferred; if no IPv4 address exists, the numerically lowest Managed IPv6 address is used. The selected value is published as `primary_overlay_address` in the readiness status.
 
-Configure `--peer` and `--default-exit` with the other node's `primary_overlay_address`. A node may have additional Managed IPs, but NetLoop v1 ignores them for routing and only exposes services on the primary address.
+Configure `--peer` with other nodes' `primary_overlay_address`. `--default-exit` may be shared across every node, including the exit node itself; when it equals the local primary address, NetLoop uses local egress directly instead of connecting to itself. A node may have additional Managed IPs, but NetLoop v1 ignores them for routing and only exposes services on the primary address.
 
 ## Build
 

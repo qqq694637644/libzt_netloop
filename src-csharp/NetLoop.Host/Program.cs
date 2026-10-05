@@ -69,7 +69,6 @@ internal static class Program
             options.NetworkId,
             options.StateDirectory,
             options.StartupTimeout);
-        var state = await node.StartAsync(shutdownToken).ConfigureAwait(false);
 
         var resetCount = 0;
         long? resetStarted = null;
@@ -86,6 +85,8 @@ internal static class Program
             options.ResetEventDebounce,
             reason => resetRequests.Writer.TryWrite(reason));
         resetMonitor.Start();
+
+        var state = await node.StartAsync(shutdownToken).ConfigureAwait(false);
 
         while (!shutdownToken.IsCancellationRequested)
         {

@@ -32,8 +32,6 @@ public sealed class OverlayNetworkSnapshot
 
     public bool IsOverlayManagedAddress(IPAddress address)
         => _peerAddresses.Contains(address);
-
-    public IReadOnlyCollection<IPAddress> PeerAddresses => _peerAddresses;
 }
 
 public sealed class RouteSelector
@@ -65,6 +63,9 @@ public sealed class RouteSelector
 
         if (overlayIngress)
             return new RouteDecision(RouteKind.DirectEgress, null, "overlay peer selected this node as final egress");
+
+        if (_defaultExit is not null && _network.IsSelf(_defaultExit))
+            return new RouteDecision(RouteKind.DirectEgress, null, "this node is the configured default exit");
 
         if (_defaultExit is not null)
             return new RouteDecision(RouteKind.DefaultExit, _defaultExit, "non-overlay target uses configured default exit");
