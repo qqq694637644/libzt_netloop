@@ -10,6 +10,8 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
     private const int MaxTcpTunnels = 128;
     private const int MaxUdpAssociations = 64;
     private static readonly TimeSpan HalfCloseTimeout = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan PeerConnectTimeout =
+        TimeSpan.FromMilliseconds(2_500);
 
     private readonly Socks5UdpAssociationFactory _udpAssociationFactory;
     private readonly OverlaySocksAgent _overlayAgent;
@@ -56,7 +58,7 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
             Array.Empty<ManagedRoute>());
         var selector = new RouteSelector(snapshot, options.DefaultExit);
 
-        var libztConnector = new LibztTcpConnector(options.ConnectTimeout);
+        var libztConnector = new LibztTcpConnector(PeerConnectTimeout);
         var loopbackConnector = new LoopbackTcpConnector(options.ConnectTimeout);
         var egressConnector = BuildEgressConnector(options);
         var overlayBind = SelectOverlayBindAddress(state.ManagedAddresses);
