@@ -9,6 +9,7 @@ import socket
 import ssl
 import struct
 import sys
+import threading
 import time
 import traceback
 
@@ -489,9 +490,42 @@ def run_reset_stress(
             ("127.0.0.1", proxy_port),
             timeout=1.0,
         )
-        stale.settimeout(1.0)
+        stale.settimeout(0.1)
         started = time.monotonic()
         deadline = started + 3.0
+        stale_closed = threading.Event()
+        stale_state: dict[str, object] = {}
+
+        def watch_stale_connection() -> None:
+            while time.monotonic() < deadline:
+                try:
+                    payload = stale.recv(1)
+                    if payload:
+                        stale_state["error"] = AssertionError(
+                            "stale local SOCKS connection produced data during reset"
+                        )
+                    else:
+                        stale_state["closed_at"] = time.monotonic()
+                    stale_closed.set()
+                    return
+                except socket.timeout:
+                    continue
+                except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
+                    stale_state["closed_at"] = time.monotonic()
+                    stale_closed.set()
+                    return
+
+            stale_state["error"] = AssertionError(
+                "stale local SOCKS connection was not discarded within recovery window"
+            )
+            stale_closed.set()
+
+        stale_thread = threading.Thread(
+            target=watch_stale_connection,
+            name=f"netloop-stale-{iteration}",
+            daemon=True,
+        )
+        stale_thread.start()
 
         try:
             write_json_atomic(
@@ -499,67 +533,69 @@ def run_reset_stress(
                 {"Id": expected_reset_count, "Command": "reset"},
             )
 
-            # The old runtime is disposable by design. Its active local TCP
-            # connection must be force-closed before we count any new traffic
-            # as recovered.
-            try:
-                closed = stale.recv(1)
-                if closed:
-                    raise AssertionError(
-                        "stale local SOCKS connection produced data during reset"
+            last_tcp_error: Exception | None = None
+            fresh_tcp_after_abort = False
+            while time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
+                try:
+                    verify_peer_local_service(
+                        proxy_port,
+                        rendezvous["server_ip"],
+                        int(rendezvous["local_service_port"]),
+                        timeout=max(0.1, remaining),
                     )
-            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
-                pass
-            except socket.timeout as exc:
-                raise AssertionError(
-                    "stale local SOCKS connection was not discarded within 1s"
-                ) from exc
-        finally:
-            stale.close()
+                    if stale_closed.is_set() and "error" not in stale_state:
+                        fresh_tcp_after_abort = True
+                        last_tcp_error = None
+                        break
 
-        last_tcp_error: Exception | None = None
-        while time.monotonic() < deadline:
-            remaining = deadline - time.monotonic()
-            try:
-                verify_peer_local_service(
-                    proxy_port,
-                    rendezvous["server_ip"],
-                    int(rendezvous["local_service_port"]),
-                    timeout=max(0.1, remaining),
-                )
-                last_tcp_error = None
-                break
-            except Exception as exc:
-                last_tcp_error = exc
+                    # A probe can race the reset and still reach the old
+                    # listener. Never count that as recovery; close it and
+                    # require a later fresh connection after old-runtime abort
+                    # is observable.
+                    last_tcp_error = RuntimeError(
+                        "fresh TCP completed before old runtime was discarded"
+                    )
+                except Exception as exc:
+                    last_tcp_error = exc
+
                 if time.monotonic() >= deadline:
                     break
                 time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
-        if last_tcp_error is not None:
-            raise AssertionError(
-                f"fresh TCP did not recover within 3s: {last_tcp_error}"
-            ) from last_tcp_error
 
-        payload = f"netloop-reset-{iteration}".encode("ascii")
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise AssertionError(
-                f"runtime reset {iteration} exhausted 3s before fresh UDP"
-            )
-        with SocksUdpAssociation(
-            "127.0.0.1",
-            proxy_port,
-            timeout=max(0.1, remaining),
-        ) as association:
-            _, _, response = association.roundtrip(
-                rendezvous["server_ip"],
-                int(rendezvous["local_udp_service_port"]),
-                payload,
-                timeout=max(0.1, deadline - time.monotonic()),
-            )
-        if response != payload:
-            raise AssertionError(
-                f"fresh UDP after reset {iteration} mismatched: {response!r}"
-            )
+            if not stale_closed.is_set():
+                stale_closed.wait(max(0.0, deadline - time.monotonic()))
+            if stale_state.get("error") is not None:
+                raise stale_state["error"]  # type: ignore[misc]
+            if not fresh_tcp_after_abort:
+                raise AssertionError(
+                    f"fresh TCP did not recover within 3s: {last_tcp_error}"
+                ) from last_tcp_error
+
+            payload = f"netloop-reset-{iteration}".encode("ascii")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError(
+                    f"runtime reset {iteration} exhausted 3s before fresh UDP"
+                )
+            with SocksUdpAssociation(
+                "127.0.0.1",
+                proxy_port,
+                timeout=max(0.1, remaining),
+            ) as association:
+                _, _, response = association.roundtrip(
+                    rendezvous["server_ip"],
+                    int(rendezvous["local_udp_service_port"]),
+                    payload,
+                    timeout=max(0.1, deadline - time.monotonic()),
+                )
+            if response != payload:
+                raise AssertionError(
+                    f"fresh UDP after reset {iteration} mismatched: {response!r}"
+                )
+        finally:
+            stale.close()
+            stale_thread.join(timeout=0.2)
 
         elapsed_ms = (time.monotonic() - started) * 1000.0
         samples_ms.append(elapsed_ms)
