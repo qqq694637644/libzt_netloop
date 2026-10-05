@@ -13,7 +13,7 @@ import traceback
 
 import csharp_e2e_client as desktop_e2e
 from common import ROOT
-from throughput_probe import TARGET_HOST, run_matrix, write_tsv
+from throughput_probe import TARGET_HOST, run_stage, write_tsv
 
 
 PACKAGE = "com.libzt.netloop"
@@ -319,6 +319,8 @@ def write_diagnostics(serial: str, label: str) -> None:
         "logcat.txt": ("logcat", "-d", "-t", "3000"),
         "properties.txt": ("shell", "getprop"),
         "services.txt": ("shell", "dumpsys", "activity", "services", PACKAGE),
+        "connectivity.txt": ("shell", "dumpsys", "connectivity"),
+        "routes.txt": ("shell", "ip", "route", "show", "table", "all"),
     }
     for filename, args in commands.items():
         try:
@@ -335,6 +337,89 @@ def write_diagnostics(serial: str, label: str) -> None:
 
 def adhoc_network_id(port: int) -> str:
     return f"ff{port:04x}{port:04x}000000"
+
+
+def print_stage(row: dict[str, object], size_mib: int) -> None:
+    print(
+        "throughput "
+        f"concurrency={row['concurrency']} "
+        f"size_mib={size_mib} "
+        f"aggregate_mbps={row['aggregate_mbps']:.2f} "
+        f"end_to_end_mbps={row['end_to_end_mbps']:.2f} "
+        f"transfer_seconds={row['transfer_seconds']:.3f}",
+        flush=True,
+    )
+
+
+def run_overlay_matrix_with_control(
+    *,
+    client_port: int,
+    server_port: int,
+    concurrencies: list[int],
+    size_mib: int,
+    timeout: float,
+    result: dict[str, object],
+) -> tuple[list[dict[str, object]], bool]:
+    size_bytes = size_mib * 1024 * 1024
+    rows: list[dict[str, object]] = []
+
+    for concurrency in concurrencies:
+        try:
+            row = run_stage(
+                "127.0.0.1",
+                client_port,
+                concurrency=concurrency,
+                size_bytes=size_bytes,
+                timeout=timeout,
+            )
+        except Exception as overlay_error:
+            result["failed_concurrency"] = concurrency
+            result["overlay_error_type"] = type(overlay_error).__name__
+            result["overlay_error"] = str(overlay_error)
+            try:
+                control = run_stage(
+                    "127.0.0.1",
+                    server_port,
+                    concurrency=concurrency,
+                    size_bytes=size_bytes,
+                    timeout=timeout,
+                )
+            except Exception as control_error:
+                result["classification"] = "inconclusive_external_or_runner"
+                result["direct_control"] = {
+                    "success": False,
+                    "error_type": type(control_error).__name__,
+                    "error": str(control_error),
+                }
+                print(
+                    "::warning::Android overlay throughput failed, but the "
+                    "exit emulator direct-control failed under the same "
+                    "conditions too; treating this run as inconclusive rather "
+                    "than a NetLoop regression.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return rows, True
+
+            result["classification"] = "overlay_failure"
+            result["direct_control"] = {
+                "success": True,
+                "row": control,
+            }
+            write_tsv(EVIDENCE / "direct-control.tsv", [control])
+            raise RuntimeError(
+                "Android overlay throughput failed while the exit emulator "
+                "direct-control passed under the same conditions: "
+                f"concurrency={concurrency}, error={overlay_error}"
+            ) from overlay_error
+
+        rows.append(row)
+        result["rows"] = rows
+        write_tsv(EVIDENCE / "throughput.tsv", rows)
+        print_stage(row, size_mib)
+
+    result["classification"] = "pass"
+    return rows, False
 
 
 def main() -> int:
@@ -428,15 +513,22 @@ def main() -> int:
                 f"client={observed_ip}, server={expected_ip}"
             )
 
-        rows = run_matrix(
-            "127.0.0.1",
-            client_port,
+        rows, inconclusive = run_overlay_matrix_with_control(
+            client_port=client_port,
+            server_port=server_port,
             concurrencies=concurrencies,
             size_mib=args.file_size_mib,
             timeout=args.stream_timeout,
+            result=result,
         )
         result["rows"] = rows
-        write_tsv(EVIDENCE / "throughput.tsv", rows)
+        if rows:
+            write_tsv(EVIDENCE / "throughput.tsv", rows)
+
+        if inconclusive:
+            result["inconclusive"] = True
+            print(json.dumps(result, indent=2))
+            return 0
 
         expected_routes = sum(concurrencies)
         client_events = parse_json_logcat(second_serial)

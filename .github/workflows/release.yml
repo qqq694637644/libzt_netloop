@@ -795,11 +795,46 @@ jobs:
         if: always()
         shell: bash
         run: |
+          if [[ -f evidence/android-throughput/result.json ]]; then
+            python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          from pathlib import Path
+
+          result = json.loads(
+              Path("evidence/android-throughput/result.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+          print("### Android throughput classification")
+          print()
+          print(f"- classification: `{result.get('classification', 'unknown')}`")
+          print(f"- success: `{result.get('success', False)}`")
+          print(f"- inconclusive: `{result.get('inconclusive', False)}`")
+          if result.get("failed_concurrency") is not None:
+              print(f"- failed concurrency: `{result['failed_concurrency']}`")
+          if result.get("server_public_ip"):
+              print(f"- exit public IP: `{result['server_public_ip']}`")
+          if result.get("client_public_ip"):
+              print(f"- client public IP: `{result['client_public_ip']}`")
+          direct = result.get("direct_control")
+          if isinstance(direct, dict):
+              print(f"- direct-control success: `{direct.get('success')}`")
+          print()
+          PY
+          fi
           if [[ -f evidence/android-throughput/throughput.tsv ]]; then
             {
               echo "### Android -> Android default-exit throughput"
               echo '~~~text'
               cat evidence/android-throughput/throughput.tsv
+              echo '~~~'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [[ -f evidence/android-throughput/direct-control.tsv ]]; then
+            {
+              echo "### Android exit direct-control"
+              echo '~~~text'
+              cat evidence/android-throughput/direct-control.tsv
               echo '~~~'
             } >> "$GITHUB_STEP_SUMMARY"
           fi
