@@ -31,24 +31,20 @@ internal sealed class RoutingUdpTransportFactory : IProxyUdpTransportFactory
         cancellationToken.ThrowIfCancellationRequested();
 
         var localTransport = new SystemUdpTransport();
-        IProxyUdpTransport? egressTransport = null;
         LibztUdpSocket? overlaySocket = null;
         try
         {
-            egressTransport = await _egressFactory.CreateAsync(cancellationToken).ConfigureAwait(false);
             overlaySocket = LibztUdpSocket.Bind(_overlayBindAddress, 0);
             return new RoutingUdpTransport(
                 _selector,
                 _overlayUdpPort,
                 localTransport,
-                egressTransport,
+                _egressFactory,
                 overlaySocket);
         }
         catch
         {
             await localTransport.DisposeAsync().ConfigureAwait(false);
-            if (egressTransport is not null)
-                await egressTransport.DisposeAsync().ConfigureAwait(false);
             if (overlaySocket is not null)
                 await overlaySocket.DisposeAsync().ConfigureAwait(false);
             throw;
@@ -61,7 +57,7 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
     private readonly RouteSelector _selector;
     private readonly ushort _overlayUdpPort;
     private readonly IProxyUdpTransport _localTransport;
-    private readonly IProxyUdpTransport _egressTransport;
+    private readonly IProxyUdpTransportFactory _egressFactory;
     private readonly LibztUdpSocket _overlaySocket;
     private readonly ConcurrentDictionary<IPEndPoint, byte> _allowedPeers = new();
     private readonly Channel<ProxyUdpDatagram> _received = Channel.CreateUnbounded<ProxyUdpDatagram>(
@@ -72,28 +68,28 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
         });
     private readonly CancellationTokenSource _stop = new();
     private readonly Task[] _receiveLoops;
+    private readonly SemaphoreSlim _egressGate = new(1, 1);
+    private IProxyUdpTransport? _egressTransport;
+    private Task? _egressReceiveLoop;
     private int _disposed;
 
     internal RoutingUdpTransport(
         RouteSelector selector,
         ushort overlayUdpPort,
         IProxyUdpTransport localTransport,
-        IProxyUdpTransport egressTransport,
+        IProxyUdpTransportFactory egressFactory,
         LibztUdpSocket overlaySocket)
     {
         _selector = selector;
         _overlayUdpPort = overlayUdpPort;
         _localTransport = localTransport;
-        _egressTransport = egressTransport;
+        _egressFactory = egressFactory;
         _overlaySocket = overlaySocket;
 
         _receiveLoops = [
             RunGuardedAsync(
                 token => PumpTransportAsync(_localTransport, "local", token),
                 "routing_udp_local_receive_failed"),
-            RunGuardedAsync(
-                token => PumpTransportAsync(_egressTransport, "egress", token),
-                "routing_udp_egress_receive_failed"),
             RunGuardedAsync(
                 PumpOverlayAsync,
                 "routing_udp_overlay_receive_failed")
@@ -126,7 +122,9 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
                 return;
 
             case RouteKind.DirectEgress:
-                await _egressTransport.SendAsync(
+                var egressTransport = await GetEgressTransportAsync(
+                    cancellationToken).ConfigureAwait(false);
+                await egressTransport.SendAsync(
                     target,
                     payload,
                     cancellationToken).ConfigureAwait(false);
@@ -153,6 +151,45 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
 
             default:
                 throw new InvalidOperationException($"Unknown UDP route kind {decision.Kind}.");
+        }
+    }
+
+    private async ValueTask<IProxyUdpTransport> GetEgressTransportAsync(
+        CancellationToken cancellationToken)
+    {
+        if (_egressTransport is { } existing)
+            return existing;
+
+        await _egressGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ThrowIfDisposed();
+            if (_egressTransport is { } current)
+                return current;
+
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken,
+                _stop.Token);
+            var created = await _egressFactory
+                .CreateAsync(linked.Token)
+                .ConfigureAwait(false);
+
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                await created.DisposeAsync().ConfigureAwait(false);
+                throw new ObjectDisposedException(
+                    nameof(RoutingUdpTransport));
+            }
+
+            _egressTransport = created;
+            _egressReceiveLoop = RunGuardedAsync(
+                token => PumpTransportAsync(created, "egress", token),
+                "routing_udp_egress_receive_failed");
+            return created;
+        }
+        finally
+        {
+            _egressGate.Release();
         }
     }
 
@@ -249,17 +286,37 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
         await _stop.CancelAsync().ConfigureAwait(false);
         await _overlaySocket.DisposeAsync().ConfigureAwait(false);
         await _localTransport.DisposeAsync().ConfigureAwait(false);
-        await _egressTransport.DisposeAsync().ConfigureAwait(false);
+
+        IProxyUdpTransport? egressTransport;
+        Task? egressReceiveLoop;
+        await _egressGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            egressTransport = _egressTransport;
+            _egressTransport = null;
+            egressReceiveLoop = _egressReceiveLoop;
+            _egressReceiveLoop = null;
+        }
+        finally
+        {
+            _egressGate.Release();
+        }
+
+        if (egressTransport is not null)
+            await egressTransport.DisposeAsync().ConfigureAwait(false);
 
         try
         {
             await Task.WhenAll(_receiveLoops).ConfigureAwait(false);
+            if (egressReceiveLoop is not null)
+                await egressReceiveLoop.ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
         }
 
         _received.Writer.TryComplete();
+        _egressGate.Dispose();
         _stop.Dispose();
     }
 

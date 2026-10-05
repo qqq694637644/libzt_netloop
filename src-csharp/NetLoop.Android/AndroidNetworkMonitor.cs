@@ -18,6 +18,7 @@ internal sealed class AndroidNetworkMonitor : ConnectivityManager.NetworkCallbac
 
     private CancellationTokenSource? _debounceCts;
     private string? _defaultNetwork;
+    private string? _linkPropertiesFingerprint;
     private int _started;
     private int _disposed;
 
@@ -59,6 +60,7 @@ internal sealed class AndroidNetworkMonitor : ConnectivityManager.NetworkCallbac
             if (_defaultNetwork is null)
             {
                 _defaultNetwork = identity;
+                _linkPropertiesFingerprint = null;
             }
             else if (!string.Equals(
                          _defaultNetwork,
@@ -66,6 +68,7 @@ internal sealed class AndroidNetworkMonitor : ConnectivityManager.NetworkCallbac
                          StringComparison.Ordinal))
             {
                 _defaultNetwork = identity;
+                _linkPropertiesFingerprint = null;
                 shouldReset = true;
             }
         }
@@ -87,12 +90,64 @@ internal sealed class AndroidNetworkMonitor : ConnectivityManager.NetworkCallbac
                     StringComparison.Ordinal))
             {
                 _defaultNetwork = null;
+                _linkPropertiesFingerprint = null;
                 shouldReset = true;
             }
         }
 
         if (shouldReset)
             Schedule("android_default_network_lost");
+    }
+
+    public override void OnLinkPropertiesChanged(
+        Network network,
+        LinkProperties linkProperties)
+    {
+        var identity = network.ToString();
+        var fingerprint = BuildLinkPropertiesFingerprint(linkProperties);
+        var shouldReset = false;
+
+        lock (_gate)
+        {
+            if (!string.Equals(
+                    _defaultNetwork,
+                    identity,
+                    StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            if (_linkPropertiesFingerprint is null)
+            {
+                _linkPropertiesFingerprint = fingerprint;
+            }
+            else if (!string.Equals(
+                         _linkPropertiesFingerprint,
+                         fingerprint,
+                         StringComparison.Ordinal))
+            {
+                _linkPropertiesFingerprint = fingerprint;
+                shouldReset = true;
+            }
+        }
+
+        if (shouldReset)
+            Schedule("android_link_properties_changed");
+    }
+
+    private static string BuildLinkPropertiesFingerprint(
+        LinkProperties properties)
+    {
+        var addresses = properties.LinkAddresses
+            .Select(static value => value.ToString())
+            .OrderBy(static value => value, StringComparer.Ordinal);
+        var routes = properties.Routes
+            .Select(static value => value.ToString())
+            .OrderBy(static value => value, StringComparer.Ordinal);
+
+        return string.Join(",", addresses)
+               + "|"
+               + string.Join(",", routes);
     }
 
     private void Schedule(string reason)

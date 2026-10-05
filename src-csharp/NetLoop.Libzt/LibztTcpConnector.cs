@@ -101,7 +101,7 @@ public sealed class LibztTcpConnector : IProxyConnector
                     lastError = new LibztException(
                         "zts_connect",
                         result,
-                        LibztNative.GetErrno());
+                        GetSocketError(fd));
                 }
                 catch (Exception ex)
                 {
@@ -160,5 +160,13 @@ public sealed class LibztTcpConnector : IProxyConnector
     {
         if (result != LibztNative.Ok)
             throw new LibztException(operation, result, LibztNative.GetLastSocketError(fd));
+    }
+
+    private static int GetSocketError(int fd)
+    {
+        var socketError = LibztNative.GetLastSocketError(fd);
+        return socketError != 0
+            ? socketError
+            : LibztNative.GetErrno();
     }
 }
