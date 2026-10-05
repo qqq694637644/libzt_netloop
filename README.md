@@ -1,157 +1,54 @@
 # libzt_netloop
 
-Windows-only lightweight TCP port bridge over [ZeroTier Sockets (\`libzt\`)](https://github.com/zerotier/libzt).
+NetLoop is a C# cross-platform SOCKS5 mesh/exit-node application built on top of ZeroTier Sockets (`libzt`).
 
-The intended topology is deliberately small:
+The repository no longer contains the original NetLoop C++ client/server implementation. The only native C/C++ code built by this repository is the third-party `external/libzt` dependency and the small patches required to expose the P/Invoke runtime used by the C# applications.
 
-\`\`\`text
-laptop application
-    |
-    | SOCKS5 bytes (not parsed by netloop)
-    v
-127.0.0.1:1080
-    |
-zt_netloop_client.exe
-    |
-    | libzt / ZeroTier P2P
-    v
-zt_netloop_server.exe
-    |
-    v
-127.0.0.1:10808
-    |
-v2rayN SOCKS5 server
-\`\`\`
+## Projects
 
-\`zt_netloop\` does not implement SOCKS5. It transports the TCP byte stream unchanged.
-It does not install a TUN/TAP adapter, modify the Windows routing table, or run a system-wide VPN.
+- `src-csharp/NetLoop.Core` — routing, relay, and shared runtime abstractions.
+- `src-csharp/NetLoop.Socks` — SOCKS5 TCP/UDP protocol handling.
+- `src-csharp/NetLoop.Libzt` — P/Invoke bindings and libzt socket wrappers.
+- `src-csharp/NetLoop.Host` — Windows/Linux NetLoop host.
+- `src-csharp/NetLoop.Android` — Android foreground-service application.
 
-The native Windows TCP side is driven by standalone Asio on its IOCP backend. libzt remains
-on its own socket API, with one ordered read worker and one ordered write worker per tunnel.
-There is no socketpair, WSAPoll bridge, libuv relay, or libhv data path between libzt and the
-local SOCKS socket.
+## Supported targets
+
+- Windows x64
+- Linux x64
+- Linux arm64
+- Android arm64-v8a
+
+Android CI also builds an x86_64-only test APK for the GitHub-hosted Android emulator. This x86_64 artifact is for CI only and is not a release target.
 
 ## Build
 
-Requirements:
+Desktop builds are orchestrated by:
 
-- Windows x64
-- Visual Studio C++ toolchain supported by the installed CMake
-- CMake
-- Python 3.11+
-- Git
+```console
+python tools/build_csharp.py --help
+```
 
-All build orchestration is Python:
+Android native libzt builds are orchestrated by:
 
-\`\`\`console
-python tools/build.py --config Release
-\`\`\`
+```console
+python tools/build_android_native.py --help
+```
 
-GitHub Actions uses MSVC through Ninja plus Mozilla `sccache`. The normal
-Windows CI workflow and the release workflow share the same GitHub Actions
-compiler-cache namespace. Local builds keep the existing Visual Studio generator
-unless `--generator ninja --use-sccache` is requested explicitly.
-
-The executables are staged in \`dist/\`.
-
-## Server
-
-Example with a normal ZeroTier network where the server has address \`10.10.10.2\`:
-
-\`\`\`console
-zt_netloop_server.exe ^
-  --network 0123456789abcdef ^
-  --state-dir state\\server ^
-  --bind-host 10.10.10.2 ^
-  --zt-port 42042 ^
-  --forward-host 127.0.0.1 ^
-  --forward-port 10808 ^
-  --status-file status-server.json ^
-  --log-file server.log
-\`\`\`
-
-If \`--bind-host\` is omitted, the server uses its assigned IPv4 address first and IPv6 otherwise.
-
-## Client
-
-\`\`\`console
-zt_netloop_client.exe ^
-  --network 0123456789abcdef ^
-  --state-dir state\\client ^
-  --remote-host 10.10.10.2 ^
-  --remote-port 42042 ^
-  --listen-host 127.0.0.1 ^
-  --listen-port 1080 ^
-  --status-file status-client.json ^
-  --log-file client.log
-\`\`\`
-
-Point the laptop application at \`127.0.0.1:1080\` as SOCKS5. The SOCKS5 handshake and
-subsequent traffic are transported to the v2rayN SOCKS5 listener unchanged.
-
-The client defaults to a 20-second per-flow recovery window (\`--connect-timeout\`) and
-retries failed libzt connects with a fresh virtual TCP socket instead of relying on libzt's
-global \`zts_errno\`. Both endpoints enable TCP keepalive (5-second idle, 2-second interval,
-3 probes) and TCP_NODELAY on tunnel streams so an abruptly disconnected peer is retired
-quickly after a physical-network switch.
-
-For mobility, \`peers.d\` is cleared at process startup and libzt peer-path caching is disabled;
-the persistent identity and \`networks.d\` membership are not touched. If an application peer
-that was previously DIRECT remains RELAY/UNREACHABLE for three seconds, active tunnel streams
-are reset so applications reconnect over the peer's newly discovered physical path instead of
-leaving stale virtual TCP sessions on the server.
-
-During ZeroTier network join, the process logs the actual libzt network status every five seconds. Failures such as `ACCESS_DENIED`, `NOT_FOUND`, `PORT_ERROR`, and `CLIENT_TOO_OLD` fail immediately. A timeout includes the network status plus whether IPv4/IPv6 addresses were actually assigned inside libzt.
+The top-level `CMakeLists.txt` exists only to build the shared libzt P/Invoke runtime required by the C# code. It does not build a NetLoop C++ executable.
 
 ## CI
 
-\`.github/workflows/windows-ci.yml\` has three Windows jobs:
+Active GitHub Actions workflows:
 
-1. Build and smoke-test both executables.
-2. Machine A starts the server and a Python SOCKS5 fixture.
-3. Machine B starts the client, performs a real SOCKS5 HTTPS request, kills the client with
-   live tunnels, restarts the same client identity, and verifies recovery while the server
-   remains running.
+- `.github/workflows/csharp-windows-ci.yml`
+- `.github/workflows/csharp-linux-ci.yml`
+- `.github/workflows/csharp-android-ci.yml`
 
-The two E2E jobs are separate GitHub-hosted Windows machines. For CI only, they use a
-controller-less ZeroTier ad-hoc IPv6 network, so no ZeroTier Central API token is required.
+The workflows build the C# runtime and exercise TCP, UDP, peer-local routing, exit-node behavior, and runtime-reset recovery on their supported test platforms.
 
-The egress test compares the public IP observed through:
+## Native dependency
 
-\`\`\`text
-machine B -> client -> libzt -> machine A -> Python SOCKS5 -> api.ipify.org
-\`\`\`
+`external/libzt` is pinned as a Git submodule. NetLoop applies repository patches under `patches/libzt` and `patches/zerotierone` before building the native P/Invoke library.
 
-with machine A's directly observed public IP.
-
-Build logs, process logs, status JSON, test results, \`ipconfig\`, route table, \`netstat\`,
-and IPv6-interface information are uploaded as evidence artifacts. Evidence is uploaded
-with \`if: always()\` so a failed join/tunnel/egress test keeps the material needed to diagnose it.
-
-## Release
-
-Run the `Release Windows EXEs` workflow manually and provide:
-
-- `branch`: the branch or ref to build, for example `main`.
-- `version`: the release version, for example `0.2.0` or `v0.2.0`.
-
-The workflow builds Windows x64 and publishes exactly two release assets:
-
-```text
-zt_netloop_client.exe
-zt_netloop_server.exe
-```
-
-No ZIP archive is created. The version is compiled into both executables, so `--version` reports the selected release version.
-
-## Dependency
-
-Dependencies are pinned as Git submodules:
-
-- \`external/libzt\`: commit \`a707ea6ae0910efdc1125d04758c411e2e9ea4f9\`.
-- \`external/asio\`: standalone Asio \`1.38.2\` (\`8806a6803cde7054c3049d3666d3ec36786568c5\`).
-
-The Windows relay is implemented in \`src/asio_relay.cpp\`. Existing Winsock TCP connections
-are adopted by \`asio::ip::tcp::socket\`; asynchronous native reads and writes run through IOCP,
-while libzt blocking reads/writes are isolated behind ordered worker handoffs with explicit
-half-close propagation.
+The former standalone Asio submodule and the original C++ NetLoop application have been removed.
