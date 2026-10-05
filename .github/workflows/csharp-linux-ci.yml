@@ -170,7 +170,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python ci/deploy.py --source package --destination runtime-csharp --all-files
+          rm -rf runtime-csharp
+          mkdir -p runtime-csharp
+          cp -a package/. runtime-csharp/
           chmod +x runtime-csharp/netloop
 
       - name: Join ad-hoc network and prepare exit
@@ -233,7 +235,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python ci/deploy.py --source package --destination runtime-csharp --all-files
+          rm -rf runtime-csharp
+          mkdir -p runtime-csharp
+          cp -a package/. runtime-csharp/
           chmod +x runtime-csharp/netloop
 
       - name: Cross-machine peer-local and default-exit E2E
