@@ -80,8 +80,8 @@ public sealed class MainActivity : Activity
             "Upstream SOCKS5 password (optional)",
             preferences.GetString(AndroidConfig.UpstreamPasswordKey, string.Empty));
         _upstreamPassword.InputType =
-            Android.Text.InputTypes.ClassText
-            | Android.Text.InputTypes.TextVariationPassword;
+            global::Android.Text.InputTypes.ClassText
+            | global::Android.Text.InputTypes.TextVariationPassword;
 
         var buttons = new LinearLayout(this) {
             Orientation = Orientation.Horizontal

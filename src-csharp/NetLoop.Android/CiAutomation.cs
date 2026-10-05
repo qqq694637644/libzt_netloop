@@ -76,7 +76,7 @@ internal static class CiAutomationStatus
                         .ToArray(),
                 reset_count = resetCount,
                 reset_reason = resetReason,
-                process_id = Android.OS.Process.MyPid()
+                process_id = global::Android.OS.Process.MyPid()
             });
     }
 
@@ -88,7 +88,7 @@ internal static class CiAutomationStatus
                 phase = "error",
                 error_type = error.GetType().FullName,
                 error = error.Message,
-                process_id = Android.OS.Process.MyPid()
+                process_id = global::Android.OS.Process.MyPid()
             });
     }
 

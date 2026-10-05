@@ -311,10 +311,11 @@ public sealed class NetLoopService : Service
             // libzt documents node_free as process-final. The foreground
             // service runs in its own process so an explicit user stop can
             // terminate that process without killing the configuration UI.
-            Android.OS.Process.KillProcess(Android.OS.Process.MyPid());
+            global::Android.OS.Process.KillProcess(
+                global::Android.OS.Process.MyPid());
         }
     }
 
-    public override Android.OS.IBinder? OnBind(Intent? intent)
+    public override global::Android.OS.IBinder? OnBind(Intent? intent)
         => null;
 }
