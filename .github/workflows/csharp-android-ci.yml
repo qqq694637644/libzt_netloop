@@ -279,7 +279,7 @@ jobs:
             -noaudio -no-boot-anim -camera-back none -camera-front none
           disable-animations: true
           script: |
-            set -euo pipefail
+            set -eu
             cleanup() {
               python ci/csharp_e2e_server.py cleanup || true
             }
