@@ -102,6 +102,10 @@ public sealed class Socks5ConnectionHandler
             await client.WriteAsync(success, success.Length, cancellationToken).ConfigureAwait(false);
             await ConnectionRelay.RunAsync(client, remote, _halfCloseTimeout, cancellationToken).ConfigureAwait(false);
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
         catch (Exception ex)
         {
             if (remote is null)
@@ -141,6 +145,10 @@ public sealed class Socks5ConnectionHandler
                 client,
                 declaredEndpoint,
                 cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception ex)
         {

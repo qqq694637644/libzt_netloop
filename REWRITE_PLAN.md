@@ -236,6 +236,8 @@ emulator 无法可靠运行 arm64 native E2E，因此 CI 额外构建一个 x86_
 - Android：ConnectivityManager.NetworkCallback。
 
 同一次切网可能产生多个 OS event，统一做约 250ms debounce。触发后不分析旧 transport 状态，也不等待 keepalive/libzt path event。
+如果事件发生在 libzt node 已启动但业务 runtime 尚未建立的 startup 阶段，则直接通知
+libzt 刷新 physical bindings，不等待 `StartAsync` 先成功返回。
 
 ### 11.2 Runtime Reset
 
@@ -317,9 +319,10 @@ Android：使用 .NET for Android，长期运行 Node 使用 foreground service�
 
 ## 17. 日志与诊断
 
-统一结构化日志，至少包含 event、peer、connection_id/association_id、transport、target_host/target_port、api_rc/socket_error、elapsed_ms、DIRECT/RELAY/UNREACHABLE path。
-
-必须记录 node 生命周期、Managed IP、peer path、OS network change、runtime reset reason/reset_count/process_id、TCP retry、UDP association、default-exit routing、local-service routing 和 egress failure。
+统一结构化日志覆盖 node 生命周期、Managed IP、关键 route decision、OS network
+change、runtime reset reason/reset_count/process_id、libzt api/socket error、UDP
+association 和 egress failure。NetLoop 不解析或承诺输出 libzt peer 的
+DIRECT/RELAY/UNREACHABLE path；runtime recovery 也不依赖这些 path 状态。
 
 Windows 错误同时记录数值错误码；文本日志统一 UTF-8。
 
@@ -455,7 +458,8 @@ C# native libzt 构建所需要的第三方源码、最小 CMake 入口和补丁
 
 - NetLoop 不做 CIDR / Managed Route routing，也不查询 libzt route table。
 - 每个 Node 只使用一个 deterministic primary overlay address：数值最小 IPv4 优先，否则数值最小 IPv6。
-- 本机 primary address -> 本机 loopback；其它本机 Managed IP 对 NetLoop 不存在。
+- 本机 primary address -> 本机 loopback；其它本机 Managed IP 对 NetLoop 不存在，
+  若被配置成 `--peer` 或 `default_exit` 则启动失败。
 - overlay peer 只由显式 `--peer` primary addresses 定义；非本机的 `default_exit`
   自动加入 peer 集合；本机 primary 不进入 peer 集合。
 - 其他显式 peer primary address -> 直接连接该 peer Agent。
@@ -474,6 +478,7 @@ C# native libzt 构建所需要的第三方源码、最小 CMake 入口和补丁
 - upstream UDP 必须使用 UDP ASSOCIATE；若 upstream 不支持 UDP，明确失败，禁止回退 DIRECT。
 - 项目内只维护 NetLoop 所需的最小 CONNECT / UDP ASSOCIATE、source validation、
   bounded state、half-close、timeout/cancellation 行为；不扩展成通用 SOCKS 框架。
+- UDP receive queue 使用固定容量 256，满时丢弃最旧 datagram，不允许无限增长。
 
 ### 23.4 Runtime Reset
 

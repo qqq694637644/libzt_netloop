@@ -37,6 +37,7 @@ internal sealed class RoutingUdpTransportFactory : IProxyUdpTransportFactory
             overlaySocket = LibztUdpSocket.Bind(_overlayBindAddress, 0);
             return new RoutingUdpTransport(
                 _selector,
+                _overlayBindAddress,
                 _overlayUdpPort,
                 localTransport,
                 _egressFactory,
@@ -54,17 +55,21 @@ internal sealed class RoutingUdpTransportFactory : IProxyUdpTransportFactory
 
 internal sealed class RoutingUdpTransport : IProxyUdpTransport
 {
+    private const int ReceiveQueueCapacity = 256;
+
     private readonly RouteSelector _selector;
+    private readonly IPAddress _primarySelfAddress;
     private readonly ushort _overlayUdpPort;
     private readonly IProxyUdpTransport _localTransport;
     private readonly IProxyUdpTransportFactory _egressFactory;
     private readonly LibztUdpSocket _overlaySocket;
     private readonly ConcurrentDictionary<IPEndPoint, byte> _allowedPeers = new();
-    private readonly Channel<ProxyUdpDatagram> _received = Channel.CreateUnbounded<ProxyUdpDatagram>(
-        new UnboundedChannelOptions {
+    private readonly Channel<ProxyUdpDatagram> _received = Channel.CreateBounded<ProxyUdpDatagram>(
+        new BoundedChannelOptions(ReceiveQueueCapacity) {
             SingleReader = false,
             SingleWriter = false,
-            AllowSynchronousContinuations = false
+            AllowSynchronousContinuations = false,
+            FullMode = BoundedChannelFullMode.DropOldest
         });
     private readonly CancellationTokenSource _stop = new();
     private readonly Task[] _receiveLoops;
@@ -75,12 +80,14 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
 
     internal RoutingUdpTransport(
         RouteSelector selector,
+        IPAddress primarySelfAddress,
         ushort overlayUdpPort,
         IProxyUdpTransport localTransport,
         IProxyUdpTransportFactory egressFactory,
         LibztUdpSocket overlaySocket)
     {
         _selector = selector;
+        _primarySelfAddress = primarySelfAddress;
         _overlayUdpPort = overlayUdpPort;
         _localTransport = localTransport;
         _egressFactory = egressFactory;
@@ -88,7 +95,10 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
 
         _receiveLoops = [
             RunGuardedAsync(
-                token => PumpTransportAsync(_localTransport, "local", token),
+                token => PumpTransportAsync(
+                    _localTransport,
+                    rewriteLoopbackSource: true,
+                    cancellationToken: token),
                 "routing_udp_local_receive_failed"),
             RunGuardedAsync(
                 PumpOverlayAsync,
@@ -175,7 +185,10 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
 
             _egressTransport = created;
             _egressReceiveLoop = RunGuardedAsync(
-                token => PumpTransportAsync(created, "egress", token),
+                token => PumpTransportAsync(
+                    created,
+                    rewriteLoopbackSource: false,
+                    cancellationToken: token),
                 "routing_udp_egress_receive_failed");
             return created;
         }
@@ -193,14 +206,32 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
 
     private async Task PumpTransportAsync(
         IProxyUdpTransport transport,
-        string source,
+        bool rewriteLoopbackSource,
         CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
         {
             var datagram = await transport.ReceiveAsync(cancellationToken).ConfigureAwait(false);
-            await _received.Writer.WriteAsync(datagram, cancellationToken).ConfigureAwait(false);
+            var response = rewriteLoopbackSource
+                ? RewriteLocalResponse(datagram)
+                : datagram;
+            await _received.Writer.WriteAsync(response, cancellationToken).ConfigureAwait(false);
         }
+    }
+
+    private ProxyUdpDatagram RewriteLocalResponse(ProxyUdpDatagram datagram)
+    {
+        if (!datagram.Source.TryGetIPAddress(out var address)
+            || !IPAddress.IsLoopback(address))
+        {
+            return datagram;
+        }
+
+        return datagram with {
+            Source = new ProxyTarget(
+                _primarySelfAddress.ToString(),
+                datagram.Source.Port)
+        };
     }
 
     private async Task PumpOverlayAsync(CancellationToken cancellationToken)

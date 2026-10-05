@@ -46,7 +46,7 @@ public sealed class LibztNode : IAsyncDisposable
         ThrowIfError("zts_init_allow_peer_cache", LibztNative.InitAllowPeerCache(0));
         ThrowIfError("zts_init_set_event_handler", LibztNative.InitSetEventHandler(_eventCallback));
         ThrowIfError("zts_node_start", LibztNative.NodeStart());
-        _started = true;
+        Volatile.Write(ref _started, true);
 
         try
         {
@@ -71,12 +71,37 @@ public sealed class LibztNode : IAsyncDisposable
 
     public void NotifyPhysicalNetworkChanged()
     {
-        if (!_started)
+        if (!Volatile.Read(ref _started))
             throw new InvalidOperationException("libzt node has not been started.");
 
         ThrowIfError(
             "zts_node_network_changed",
             LibztNative.NodeNetworkChanged());
+        LogPhysicalNetworkRefreshRequested();
+    }
+
+    public bool TryNotifyPhysicalNetworkChanged()
+    {
+        if (!Volatile.Read(ref _started))
+            return false;
+
+        var result = LibztNative.NodeNetworkChanged();
+        if (result != LibztNative.Ok)
+        {
+            JsonLog.Error("libzt_physical_network_refresh_failed", new {
+                network = _networkId.ToString("x16"),
+                api_rc = result,
+                socket_error = LibztNative.GetErrno()
+            });
+            return false;
+        }
+
+        LogPhysicalNetworkRefreshRequested();
+        return true;
+    }
+
+    private void LogPhysicalNetworkRefreshRequested()
+    {
         JsonLog.Info("libzt_physical_network_refresh_requested", new {
             network = _networkId.ToString("x16"),
             node = State?.NodeId.ToString("x10")
@@ -215,7 +240,7 @@ public sealed class LibztNode : IAsyncDisposable
 
     private void TryStop()
     {
-        if (!_started)
+        if (!Volatile.Read(ref _started))
             return;
 
         try
@@ -226,7 +251,7 @@ public sealed class LibztNode : IAsyncDisposable
         }
         finally
         {
-            _started = false;
+            Volatile.Write(ref _started, false);
         }
     }
 

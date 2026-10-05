@@ -49,6 +49,7 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
         LibztNetworkState state)
     {
         var overlayBind = SelectOverlayBindAddress(state.ManagedAddresses);
+        ValidateConfiguredOverlayAddresses(options, state.ManagedAddresses, overlayBind);
         var peers = options.Peers
             .Where(address => !overlayBind.Equals(address))
             .ToHashSet();
@@ -222,5 +223,32 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
                ?? addresses
                    .OrderBy(SortKey, StringComparer.Ordinal)
                    .First();
+    }
+
+    private static void ValidateConfiguredOverlayAddresses(
+        HostOptions options,
+        IReadOnlyList<IPAddress> managedAddresses,
+        IPAddress primaryAddress)
+    {
+        var secondarySelfAddresses = managedAddresses
+            .Where(address => !primaryAddress.Equals(address))
+            .ToHashSet();
+
+        var secondaryPeer = options.Peers.FirstOrDefault(
+            secondarySelfAddresses.Contains);
+        if (secondaryPeer is not null)
+        {
+            throw new InvalidOperationException(
+                $"Configured peer {secondaryPeer} is a secondary local Managed IP; "
+                + $"NetLoop primary address is {primaryAddress}.");
+        }
+
+        if (options.DefaultExit is not null
+            && secondarySelfAddresses.Contains(options.DefaultExit))
+        {
+            throw new InvalidOperationException(
+                $"Configured default exit {options.DefaultExit} is a secondary local Managed IP; "
+                + $"NetLoop primary address is {primaryAddress}.");
+        }
     }
 }

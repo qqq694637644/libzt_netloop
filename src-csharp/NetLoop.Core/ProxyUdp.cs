@@ -34,16 +34,18 @@ public sealed class DirectUdpTransportFactory : IProxyUdpTransportFactory
 public sealed class SystemUdpTransport : IProxyUdpTransport
 {
     private const int MaxDestinations = 256;
+    private const int ReceiveQueueCapacity = 256;
     private static readonly TimeSpan DestinationIdleTimeout = TimeSpan.FromMinutes(2);
 
     private readonly UdpClient _ipv4;
     private readonly UdpClient _ipv6;
     private readonly ConcurrentDictionary<IPEndPoint, long> _destinations = new();
-    private readonly Channel<ProxyUdpDatagram> _received = Channel.CreateUnbounded<ProxyUdpDatagram>(
-        new UnboundedChannelOptions {
+    private readonly Channel<ProxyUdpDatagram> _received = Channel.CreateBounded<ProxyUdpDatagram>(
+        new BoundedChannelOptions(ReceiveQueueCapacity) {
             SingleReader = false,
             SingleWriter = false,
-            AllowSynchronousContinuations = false
+            AllowSynchronousContinuations = false,
+            FullMode = BoundedChannelFullMode.DropOldest
         });
     private readonly CancellationTokenSource _stop = new();
     private readonly Task[] _receiveLoops;

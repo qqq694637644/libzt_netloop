@@ -9,6 +9,7 @@ namespace NetLoop.Host;
 internal sealed class OverlayUdpAgent : IAsyncDisposable
 {
     private readonly LibztUdpSocket _socket;
+    private readonly IPAddress _primarySelfAddress;
     private readonly RouteSelector _selector;
     private readonly IProxyUdpTransportFactory _egressFactory;
     private readonly TimeSpan _idleTimeout;
@@ -30,6 +31,7 @@ internal sealed class OverlayUdpAgent : IAsyncDisposable
         if (maxAssociations <= 0)
             throw new ArgumentOutOfRangeException(nameof(maxAssociations));
 
+        _primarySelfAddress = bindAddress;
         _selector = selector;
         _egressFactory = egressFactory;
         _maxAssociations = maxAssociations;
@@ -124,6 +126,7 @@ internal sealed class OverlayUdpAgent : IAsyncDisposable
 
         var created = new OverlayUdpAssociation(
             peer,
+            _primarySelfAddress,
             _selector,
             new SystemUdpTransport(),
             _egressFactory,
@@ -240,12 +243,12 @@ internal sealed class OverlayUdpAgent : IAsyncDisposable
 internal sealed class OverlayUdpAssociation : IAsyncDisposable
 {
     private readonly IPEndPoint _peer;
+    private readonly IPAddress _primarySelfAddress;
     private readonly RouteSelector _selector;
     private readonly IProxyUdpTransport _localTransport;
     private readonly IProxyUdpTransportFactory _egressFactory;
     private readonly TimeSpan _idleTimeout;
     private readonly Func<IPEndPoint, ProxyUdpDatagram, CancellationToken, ValueTask> _responseSender;
-    private readonly ConcurrentDictionary<ProxyTarget, ProxyTarget> _localResponseAliases = new();
     private readonly CancellationTokenSource _stop;
     private readonly SemaphoreSlim _egressCreateLock = new(1, 1);
     private readonly Task _localReceiveLoop;
@@ -258,6 +261,7 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
 
     internal OverlayUdpAssociation(
         IPEndPoint peer,
+        IPAddress primarySelfAddress,
         RouteSelector selector,
         IProxyUdpTransport localTransport,
         IProxyUdpTransportFactory egressFactory,
@@ -266,6 +270,7 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
         CancellationToken cancellationToken)
     {
         _peer = peer;
+        _primarySelfAddress = primarySelfAddress;
         _selector = selector;
         _localTransport = localTransport;
         _egressFactory = egressFactory;
@@ -295,10 +300,8 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
         switch (decision.Kind)
         {
             case RouteKind.LocalLoopback:
-                var loopbackTarget = MapToLoopback(target);
-                _localResponseAliases[loopbackTarget] = target;
                 await _localTransport.SendAsync(
-                    loopbackTarget,
+                    MapToLoopback(target),
                     payload,
                     cancellationToken).ConfigureAwait(false);
                 break;
@@ -382,12 +385,13 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
 
     private ProxyUdpDatagram RewriteLocalResponse(ProxyUdpDatagram datagram)
     {
-        if (_localResponseAliases.TryGetValue(
-                datagram.Source,
-                out var logicalSource))
+        if (datagram.Source.TryGetIPAddress(out var address)
+            && IPAddress.IsLoopback(address))
         {
             return datagram with {
-                Source = logicalSource
+                Source = new ProxyTarget(
+                    _primarySelfAddress.ToString(),
+                    datagram.Source.Port)
             };
         }
 

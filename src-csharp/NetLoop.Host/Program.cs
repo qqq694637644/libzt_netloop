@@ -80,13 +80,31 @@ internal static class Program
                 AllowSynchronousContinuations = false,
                 FullMode = BoundedChannelFullMode.DropOldest
             });
+        var resetRuntimeOnNetworkChange = 0;
+
+        void RequestReset(string reason)
+        {
+            var physicalNetworkEvent = reason.StartsWith(
+                "network_",
+                StringComparison.Ordinal);
+            if (physicalNetworkEvent
+                && Volatile.Read(ref resetRuntimeOnNetworkChange) == 0)
+            {
+                node.TryNotifyPhysicalNetworkChanged();
+                return;
+            }
+
+            resetRequests.Writer.TryWrite(reason);
+        }
+
         await using var resetMonitor = new RuntimeResetMonitor(
             options.ResetCommandFile,
             options.ResetEventDebounce,
-            reason => resetRequests.Writer.TryWrite(reason));
+            RequestReset);
         resetMonitor.Start();
 
         var state = await node.StartAsync(shutdownToken).ConfigureAwait(false);
+        Volatile.Write(ref resetRuntimeOnNetworkChange, 1);
 
         while (!shutdownToken.IsCancellationRequested)
         {
@@ -136,6 +154,7 @@ internal static class Program
 
                 var nextResetCount = checked(resetCount + 1);
                 resetStarted = Stopwatch.GetTimestamp();
+                Volatile.Write(ref resetRuntimeOnNetworkChange, 0);
 
                 await StatusWriter.WriteAsync(
                     options.StatusFile,
@@ -168,6 +187,7 @@ internal static class Program
                 // immediately refreshes UDP binds and local-interface state.
                 node.NotifyPhysicalNetworkChanged();
                 state = node.RefreshNetworkState();
+                Volatile.Write(ref resetRuntimeOnNetworkChange, 1);
                 resetCount = nextResetCount;
 
                 JsonLog.Info("runtime_reset_transport_refresh", new {

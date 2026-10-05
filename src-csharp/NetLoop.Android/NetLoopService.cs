@@ -88,6 +88,18 @@ public sealed class NetLoopService : Service
                 AllowSynchronousContinuations = false,
                 FullMode = BoundedChannelFullMode.DropOldest
             });
+        var resetRuntimeOnNetworkChange = 0;
+
+        void OnNetworkChanged(string reason)
+        {
+            if (Volatile.Read(ref resetRuntimeOnNetworkChange) == 0)
+            {
+                node.TryNotifyPhysicalNetworkChanged();
+                return;
+            }
+
+            resets.Writer.TryWrite(reason);
+        }
 #if NETLOOP_CI
         _ciResets = resets;
 #endif
@@ -95,7 +107,7 @@ public sealed class NetLoopService : Service
         await using var networkMonitor = new AndroidNetworkMonitor(
             this,
             options.ResetEventDebounce,
-            reason => resets.Writer.TryWrite(reason));
+            OnNetworkChanged);
 
         NetLoopRuntime? runtime = null;
         var resetCount = 0;
@@ -105,6 +117,7 @@ public sealed class NetLoopService : Service
             networkMonitor.Start();
             var state = await node.StartAsync(cancellationToken)
                 .ConfigureAwait(false);
+            Volatile.Write(ref resetRuntimeOnNetworkChange, 1);
             runtime = await NetLoopRuntime.CreateAsync(options, state)
                 .ConfigureAwait(false);
 #if NETLOOP_CI
@@ -140,6 +153,7 @@ public sealed class NetLoopService : Service
                     reset_count = resetCount
                 });
 
+                Volatile.Write(ref resetRuntimeOnNetworkChange, 0);
                 var discarded = runtime;
                 runtime = null;
                 discarded.Abort();
@@ -147,6 +161,7 @@ public sealed class NetLoopService : Service
 
                 node.NotifyPhysicalNetworkChanged();
                 state = node.RefreshNetworkState();
+                Volatile.Write(ref resetRuntimeOnNetworkChange, 1);
                 resetCount++;
 
                 runtime = await NetLoopRuntime.CreateAsync(options, state)
