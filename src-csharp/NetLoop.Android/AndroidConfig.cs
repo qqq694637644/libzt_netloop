@@ -116,10 +116,10 @@ internal sealed record AndroidConfig(
     private static string? EmptyToNull(string? value)
         => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
 
-    private static int ParsePort(
+    private static ushort ParsePort(
         string? value,
         string label,
-        int defaultValue)
+        ushort defaultValue)
     {
         var text = string.IsNullOrWhiteSpace(value)
             ? defaultValue.ToString(CultureInfo.InvariantCulture)
