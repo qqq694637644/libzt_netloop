@@ -4,7 +4,9 @@ if(POLICY CMP0141)
 endif()
 project(libzt_netloop LANGUAGES C CXX)
 
-if(NOT WIN32)
+option(NETLOOP_CSHARP_NATIVE "Build only the shared libzt P/Invoke runtime used by the C# rewrite" OFF)
+
+if(NOT WIN32 AND NOT NETLOOP_CSHARP_NATIVE)
     message(FATAL_ERROR "libzt_netloop currently supports Windows only")
 endif()
 
@@ -14,7 +16,6 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<$<CONFIG:Debug,RelWithDebInfo>:Embedded>")
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set(NETLOOP_VERSION "0.1.0" CACHE STRING "libzt_netloop version")
-option(NETLOOP_CSHARP_NATIVE "Build only the shared libzt P/Invoke runtime used by the C# rewrite" OFF)
 
 if(NETLOOP_CSHARP_NATIVE)
     set(ZTS_ENABLE_PINVOKE ON CACHE BOOL "" FORCE)

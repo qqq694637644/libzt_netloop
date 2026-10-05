@@ -1,0 +1,136 @@
+name: C# Linux CI
+
+on:
+  push:
+    branches:
+      - main
+      - "gpt/**"
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: csharp-linux-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  PYTHONUTF8: "1"
+  DOTNET_NOLOGO: "1"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  SCCACHE_GHA_ENABLED: "true"
+  SCCACHE_GHA_VERSION: "libzt-netloop-csharp-linux-v1"
+  SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
+  SCCACHE_BASEDIRS: ${{ github.workspace }}
+
+jobs:
+  build:
+    name: Build C# ${{ matrix.runtime }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runtime: linux-x64
+            arch: x64
+            runner: ubuntu-24.04
+          - runtime: linux-arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up .NET from global.json
+        uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+          architecture: ${{ matrix.arch }}
+
+      - name: Resolve native cache key
+        id: native-key
+        shell: bash
+        run: |
+          set -euo pipefail
+          libzt="$(git ls-tree HEAD external/libzt | awk '{print $3}')"
+          cmake="$(git hash-object CMakeLists.txt)"
+          script="$(git hash-object tools/build_csharp.py)"
+          network_refresh_patch="$(git hash-object patches/libzt/0001-host-network-change-refresh.patch)"
+          echo "key=libzt-pinvoke-linux-${{ matrix.arch }}-${libzt}-${cmake}-${script}-${network_refresh_patch}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore compiled libzt bundle
+        id: native-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: native-cache
+          key: ${{ steps.native-key.outputs.key }}
+
+      - name: Set up sccache
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: "v0.18.0"
+
+      - name: Build native libzt on cache miss
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        run: >
+          python tools/build_csharp.py
+          --native-only
+          --use-sccache
+          --native-output native-cache/libzt.so
+
+      - name: Verify native bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f native-cache/libzt.so
+          file native-cache/libzt.so
+          if [[ -f native-cache/libzt.so.manifest.json ]]; then
+            cat native-cache/libzt.so.manifest.json
+          fi
+
+      - name: Save compiled libzt bundle immediately
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: native-cache
+          key: ${{ steps.native-key.outputs.key }}
+
+      - name: Restore and publish managed host
+        run: >
+          python tools/build_csharp.py
+          --managed-only
+          --native-input native-cache/libzt.so
+          --output dist-csharp
+          --runtime ${{ matrix.runtime }}
+
+      - name: Smoke test
+        run: python ci/csharp_smoke.py --runtime dist-csharp
+
+      - name: Upload Linux runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: csharp-${{ matrix.runtime }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist-csharp/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Build summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### C# ${{ matrix.runtime }} build"
+            echo "- native bundle cache hit: ${{ steps.native-cache.outputs.cache-hit }}"
+            if [[ -f dist-csharp/build-manifest.json ]]; then
+              echo '~~~json'
+              cat dist-csharp/build-manifest.json
+              echo '~~~'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

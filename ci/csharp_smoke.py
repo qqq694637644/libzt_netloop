@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import subprocess
 
@@ -12,8 +13,10 @@ def main() -> int:
     args = parser.parse_args()
 
     runtime = Path(args.runtime).resolve()
-    executable = runtime / "netloop.exe"
-    native = runtime / "libzt.dll"
+    executable_name = "netloop.exe" if os.name == "nt" else "netloop"
+    native_name = "libzt.dll" if os.name == "nt" else "libzt.so"
+    executable = runtime / executable_name
+    native = runtime / native_name
     if not executable.exists():
         raise FileNotFoundError(executable)
     if not native.exists():
@@ -29,7 +32,7 @@ def main() -> int:
             errors="replace",
             timeout=20,
         )
-        print(f"$ netloop.exe {flag}\n{result.stdout}{result.stderr}")
+        print(f"$ {executable_name} {flag}\n{result.stdout}{result.stderr}")
         if result.returncode != 0:
             return result.returncode
     return 0
