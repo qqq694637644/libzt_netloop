@@ -140,10 +140,6 @@ internal static class CiAutomationStatus
             new {
                 phase = "ready",
                 node_id = state.NodeId.ToString("x10"),
-                managed_addresses =
-                    state.ManagedAddresses
-                        .Select(static address => address.ToString())
-                        .ToArray(),
                 primary_overlay_address = primaryOverlayAddress,
                 reset_count = resetCount,
                 reset_reason = resetReason,
