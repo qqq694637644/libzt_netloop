@@ -129,9 +129,9 @@ public sealed class MainActivity : Activity
     {
         var field = new EditText(this) {
             Hint = hint,
-            Text = value ?? string.Empty,
-            SingleLine = true
+            Text = value ?? string.Empty
         };
+        field.SetSingleLine(true);
         root.AddView(
             field,
             new LinearLayout.LayoutParams(
@@ -143,10 +143,11 @@ public sealed class MainActivity : Activity
 #if NETLOOP_CI
     private void ApplyCiConfigurationFromIntent()
     {
-        if (Intent?.GetBooleanExtra("netloop_ci_start", false) != true)
+        var intent = Intent;
+        if (intent?.GetBooleanExtra("netloop_ci_start", false) != true)
             return;
 
-        var networkId = (Intent.GetStringExtra("network_id") ?? string.Empty).Trim();
+        var networkId = (intent.GetStringExtra("network_id") ?? string.Empty).Trim();
         if (networkId.Length == 0)
             throw new InvalidOperationException("CI start requires network_id.");
 
@@ -159,18 +160,17 @@ public sealed class MainActivity : Activity
             ?? throw new InvalidOperationException(
                 "Unable to edit NetLoop CI preferences.");
 
-        editor
-            .PutString(AndroidConfig.NetworkIdKey, networkId)
-            .PutString(
-                AndroidConfig.PeersKey,
-                Intent.GetStringExtra("peers") ?? string.Empty)
-            .PutString(
-                AndroidConfig.DefaultExitKey,
-                Intent.GetStringExtra("default_exit") ?? string.Empty)
-            .PutString(AndroidConfig.UpstreamHostKey, string.Empty)
-            .PutString(AndroidConfig.UpstreamUserKey, string.Empty)
-            .PutString(AndroidConfig.UpstreamPasswordKey, string.Empty)
-            .Commit();
+        editor.PutString(AndroidConfig.NetworkIdKey, networkId);
+        editor.PutString(
+            AndroidConfig.PeersKey,
+            intent.GetStringExtra("peers") ?? string.Empty);
+        editor.PutString(
+            AndroidConfig.DefaultExitKey,
+            intent.GetStringExtra("default_exit") ?? string.Empty);
+        editor.PutString(AndroidConfig.UpstreamHostKey, string.Empty);
+        editor.PutString(AndroidConfig.UpstreamUserKey, string.Empty);
+        editor.PutString(AndroidConfig.UpstreamPasswordKey, string.Empty);
+        editor.Commit();
 
         CiAutomationStatus.Delete(this);
     }
@@ -201,25 +201,26 @@ public sealed class MainActivity : Activity
             ?? throw new InvalidOperationException(
                 "Unable to edit NetLoop preferences.");
 
-        editor
-            .PutString(AndroidConfig.NetworkIdKey, networkId)
-            .PutString(AndroidConfig.PeersKey, _peers?.Text ?? string.Empty)
-            .PutString(
-                AndroidConfig.DefaultExitKey,
-                _defaultExit?.Text ?? string.Empty)
-            .PutString(
-                AndroidConfig.UpstreamHostKey,
-                _upstreamHost?.Text ?? string.Empty)
-            .PutString(
-                AndroidConfig.UpstreamPortKey,
-                _upstreamPort?.Text ?? "1080")
-            .PutString(
-                AndroidConfig.UpstreamUserKey,
-                _upstreamUser?.Text ?? string.Empty)
-            .PutString(
-                AndroidConfig.UpstreamPasswordKey,
-                _upstreamPassword?.Text ?? string.Empty)
-            .Commit();
+        editor.PutString(AndroidConfig.NetworkIdKey, networkId);
+        editor.PutString(
+            AndroidConfig.PeersKey,
+            _peers?.Text ?? string.Empty);
+        editor.PutString(
+            AndroidConfig.DefaultExitKey,
+            _defaultExit?.Text ?? string.Empty);
+        editor.PutString(
+            AndroidConfig.UpstreamHostKey,
+            _upstreamHost?.Text ?? string.Empty);
+        editor.PutString(
+            AndroidConfig.UpstreamPortKey,
+            _upstreamPort?.Text ?? "1080");
+        editor.PutString(
+            AndroidConfig.UpstreamUserKey,
+            _upstreamUser?.Text ?? string.Empty);
+        editor.PutString(
+            AndroidConfig.UpstreamPasswordKey,
+            _upstreamPassword?.Text ?? string.Empty);
+        editor.Commit();
 
         if (OperatingSystem.IsAndroidVersionAtLeast(33)
             && CheckSelfPermission(Manifest.Permission.PostNotifications)

@@ -142,7 +142,7 @@ internal sealed class AndroidNetworkMonitor : ConnectivityManager.NetworkCallbac
             if (!cancellationToken.IsCancellationRequested)
                 _onNetworkChanged(reason);
         }
-        catch (OperationCanceledException)
+        catch (System.OperationCanceledException)
             when (cancellationToken.IsCancellationRequested)
         {
         }

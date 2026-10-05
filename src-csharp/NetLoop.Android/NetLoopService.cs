@@ -141,7 +141,7 @@ public sealed class NetLoopService : Service
                         .ReadAsync(cancellationToken)
                         .ConfigureAwait(false);
                 }
-                catch (OperationCanceledException)
+                catch (System.OperationCanceledException)
                     when (cancellationToken.IsCancellationRequested)
                 {
                     break;
@@ -214,7 +214,7 @@ public sealed class NetLoopService : Service
         {
             await runner.ConfigureAwait(false);
         }
-        catch (OperationCanceledException)
+        catch (System.OperationCanceledException)
         {
         }
         catch (Exception ex)
