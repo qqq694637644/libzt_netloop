@@ -8,7 +8,7 @@ internal sealed class RoutingConnector : IProxyConnector
     private static readonly TimeSpan PeerNegotiationRecoveryWindow =
         TimeSpan.FromSeconds(3);
     private static readonly TimeSpan PeerNegotiationAttemptTimeout =
-        TimeSpan.FromSeconds(3);
+        TimeSpan.FromMilliseconds(750);
 
     private readonly RouteSelector _selector;
     private readonly bool _overlayIngress;

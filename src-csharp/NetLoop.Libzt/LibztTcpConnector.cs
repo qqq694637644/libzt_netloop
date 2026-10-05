@@ -5,6 +5,9 @@ namespace NetLoop.Libzt;
 
 public sealed class LibztTcpConnector : IProxyConnector
 {
+    private static readonly TimeSpan RetryDelay = TimeSpan.FromMilliseconds(250);
+    private const int AttemptTimeoutMilliseconds = 500;
+
     private readonly TimeSpan _connectTimeout;
 
     public LibztTcpConnector(TimeSpan connectTimeout)
@@ -23,52 +26,101 @@ public sealed class LibztTcpConnector : IProxyConnector
             ? LibztNative.AfInet
             : LibztNative.AfInet6;
 
-        var fd = LibztNative.Socket(family, LibztNative.SockStream, 0);
-        if (fd < 0)
-            throw new LibztException("zts_bsd_socket", fd, LibztNative.GetErrno());
+        var deadline = DateTimeOffset.UtcNow + _connectTimeout;
+        var attempt = 0;
+        Exception? lastError = null;
 
-        try
+        while (DateTimeOffset.UtcNow < deadline)
         {
-            ConfigureStream(fd);
             cancellationToken.ThrowIfCancellationRequested();
-            var timeoutMs = checked((int)Math.Clamp(
-                Math.Ceiling(_connectTimeout.TotalMilliseconds),
-                1,
-                int.MaxValue));
+            attempt++;
 
-            // zts_connect() is already the libzt convenience API that retries
-            // internally while a transport-triggered peer path is forming.
-            // Do not wrap it in another native fresh-socket retry loop.
-            using var registration = cancellationToken.Register(
-                static state =>
-                    LibztNative.Shutdown(
-                        (int)state!,
-                        LibztNative.ShutReadWrite),
-                fd);
-            var result = await Task.Run(
-                () => LibztNative.ConnectEasy(fd, target.Host, target.Port, timeoutMs),
-                CancellationToken.None).ConfigureAwait(false);
-            cancellationToken.ThrowIfCancellationRequested();
-
-            if (result != LibztNative.Ok)
+            var fd = LibztNative.Socket(family, LibztNative.SockStream, 0);
+            if (fd < 0)
             {
-                var error = new LibztException(
-                    "zts_connect",
-                    result,
+                lastError = new LibztException(
+                    "zts_bsd_socket",
+                    fd,
                     LibztNative.GetErrno());
-                throw new TimeoutException(
-                    $"libzt connect timed out for {target}",
-                    error);
+            }
+            else
+            {
+                try
+                {
+                    ConfigureStream(fd);
+                    var remaining = deadline - DateTimeOffset.UtcNow;
+                    var attemptTimeout = Math.Clamp(
+                        (int)Math.Max(250, remaining.TotalMilliseconds),
+                        250,
+                        AttemptTimeoutMilliseconds);
+
+                    using var registration = cancellationToken.Register(
+                        static state =>
+                            LibztNative.Shutdown(
+                                (int)state!,
+                                LibztNative.ShutReadWrite),
+                        fd);
+
+                    // zts_connect() retries on the same fd. After a physical
+                    // network rebind that fd may already carry stale lwIP path
+                    // state, so bound each native attempt and replace the fd
+                    // before retrying.
+                    var result = await Task.Run(
+                        () => LibztNative.ConnectEasy(
+                            fd,
+                            target.Host,
+                            target.Port,
+                            attemptTimeout),
+                        CancellationToken.None).ConfigureAwait(false);
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    if (result == LibztNative.Ok)
+                    {
+                        if (attempt > 1)
+                        {
+                            JsonLog.Info("libzt_connect_recovered", new {
+                                target = target.ToString(),
+                                attempts = attempt
+                            });
+                        }
+
+                        return new LibztTcpConnection(
+                            fd,
+                            $"libzt:{target}");
+                    }
+
+                    lastError = new LibztException(
+                        "zts_connect",
+                        result,
+                        LibztNative.GetErrno());
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex;
+                }
+
+                _ = LibztNative.Shutdown(fd, LibztNative.ShutReadWrite);
+                _ = LibztNative.Close(fd);
             }
 
-            return new LibztTcpConnection(fd, $"libzt:{target}");
+            JsonLog.Info("libzt_connect_retry", new {
+                target = target.ToString(),
+                attempts = attempt,
+                error = lastError?.Message
+            });
+
+            var delay = deadline - DateTimeOffset.UtcNow;
+            if (delay <= TimeSpan.Zero)
+                break;
+
+            await Task.Delay(
+                delay < RetryDelay ? delay : RetryDelay,
+                cancellationToken).ConfigureAwait(false);
         }
-        catch
-        {
-            _ = LibztNative.Shutdown(fd, LibztNative.ShutReadWrite);
-            _ = LibztNative.Close(fd);
-            throw;
-        }
+
+        throw new TimeoutException(
+            $"libzt connect timed out for {target}",
+            lastError);
     }
 
     internal static void ConfigureStream(int fd)
