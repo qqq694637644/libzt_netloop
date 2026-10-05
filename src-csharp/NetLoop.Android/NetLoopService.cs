@@ -156,7 +156,7 @@ public sealed class NetLoopService : Service
                 var discarded = runtime;
                 runtime = null;
                 discarded.Abort();
-                _ = DisposeDiscardedRuntimeAsync(discarded);
+                await discarded.DisposeAsync().ConfigureAwait(false);
 
                 node.NotifyPhysicalNetworkChanged();
                 state = node.RefreshNetworkState();
@@ -189,22 +189,6 @@ public sealed class NetLoopService : Service
 #endif
             if (runtime is not null)
                 await runtime.DisposeAsync().ConfigureAwait(false);
-        }
-    }
-
-    private static async Task DisposeDiscardedRuntimeAsync(
-        NetLoopRuntime runtime)
-    {
-        try
-        {
-            await runtime.DisposeAsync().ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            JsonLog.Error("android_runtime_background_dispose_failed", new {
-                error_type = ex.GetType().Name,
-                error = ex.Message
-            });
         }
     }
 

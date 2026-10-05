@@ -245,6 +245,7 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
     private readonly IProxyUdpTransportFactory _egressFactory;
     private readonly TimeSpan _idleTimeout;
     private readonly Func<IPEndPoint, ProxyUdpDatagram, CancellationToken, ValueTask> _responseSender;
+    private readonly ConcurrentDictionary<ProxyTarget, ProxyTarget> _localResponseAliases = new();
     private readonly CancellationTokenSource _stop;
     private readonly SemaphoreSlim _egressCreateLock = new(1, 1);
     private readonly Task _localReceiveLoop;
@@ -301,8 +302,10 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
         switch (decision.Kind)
         {
             case RouteKind.LocalLoopback:
+                var loopbackTarget = MapToLoopback(target);
+                _localResponseAliases[loopbackTarget] = target;
                 await _localTransport.SendAsync(
-                    MapToLoopback(target),
+                    loopbackTarget,
                     payload,
                     cancellationToken).ConfigureAwait(false);
                 break;
@@ -376,16 +379,33 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
         while (!cancellationToken.IsCancellationRequested)
         {
             var datagram = await transport.ReceiveAsync(cancellationToken).ConfigureAwait(false);
-            await _responseSender(_peer, datagram, cancellationToken).ConfigureAwait(false);
+            var response = source == "local"
+                ? RewriteLocalResponse(datagram)
+                : datagram;
+            await _responseSender(_peer, response, cancellationToken).ConfigureAwait(false);
             Touch();
 
             JsonLog.Info("overlay_udp_response_sent", new {
                 peer = _peer.ToString(),
                 transport = source,
-                source_endpoint = datagram.Source.ToString(),
-                bytes = datagram.Payload.Length
+                source_endpoint = response.Source.ToString(),
+                bytes = response.Payload.Length
             });
         }
+    }
+
+    private ProxyUdpDatagram RewriteLocalResponse(ProxyUdpDatagram datagram)
+    {
+        if (_localResponseAliases.TryGetValue(
+                datagram.Source,
+                out var logicalSource))
+        {
+            return datagram with {
+                Source = logicalSource
+            };
+        }
+
+        return datagram;
     }
 
     private async Task IdleMonitorAsync(CancellationToken cancellationToken)

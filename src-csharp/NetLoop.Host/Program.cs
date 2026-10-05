@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Threading.Channels;
 using NetLoop.Core;
 using NetLoop.Libzt;
 
@@ -65,23 +66,27 @@ internal static class Program
         var resetCount = 0;
         long? resetStarted = null;
         string? lastResetReason = null;
+        var resetRequests = Channel.CreateBounded<string>(
+            new BoundedChannelOptions(1) {
+                SingleReader = true,
+                SingleWriter = false,
+                AllowSynchronousContinuations = false,
+                FullMode = BoundedChannelFullMode.DropOldest
+            });
+        await using var resetMonitor = new RuntimeResetMonitor(
+            options.ResetCommandFile,
+            options.ResetEventDebounce,
+            reason => resetRequests.Writer.TryWrite(reason));
+        resetMonitor.Start();
 
         while (!shutdownToken.IsCancellationRequested)
         {
             var runtime = await NetLoopRuntime.CreateAsync(
                 options,
                 state).ConfigureAwait(false);
-            var runtimeAborted = false;
-            var resetRequested = new TaskCompletionSource<string>(
-                TaskCreationOptions.RunContinuationsAsynchronously);
-            var resetMonitor = new RuntimeResetMonitor(
-                options.ResetCommandFile,
-                options.ResetEventDebounce,
-                reason => resetRequested.TrySetResult(reason));
 
             try
             {
-                resetMonitor.Start();
                 double? resetElapsedMs = resetStarted is null
                     ? null
                     : Stopwatch.GetElapsedTime(resetStarted.Value).TotalMilliseconds;
@@ -108,27 +113,18 @@ internal static class Program
                 resetStarted = null;
                 lastResetReason = null;
 
-                var shutdownTask = Task.Delay(
-                    Timeout.InfiniteTimeSpan,
-                    shutdownToken);
-                var completed = await Task.WhenAny(
-                    shutdownTask,
-                    resetRequested.Task).ConfigureAwait(false);
-
-                if (ReferenceEquals(completed, shutdownTask))
+                try
                 {
-                    try
-                    {
-                        await shutdownTask.ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException)
-                        when (shutdownToken.IsCancellationRequested)
-                    {
-                    }
+                    lastResetReason = await resetRequests.Reader
+                        .ReadAsync(shutdownToken)
+                        .ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                    when (shutdownToken.IsCancellationRequested)
+                {
                     return 0;
                 }
 
-                lastResetReason = await resetRequested.Task.ConfigureAwait(false);
                 var nextResetCount = checked(resetCount + 1);
                 resetStarted = Stopwatch.GetTimestamp();
 
@@ -152,13 +148,11 @@ internal static class Program
                     process_id = Environment.ProcessId
                 });
 
-                // Network reset is an abort, not a graceful drain. Close every
-                // old socket immediately and do not wait for old handlers or
-                // TCP half-close semantics before refreshing the transport.
-                await resetMonitor.DisposeAsync().ConfigureAwait(false);
+                // Network reset is an abort, not a graceful drain. Abort first
+                // so stale traffic stops immediately, then wait until every old
+                // socket/task has released its fd before the new runtime starts.
                 runtime.Abort();
-                runtimeAborted = true;
-                _ = DisposeDiscardedRuntimeAsync(runtime);
+                await runtime.DisposeAsync().ConfigureAwait(false);
 
                 // Keep the ZeroTier node/identity/network alive. Tell the
                 // service that the host physical network changed so it
@@ -175,28 +169,11 @@ internal static class Program
             }
             finally
             {
-                await resetMonitor.DisposeAsync().ConfigureAwait(false);
-                if (!runtimeAborted)
-                    await runtime.DisposeAsync().ConfigureAwait(false);
+                await runtime.DisposeAsync().ConfigureAwait(false);
             }
         }
 
         return 0;
-    }
-
-    private static async Task DisposeDiscardedRuntimeAsync(NetLoopRuntime runtime)
-    {
-        try
-        {
-            await runtime.DisposeAsync().ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            JsonLog.Error("runtime_background_dispose_failed", new {
-                error_type = ex.GetType().Name,
-                error = ex.Message
-            });
-        }
     }
 
     private static Task WriteReadyStatusAsync(

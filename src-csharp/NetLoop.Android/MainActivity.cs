@@ -180,7 +180,8 @@ public sealed class MainActivity : Activity
         editor.PutString(AndroidConfig.UpstreamHostKey, string.Empty);
         editor.PutString(AndroidConfig.UpstreamUserKey, string.Empty);
         editor.PutString(AndroidConfig.UpstreamPasswordKey, string.Empty);
-        editor.Commit();
+        if (!editor.Commit())
+            throw new IOException("Unable to persist NetLoop CI preferences.");
 
         CiAutomationStatus.Delete(this);
     }
@@ -204,10 +205,12 @@ public sealed class MainActivity : Activity
             return;
         }
 
-        var editor = GetSharedPreferences(
+        var preferences = GetSharedPreferences(
             AndroidConfig.PreferencesName,
             FileCreationMode.Private)
-            ?.Edit()
+            ?? throw new InvalidOperationException(
+                "Unable to open NetLoop preferences.");
+        var editor = preferences.Edit()
             ?? throw new InvalidOperationException(
                 "Unable to edit NetLoop preferences.");
 
@@ -230,7 +233,13 @@ public sealed class MainActivity : Activity
         editor.PutString(
             AndroidConfig.UpstreamPasswordKey,
             _upstreamPassword?.Text ?? string.Empty);
-        editor.Commit();
+        if (!editor.Commit())
+            throw new IOException("Unable to persist NetLoop preferences.");
+
+        // SharedPreferences remains a UI convenience only. The foreground
+        // service runs in :netloop, so cross-process configuration is carried
+        // by an atomically replaced app-private JSON snapshot instead.
+        AndroidConfig.SaveSnapshot(this, preferences);
 
         if (OperatingSystem.IsAndroidVersionAtLeast(33)
             && CheckSelfPermission(Manifest.Permission.PostNotifications)
@@ -241,16 +250,45 @@ public sealed class MainActivity : Activity
                 1001);
         }
 
-        var intent = new Intent(this, typeof(NetLoopService))
-            .SetAction(NetLoopService.ActionStart);
+        RestartNetLoopService();
 
+        if (_status is not null)
+            _status.Text = "NetLoop foreground service restart requested.";
+    }
+
+    private void RestartNetLoopService()
+    {
+        var stopIntent = new Intent(this, typeof(NetLoopService))
+            .SetAction(NetLoopService.ActionStop);
+        StartServiceCompat(stopIntent);
+        _ = StartAfterStopAsync();
+    }
+
+    private async Task StartAfterStopAsync()
+    {
+        try
+        {
+            // The runtime lives in a dedicated process. Give the explicit stop
+            // enough time to destroy that process before starting a new one so
+            // the new service always reads the just-written config snapshot.
+            await Task.Delay(TimeSpan.FromSeconds(1)).ConfigureAwait(true);
+            var startIntent = new Intent(this, typeof(NetLoopService))
+                .SetAction(NetLoopService.ActionStart);
+            StartServiceCompat(startIntent);
+        }
+        catch (Exception ex)
+        {
+            if (_status is not null)
+                _status.Text = $"Unable to restart NetLoop: {ex.Message}";
+        }
+    }
+
+    private void StartServiceCompat(Intent intent)
+    {
         if (OperatingSystem.IsAndroidVersionAtLeast(26))
             StartForegroundService(intent);
         else
             StartService(intent);
-
-        if (_status is not null)
-            _status.Text = "NetLoop foreground service start requested.";
     }
 
     private void StopNetLoop()
@@ -258,10 +296,7 @@ public sealed class MainActivity : Activity
         var intent = new Intent(this, typeof(NetLoopService))
             .SetAction(NetLoopService.ActionStop);
 
-        if (OperatingSystem.IsAndroidVersionAtLeast(26))
-            StartForegroundService(intent);
-        else
-            StartService(intent);
+        StartServiceCompat(intent);
 
         if (_status is not null)
             _status.Text = "NetLoop foreground service stop requested.";

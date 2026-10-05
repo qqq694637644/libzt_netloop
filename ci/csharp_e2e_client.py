@@ -260,7 +260,21 @@ class SocksUdpAssociation:
 def verify_peer_local_udp(proxy_port: int, peer_ip: str, service_port: int) -> None:
     payload = b"netloop-peer-udp-echo"
     with SocksUdpAssociation("127.0.0.1", proxy_port) as association:
-        _, _, response = association.roundtrip(peer_ip, service_port, payload)
+        response_host, response_port, response = association.roundtrip(
+            peer_ip,
+            service_port,
+            payload,
+        )
+        if ipaddress.ip_address(response_host) != ipaddress.ip_address(peer_ip):
+            raise AssertionError(
+                "peer UDP response source mismatch: "
+                f"expected_host={peer_ip}, observed_host={response_host}"
+            )
+        if response_port != service_port:
+            raise AssertionError(
+                "peer UDP response source port mismatch: "
+                f"expected_port={service_port}, observed_port={response_port}"
+            )
         if response != payload:
             raise AssertionError(
                 f"peer UDP echo mismatch: expected={payload!r}, observed={response!r}"
@@ -771,7 +785,7 @@ def run_reset_stress(
                             if remaining <= 0:
                                 break
                             try:
-                                _, _, response = association.receive(
+                                response_host, response_port, response = association.receive(
                                     timeout=min(
                                         RESET_UDP_RESPONSE_SLICE_SECONDS,
                                         remaining,
@@ -792,6 +806,25 @@ def run_reset_stress(
                                     time.sleep(sleep_for)
                                 continue
 
+                            if (
+                                ipaddress.ip_address(response_host)
+                                != ipaddress.ip_address(rendezvous["server_ip"])
+                            ):
+                                last_error = (
+                                    "fresh UDP source host mismatch: "
+                                    f"expected={rendezvous['server_ip']}, "
+                                    f"observed={response_host}"
+                                )
+                                continue
+                            if response_port != int(
+                                rendezvous["local_udp_service_port"]
+                            ):
+                                last_error = (
+                                    "fresh UDP source port mismatch: "
+                                    f"expected={rendezvous['local_udp_service_port']}, "
+                                    f"observed={response_port}"
+                                )
+                                continue
                             if response != payload:
                                 last_error = (
                                     "fresh UDP mismatch: "

@@ -120,6 +120,11 @@ internal sealed class CiUdpProbeResult
     public string? error { get; set; }
 }
 
+internal sealed record SocksUdpResponse(
+    string Host,
+    ushort Port,
+    byte[] Payload);
+
 internal static class CiUdpProbe
 {
     private const uint StunMagicCookie = 0x2112A442;
@@ -185,7 +190,15 @@ internal static class CiUdpProbe
             request.PeerPort,
             request.Payload,
             request.TimeoutMilliseconds);
-        if (!response.AsSpan().SequenceEqual(request.Payload))
+        if (!IPAddress.Parse(response.Host).Equals(request.PeerAddress)
+            || response.Port != request.PeerPort)
+        {
+            throw new InvalidOperationException(
+                "Peer UDP response source mismatch: "
+                + $"{response.Host}:{response.Port} != "
+                + $"{request.PeerAddress}:{request.PeerPort}");
+        }
+        if (!response.Payload.AsSpan().SequenceEqual(request.Payload))
         {
             throw new InvalidOperationException(
                 "Peer UDP echo payload mismatch.");
@@ -224,7 +237,7 @@ internal static class CiUdpProbe
             request.PeerPort,
             request.Payload,
             request.TimeoutMilliseconds);
-        if (!response.AsSpan().SequenceEqual(request.Payload))
+        if (!response.Payload.AsSpan().SequenceEqual(request.Payload))
         {
             throw new InvalidOperationException(
                 "UDP association did not recover after FRAG rejection.");
@@ -242,7 +255,7 @@ internal static class CiUdpProbe
             request.StunPort,
             stunRequest,
             Math.Max(request.TimeoutMilliseconds, 5000));
-        return ParseStunPublicIp(response);
+        return ParseStunPublicIp(response.Payload);
     }
 
     private static void VerifyControlCloseCleanup(
@@ -255,7 +268,7 @@ internal static class CiUdpProbe
             request.PeerPort,
             request.Payload,
             request.TimeoutMilliseconds);
-        if (!response.AsSpan().SequenceEqual(request.Payload))
+        if (!response.Payload.AsSpan().SequenceEqual(request.Payload))
         {
             throw new InvalidOperationException(
                 "UDP association did not work before control close.");
@@ -467,7 +480,7 @@ internal sealed class SocksUdpAssociation : IDisposable
         _udp.SendTo(packet, _relay);
     }
 
-    internal byte[] Receive(int timeoutMilliseconds)
+    internal SocksUdpResponse Receive(int timeoutMilliseconds)
     {
         _udp.ReceiveTimeout = timeoutMilliseconds;
         var buffer = new byte[65535];
@@ -491,13 +504,17 @@ internal sealed class SocksUdpAssociation : IDisposable
             throw new InvalidOperationException(
                 $"Unexpected SOCKS5 UDP response FRAG={buffer[2]}.");
 
-        var payloadOffset = SkipTarget(buffer.AsSpan(3, count - 3));
-        return buffer
-            .AsSpan(3 + payloadOffset, count - 3 - payloadOffset)
-            .ToArray();
+        var (host, port, payloadOffset) = ReadTarget(
+            buffer.AsSpan(3, count - 3));
+        return new SocksUdpResponse(
+            host,
+            port,
+            buffer
+                .AsSpan(3 + payloadOffset, count - 3 - payloadOffset)
+                .ToArray());
     }
 
-    internal byte[] RoundTrip(
+    internal SocksUdpResponse RoundTrip(
         string targetHost,
         ushort targetPort,
         byte[] payload,
@@ -618,27 +635,57 @@ internal sealed class SocksUdpAssociation : IDisposable
         return address;
     }
 
-    private static int SkipTarget(ReadOnlySpan<byte> payload)
+    private static (string Host, ushort Port, int PayloadOffset) ReadTarget(
+        ReadOnlySpan<byte> payload)
     {
         if (payload.Length < 1)
             throw new InvalidOperationException(
                 "Truncated SOCKS5 UDP target.");
 
-        var addressLength = payload[0] switch {
-            0x01 => 4,
-            0x04 => 16,
-            0x03 when payload.Length >= 2 => 1 + payload[1],
-            _ => throw new InvalidOperationException(
-                $"Invalid SOCKS5 UDP target type {payload[0]}.")
-        };
+        string host;
+        int offset;
+        switch (payload[0])
+        {
+            case 0x01:
+                if (payload.Length < 5)
+                    throw new InvalidOperationException(
+                        "Truncated SOCKS5 UDP IPv4 target.");
+                host = new IPAddress(payload.Slice(1, 4)).ToString();
+                offset = 5;
+                break;
 
-        var offset = 1 + addressLength;
-        if (payload[0] == 0x03)
-            offset = 2 + payload[1];
+            case 0x04:
+                if (payload.Length < 17)
+                    throw new InvalidOperationException(
+                        "Truncated SOCKS5 UDP IPv6 target.");
+                host = new IPAddress(payload.Slice(1, 16)).ToString();
+                offset = 17;
+                break;
+
+            case 0x03:
+                if (payload.Length < 2)
+                    throw new InvalidOperationException(
+                        "Truncated SOCKS5 UDP domain target.");
+                var length = payload[1];
+                if (payload.Length < 2 + length)
+                    throw new InvalidOperationException(
+                        "Truncated SOCKS5 UDP domain target.");
+                host = Encoding.ASCII.GetString(
+                    payload.Slice(2, length));
+                offset = 2 + length;
+                break;
+
+            default:
+                throw new InvalidOperationException(
+                    $"Invalid SOCKS5 UDP target type {payload[0]}.");
+        }
+
         if (payload.Length < offset + 2)
             throw new InvalidOperationException(
                 "Truncated SOCKS5 UDP target port.");
-        return offset + 2;
+        var port = BinaryPrimitives.ReadUInt16BigEndian(
+            payload.Slice(offset, 2));
+        return (host, port, offset + 2);
     }
 }
 

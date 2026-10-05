@@ -18,7 +18,6 @@ internal sealed class RuntimeResetMonitor : IAsyncDisposable
     private CancellationTokenSource? _debounceCts;
     private Task? _commandLoop;
     private int _started;
-    private int _requested;
     private int _disposed;
 
     internal RuntimeResetMonitor(
@@ -66,7 +65,6 @@ internal sealed class RuntimeResetMonitor : IAsyncDisposable
     private void ScheduleNetworkReset(string reason)
     {
         if (Volatile.Read(ref _disposed) != 0
-            || Volatile.Read(ref _requested) != 0
             || DateTimeOffset.UtcNow < _acceptNetworkEventsAfter)
             return;
 
@@ -98,8 +96,7 @@ internal sealed class RuntimeResetMonitor : IAsyncDisposable
 
     private async Task CommandLoopAsync(CancellationToken cancellationToken)
     {
-        while (!cancellationToken.IsCancellationRequested
-               && Volatile.Read(ref _requested) == 0)
+        while (!cancellationToken.IsCancellationRequested)
         {
             try
             {
@@ -123,7 +120,6 @@ internal sealed class RuntimeResetMonitor : IAsyncDisposable
                         if (!TryConsumeCommandFile(_commandFile))
                             continue;
                         RequestReset($"command:{command.Id}");
-                        return;
                     }
                 }
             }
@@ -164,9 +160,6 @@ internal sealed class RuntimeResetMonitor : IAsyncDisposable
 
     private void RequestReset(string reason)
     {
-        if (Interlocked.Exchange(ref _requested, 1) != 0)
-            return;
-
         JsonLog.Info("runtime_reset_requested", new { reason });
         _requestReset(reason);
     }
