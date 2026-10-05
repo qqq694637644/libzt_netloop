@@ -1,0 +1,19 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 8a41d52..d82f0d3 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -192,8 +192,12 @@ if(${CMAKE_SYSTEM_NAME} MATCHES "Android")
+     set(BUILD_HOST_SELFTEST    FALSE)
+     set(BUILD_HOST_EXAMPLES    FALSE)
+     set(ALLOW_INSTALL_TARGET   FALSE)
+-    set(LANG_WRAPPER_FILE ${LIBZT_SRC_DIR}/bindings/java/*.cxx)
+-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DZTS_ENABLE_JAVA=1")
++    if(ZTS_ENABLE_PINVOKE)
++        set(ZTS_NDK_ONLY TRUE CACHE BOOL "Use C API callbacks on Android" FORCE)
++    else()
++        set(LANG_WRAPPER_FILE ${LIBZT_SRC_DIR}/bindings/java/*.cxx)
++        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DZTS_ENABLE_JAVA=1")
++    endif()
+ endif()
+ 
+ if(BUILD_MACOS_FRAMEWORK)

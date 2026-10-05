@@ -1,0 +1,175 @@
+using Android.Content;
+using Android.Net;
+using NetLoop.Core;
+
+namespace NetLoop.Android;
+
+internal sealed class AndroidNetworkMonitor : ConnectivityManager.NetworkCallback, IAsyncDisposable
+{
+    private static readonly TimeSpan StartupGrace = TimeSpan.FromSeconds(1);
+
+    private readonly ConnectivityManager _manager;
+    private readonly TimeSpan _debounce;
+    private readonly Action<string> _onNetworkChanged;
+    private readonly CancellationTokenSource _stop = new();
+    private readonly object _gate = new();
+    private readonly DateTimeOffset _acceptEventsAfter =
+        DateTimeOffset.UtcNow + StartupGrace;
+
+    private CancellationTokenSource? _debounceCts;
+    private string? _defaultNetwork;
+    private int _started;
+    private int _disposed;
+
+    internal AndroidNetworkMonitor(
+        Context context,
+        TimeSpan debounce,
+        Action<string> onNetworkChanged)
+    {
+        _manager = (ConnectivityManager?)context.GetSystemService(
+            Context.ConnectivityService)
+            ?? throw new InvalidOperationException(
+                "Android ConnectivityManager is unavailable.");
+        _debounce = debounce;
+        _onNetworkChanged = onNetworkChanged;
+    }
+
+    internal void Start()
+    {
+        ObjectDisposedException.ThrowIf(
+            Volatile.Read(ref _disposed) != 0,
+            this);
+        if (Interlocked.Exchange(ref _started, 1) != 0)
+            throw new InvalidOperationException(
+                "Android network monitor is already started.");
+
+        _manager.RegisterDefaultNetworkCallback(this);
+        JsonLog.Info("android_network_monitor_ready", new {
+            debounce_ms = _debounce.TotalMilliseconds
+        });
+    }
+
+    public override void OnAvailable(Network network)
+    {
+        var identity = network.ToString();
+        var shouldReset = false;
+
+        lock (_gate)
+        {
+            if (_defaultNetwork is null)
+            {
+                _defaultNetwork = identity;
+            }
+            else if (!string.Equals(
+                         _defaultNetwork,
+                         identity,
+                         StringComparison.Ordinal))
+            {
+                _defaultNetwork = identity;
+                shouldReset = true;
+            }
+        }
+
+        if (shouldReset)
+            Schedule("android_default_network_changed");
+    }
+
+    public override void OnLost(Network network)
+    {
+        var identity = network.ToString();
+        var shouldReset = false;
+
+        lock (_gate)
+        {
+            if (string.Equals(
+                    _defaultNetwork,
+                    identity,
+                    StringComparison.Ordinal))
+            {
+                _defaultNetwork = null;
+                shouldReset = true;
+            }
+        }
+
+        if (shouldReset)
+            Schedule("android_default_network_lost");
+    }
+
+    public override void OnLinkPropertiesChanged(
+        Network network,
+        LinkProperties linkProperties)
+    {
+        var identity = network.ToString();
+        lock (_gate)
+        {
+            if (!string.Equals(
+                    _defaultNetwork,
+                    identity,
+                    StringComparison.Ordinal))
+                return;
+        }
+
+        Schedule("android_link_properties_changed");
+    }
+
+    private void Schedule(string reason)
+    {
+        if (Volatile.Read(ref _disposed) != 0
+            || DateTimeOffset.UtcNow < _acceptEventsAfter)
+            return;
+
+        CancellationTokenSource debounce;
+        lock (_gate)
+        {
+            _debounceCts?.Cancel();
+            _debounceCts?.Dispose();
+            _debounceCts =
+                CancellationTokenSource.CreateLinkedTokenSource(_stop.Token);
+            debounce = _debounceCts;
+        }
+
+        _ = DebounceAsync(reason, debounce.Token);
+    }
+
+    private async Task DebounceAsync(
+        string reason,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await Task.Delay(_debounce, cancellationToken)
+                .ConfigureAwait(false);
+            if (!cancellationToken.IsCancellationRequested)
+                _onNetworkChanged(reason);
+        }
+        catch (OperationCanceledException)
+            when (cancellationToken.IsCancellationRequested)
+        {
+        }
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return ValueTask.CompletedTask;
+
+        try
+        {
+            _manager.UnregisterNetworkCallback(this);
+        }
+        catch (Java.Lang.IllegalArgumentException)
+        {
+        }
+
+        lock (_gate)
+        {
+            _debounceCts?.Cancel();
+            _debounceCts?.Dispose();
+            _debounceCts = null;
+        }
+
+        _stop.Cancel();
+        _stop.Dispose();
+        return ValueTask.CompletedTask;
+    }
+}

@@ -1,0 +1,386 @@
+name: C# Android CI
+
+on:
+  push:
+    branches:
+      - main
+      - "gpt/**"
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: csharp-android-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  PYTHONUTF8: "1"
+  DOTNET_NOLOGO: "1"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  SCCACHE_GHA_ENABLED: "true"
+  SCCACHE_GHA_VERSION: "libzt-netloop-csharp-android-v1"
+  SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
+  SCCACHE_BASEDIRS: ${{ github.workspace }}
+  ANDROID_E2E_APK_ARTIFACT: csharp-android-e2e-apk-${{ github.run_id }}-${{ github.run_attempt }}
+  ANDROID_RENDEZVOUS_ARTIFACT: csharp-android-zt-rendezvous-${{ github.run_id }}-${{ github.run_attempt }}
+  ANDROID_CLIENT_RESULT_ARTIFACT: csharp-android-zt-client-result-${{ github.run_id }}-${{ github.run_attempt }}
+
+jobs:
+  build:
+    name: Build C# Android arm64-v8a
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up .NET Android workload
+        uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+          workloads: android
+
+      - name: Resolve Android native cache key
+        id: native-key
+        shell: bash
+        run: |
+          set -euo pipefail
+          libzt="$(git ls-tree HEAD external/libzt | awk '{print $3}')"
+          cmake="$(git hash-object CMakeLists.txt)"
+          script="$(git hash-object tools/build_android_native.py)"
+          patch1="$(git hash-object patches/libzt/0001-host-network-change-refresh.patch)"
+          patch2="$(git hash-object patches/libzt/0002-android-pinvoke.patch)"
+          ndk_revision="$(awk -F= '/Pkg.Revision/ {gsub(/ /, "", $2); print $2}' "$ANDROID_NDK_HOME/source.properties")"
+          echo "ndk_revision=$ndk_revision" >> "$GITHUB_OUTPUT"
+          echo "key=libzt-pinvoke-android-arm64-${ndk_revision}-${libzt}-${cmake}-${script}-${patch1}-${patch2}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore compiled Android libzt bundle
+        id: native-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: native-cache/android-arm64
+          key: ${{ steps.native-key.outputs.key }}
+
+      - name: Set up sccache
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: "v0.18.0"
+
+      - name: Build Android arm64-v8a libzt on cache miss
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        run: >
+          python tools/build_android_native.py
+          --ndk "$ANDROID_NDK_HOME"
+          --api 24
+          --abi arm64-v8a
+          --use-sccache
+          --output native-cache/android-arm64/libzt.so
+
+      - name: Verify Android native bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f native-cache/android-arm64/libzt.so
+          file native-cache/android-arm64/libzt.so | tee native-cache/android-arm64/file.txt
+          grep -Eq 'ARM aarch64|ARM64|AArch64' native-cache/android-arm64/file.txt
+          if [[ -f native-cache/android-arm64/libzt.so.manifest.json ]]; then
+            cat native-cache/android-arm64/libzt.so.manifest.json
+          fi
+
+      - name: Save compiled Android libzt bundle immediately
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: native-cache/android-arm64
+          key: ${{ steps.native-key.outputs.key }}
+
+      - name: Publish Android application
+        run: >
+          dotnet publish src-csharp/NetLoop.Android/NetLoop.Android.csproj
+          --configuration Release
+          --framework net10.0-android36.0
+          --runtime android-arm64
+          -p:LibztNativePath="$PWD/native-cache/android-arm64/libzt.so"
+          -p:AndroidPackageFormat=apk
+
+      - name: Verify APK architecture and native library
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist-android
+          apk="$(find src-csharp/NetLoop.Android/bin/Release/net10.0-android36.0/android-arm64 -type f -name '*-Signed.apk' -print -quit)"
+          if [[ -z "$apk" ]]; then
+            apk="$(find src-csharp/NetLoop.Android/bin/Release/net10.0-android36.0/android-arm64 -type f -name '*.apk' -print -quit)"
+          fi
+          test -n "$apk"
+          cp "$apk" dist-android/netloop-android-arm64.apk
+          unzip -Z1 "$apk" | tee dist-android/apk-contents.txt
+          grep -q '^lib/arm64-v8a/libzt.so$' dist-android/apk-contents.txt
+          abis="$(awk -F/ '$1 == "lib" {print $2}' dist-android/apk-contents.txt | sort -u | paste -sd, -)"
+          test "$abis" = "arm64-v8a"
+          echo "APK_ABIS=$abis"
+
+      - name: Upload Android arm64 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: csharp-android-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist-android/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Publish CI automation APK
+        run: >
+          dotnet publish src-csharp/NetLoop.Android/NetLoop.Android.csproj
+          --configuration Release
+          --framework net10.0-android36.0
+          --runtime android-arm64
+          -p:LibztNativePath="$PWD/native-cache/android-arm64/libzt.so"
+          -p:AndroidPackageFormat=apk
+          -p:NetLoopCiAutomation=true
+          -p:AndroidDebuggable=true
+
+      - name: Collect CI automation APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist-android-e2e
+          apk="$(find src-csharp/NetLoop.Android/bin/Release/net10.0-android36.0/android-arm64 -type f -name '*-Signed.apk' -print -quit)"
+          if [[ -z "$apk" ]]; then
+            apk="$(find src-csharp/NetLoop.Android/bin/Release/net10.0-android36.0/android-arm64 -type f -name '*.apk' -print -quit)"
+          fi
+          test -n "$apk"
+          cp "$apk" dist-android-e2e/netloop-android-arm64-ci.apk
+          unzip -Z1 "$apk" | tee dist-android-e2e/apk-contents.txt
+          grep -q '^lib/arm64-v8a/libzt.so$' dist-android-e2e/apk-contents.txt
+          abis="$(awk -F/ '$1 == "lib" {print $2}' dist-android-e2e/apk-contents.txt | sort -u | paste -sd, -)"
+          test "$abis" = "arm64-v8a"
+
+      - name: Upload Android CI automation APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ANDROID_E2E_APK_ARTIFACT }}
+          path: dist-android-e2e/
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Build summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### C# Android arm64-v8a build"
+            echo "- NDK: ${{ steps.native-key.outputs.ndk_revision }}"
+            echo "- native bundle cache hit: ${{ steps.native-cache.outputs.cache-hit }}"
+            if [[ -f native-cache/android-arm64/libzt.so.manifest.json ]]; then
+              echo '~~~json'
+              cat native-cache/android-arm64/libzt.so.manifest.json
+              echo '~~~'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  e2e-server:
+    name: Android E2E Linux exit/server
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+
+      - name: Resolve Linux server native cache key
+        id: native-key
+        shell: bash
+        run: |
+          set -euo pipefail
+          libzt="$(git ls-tree HEAD external/libzt | awk '{print $3}')"
+          cmake="$(git hash-object CMakeLists.txt)"
+          script="$(git hash-object tools/build_csharp.py)"
+          patch="$(git hash-object patches/libzt/0001-host-network-change-refresh.patch)"
+          echo "key=libzt-pinvoke-linux-x64-${libzt}-${cmake}-${script}-${patch}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Linux server native bundle
+        id: native-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: native-cache
+          key: ${{ steps.native-key.outputs.key }}
+
+      - name: Set up sccache
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: "v0.18.0"
+
+      - name: Build Linux server native bundle on cache miss
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        run: >
+          python tools/build_csharp.py
+          --native-only
+          --use-sccache
+          --native-output native-cache/libzt.so
+
+      - name: Save Linux server native bundle
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: native-cache
+          key: ${{ steps.native-key.outputs.key }}
+
+      - name: Publish Linux E2E server runtime
+        run: >
+          python tools/build_csharp.py
+          --managed-only
+          --native-input native-cache/libzt.so
+          --output runtime-csharp
+          --runtime linux-x64
+
+      - name: Prepare Android E2E exit
+        run: >
+          python ci/csharp_e2e_server.py prepare
+          --runtime runtime-csharp
+          --overlay-port 42242
+          --overlay-udp-port 42243
+
+      - name: Publish Android rendezvous
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ANDROID_RENDEZVOUS_ARTIFACT }}
+          path: evidence/csharp-server/rendezvous.json
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Hold server until Android client finishes
+        run: >
+          python ci/csharp_e2e_server.py hold
+          --client-artifact "${{ env.ANDROID_CLIENT_RESULT_ARTIFACT }}"
+          --timeout 1200
+
+      - name: Preserve Android E2E server evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: csharp-android-server-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/csharp-server/
+          if-no-files-found: warn
+          retention-days: 14
+
+  e2e-client:
+    name: Android arm64 APK E2E client
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ANDROID_E2E_APK_ARTIFACT }}
+          path: package
+
+      - name: Enable KVM
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Android arm64 APK cross-machine E2E
+        id: e2e
+        continue-on-error: true
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_5
+          emulator-options: >-
+            -no-snapshot-save -no-window -gpu swiftshader_indirect
+            -noaudio -no-boot-anim -camera-back none -camera-front none
+          disable-animations: true
+          script: >-
+            python ci/android_e2e_client.py
+            --apk package/netloop-android-arm64-ci.apk
+            --rendezvous-artifact "${{ env.ANDROID_RENDEZVOUS_ARTIFACT }}"
+            --reset-cycles 3
+
+      - name: Ensure Android client result exists
+        if: always()
+        shell: bash
+        env:
+          E2E_OUTCOME: ${{ steps.e2e.outcome }}
+        run: |
+          set -euo pipefail
+          mkdir -p evidence/android-client
+          if [[ ! -f evidence/android-client/result.json ]]; then
+            python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          Path('evidence/android-client/result.json').write_text(
+              json.dumps({
+                  'success': False,
+                  'error_type': 'AndroidEmulatorStepFailed',
+                  'error': f"android-emulator-runner outcome={os.environ.get('E2E_OUTCOME', 'unknown')}",
+              }, indent=2),
+              encoding='utf-8',
+          )
+          PY
+          fi
+
+      - name: Publish Android reset timing summary
+        if: always()
+        shell: bash
+        run: |
+          path="evidence/android-client/reset_timing.tsv"
+          if [[ -f "$path" ]]; then
+            {
+              echo '### Android runtime reset timing'
+              echo '~~~text'
+              cat "$path"
+              echo '~~~'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Publish Android client result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ANDROID_CLIENT_RESULT_ARTIFACT }}
+          path: evidence/android-client/result.json
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Preserve Android client evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: csharp-android-client-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/android-client/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Fail job when Android E2E failed
+        if: steps.e2e.outcome != 'success'
+        run: python -c "raise SystemExit('Android E2E failed; inspect Android evidence artifacts')"

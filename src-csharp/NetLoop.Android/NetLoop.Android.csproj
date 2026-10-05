@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-android36.0</TargetFramework>
+    <SupportedOSPlatformVersion>24</SupportedOSPlatformVersion>
+    <OutputType>Exe</OutputType>
+    <ApplicationId>com.libzt.netloop</ApplicationId>
+    <ApplicationTitle>NetLoop</ApplicationTitle>
+    <ApplicationVersion>1</ApplicationVersion>
+    <ApplicationDisplayVersion>0.1.0</ApplicationDisplayVersion>
+    <RuntimeIdentifier>android-arm64</RuntimeIdentifier>
+    <AndroidPackageFormat>apk</AndroidPackageFormat>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(NetLoopCiAutomation)' == 'true'">
+    <DefineConstants>$(DefineConstants);NETLOOP_CI</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../NetLoop.Core/NetLoop.Core.csproj" />
+    <ProjectReference Include="../NetLoop.Libzt/NetLoop.Libzt.csproj" />
+    <ProjectReference Include="../NetLoop.Socks/NetLoop.Socks.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="../NetLoop.Host/HostOptions.cs" Link="SharedRuntime/HostOptions.cs" />
+    <Compile Include="../NetLoop.Host/NetLoopRuntime.cs" Link="SharedRuntime/NetLoopRuntime.cs" />
+    <Compile Include="../NetLoop.Host/OverlaySocksAgent.cs" Link="SharedRuntime/OverlaySocksAgent.cs" />
+    <Compile Include="../NetLoop.Host/OverlayUdpAgent.cs" Link="SharedRuntime/OverlayUdpAgent.cs" />
+    <Compile Include="../NetLoop.Host/RoutingConnector.cs" Link="SharedRuntime/RoutingConnector.cs" />
+    <Compile Include="../NetLoop.Host/RoutingUdpTransport.cs" Link="SharedRuntime/RoutingUdpTransport.cs" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(LibztNativePath)' != ''">
+    <AndroidNativeLibrary Include="$(LibztNativePath)" Abi="arm64-v8a" />
+  </ItemGroup>
+
+  <Target Name="RequireLibztNative" BeforeTargets="Build" Condition="'$(LibztNativePath)' == ''">
+    <Error Text="LibztNativePath must point to the arm64-v8a libzt.so built for Android." />
+  </Target>
+</Project>
