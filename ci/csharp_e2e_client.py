@@ -475,6 +475,7 @@ RESET_BUDGET_SECONDS = 3.0
 RESET_RETRY_INTERVAL_SECONDS = 0.05
 RESET_UDP_RESPONSE_SLICE_SECONDS = 0.20
 RESET_INTER_CYCLE_SETTLE_SECONDS = 1.0
+RESET_PRECONDITION_TIMEOUT_SECONDS = 5.0
 
 
 def nearest_rank_percentile(values: list[float], percentile: int) -> float | None:
@@ -489,6 +490,48 @@ def nearest_rank_percentile(values: list[float], percentile: int) -> float | Non
 
 def format_exception(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
+
+
+def open_negotiated_socks_sentinel(
+    proxy_port: int,
+    *,
+    timeout: float = RESET_PRECONDITION_TIMEOUT_SECONDS,
+) -> socket.socket:
+    deadline = time.monotonic() + timeout
+    last_error: Exception | None = None
+
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        attempt_timeout = min(1.0, max(0.1, remaining))
+        sock: socket.socket | None = None
+        try:
+            sock = socket.create_connection(
+                ("127.0.0.1", proxy_port),
+                timeout=attempt_timeout,
+            )
+            sock.settimeout(attempt_timeout)
+            sock.sendall(b"\x05\x01\x00")
+            if recv_exact(sock, 2) != b"\x05\x00":
+                raise RuntimeError(
+                    "stale SOCKS sentinel did not complete method negotiation"
+                )
+            sock.settimeout(0.05)
+            return sock
+        except Exception as exc:
+            last_error = exc
+            if sock is not None:
+                sock.close()
+
+        sleep_for = min(
+            RESET_RETRY_INTERVAL_SECONDS,
+            max(0.0, deadline - time.monotonic()),
+        )
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+
+    raise TimeoutError(
+        "local SOCKS precondition did not become healthy before reset"
+    ) from last_error
 
 
 def wait_for_old_runtime_abort(
@@ -573,17 +616,10 @@ def run_reset_stress(
 
         stale: socket.socket | None = None
         try:
-            stale = socket.create_connection(
-                ("127.0.0.1", proxy_port),
-                timeout=0.5,
-            )
-            stale.settimeout(0.5)
-            stale.sendall(b"\x05\x01\x00")
-            if recv_exact(stale, 2) != b"\x05\x00":
-                raise RuntimeError(
-                    "stale SOCKS sentinel did not complete method negotiation"
-                )
-            stale.settimeout(0.05)
+            # This is a precondition, not part of the recovery SLO. Do not
+            # start the reset clock until the local SOCKS runtime is known-good
+            # and the sentinel has entered an active handler.
+            stale = open_negotiated_socks_sentinel(proxy_port)
         except Exception as exc:
             if stale is not None:
                 stale.close()
