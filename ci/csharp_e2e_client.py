@@ -474,6 +474,7 @@ def wait_for_reset_ready(
 RESET_BUDGET_SECONDS = 3.0
 RESET_RETRY_INTERVAL_SECONDS = 0.05
 RESET_UDP_RESPONSE_SLICE_SECONDS = 0.20
+RESET_INTER_CYCLE_SETTLE_SECONDS = 1.0
 
 
 def nearest_rank_percentile(values: list[float], percentile: int) -> float | None:
@@ -900,6 +901,13 @@ def run_reset_stress(
             for thread in threads:
                 thread.join(timeout=0.05)
             rows.append(row)
+
+        if cycle < cycles:
+            # A stress cycle represents one completed physical-network change,
+            # not continuous sub-second interface flapping. Keep this delay
+            # outside the measured recovery budget so the next synthetic
+            # network-change event starts from a steady state.
+            time.sleep(RESET_INTER_CYCLE_SETTLE_SECONDS)
 
     write_reset_timing_matrix(rows)
 
