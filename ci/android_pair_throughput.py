@@ -104,6 +104,15 @@ def wait_for_boot(serial: str, timeout: float = 240) -> None:
 def create_second_emulator() -> tuple[str, subprocess.Popen[bytes]]:
     avdmanager = shutil.which("avdmanager")
     emulator = shutil.which("emulator")
+    if emulator is None:
+        sdk_root = (
+            os.environ.get("ANDROID_SDK_ROOT")
+            or os.environ.get("ANDROID_HOME")
+        )
+        if sdk_root:
+            candidate = Path(sdk_root) / "emulator" / "emulator"
+            if candidate.is_file():
+                emulator = str(candidate)
     if avdmanager is None or emulator is None:
         raise FileNotFoundError(
             f"Android tools unavailable: avdmanager={avdmanager}, emulator={emulator}"
