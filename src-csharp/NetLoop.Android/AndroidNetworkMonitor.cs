@@ -95,23 +95,6 @@ internal sealed class AndroidNetworkMonitor : ConnectivityManager.NetworkCallbac
             Schedule("android_default_network_lost");
     }
 
-    public override void OnLinkPropertiesChanged(
-        Network network,
-        LinkProperties linkProperties)
-    {
-        var identity = network.ToString();
-        lock (_gate)
-        {
-            if (!string.Equals(
-                    _defaultNetwork,
-                    identity,
-                    StringComparison.Ordinal))
-                return;
-        }
-
-        Schedule("android_link_properties_changed");
-    }
-
     private void Schedule(string reason)
     {
         if (Volatile.Read(ref _disposed) != 0
