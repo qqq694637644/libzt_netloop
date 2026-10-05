@@ -25,7 +25,6 @@ env:
   SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
   SCCACHE_BASEDIRS: ${{ github.workspace }}
   ANDROID_E2E_APK_ARTIFACT: csharp-android-e2e-apk-${{ github.run_id }}-${{ github.run_attempt }}
-  ANDROID_RENDEZVOUS_ARTIFACT: csharp-android-zt-rendezvous-${{ github.run_id }}-${{ github.run_attempt }}
   ANDROID_CLIENT_RESULT_ARTIFACT: csharp-android-zt-client-result-${{ github.run_id }}-${{ github.run_attempt }}
 
 jobs:
@@ -185,8 +184,9 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-  e2e-server:
-    name: Android E2E Linux exit/server
+  e2e-client:
+    name: Android arm64 APK E2E client
+    needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     env:
@@ -202,8 +202,8 @@ jobs:
         with:
           global-json-file: global.json
 
-      - name: Resolve Linux server native cache key
-        id: native-key
+      - name: Resolve Linux peer native cache key
+        id: linux-native-key
         shell: bash
         run: |
           set -euo pipefail
@@ -213,35 +213,35 @@ jobs:
           patch="$(git hash-object patches/libzt/0001-host-network-change-refresh.patch)"
           echo "key=libzt-pinvoke-linux-x64-${libzt}-${cmake}-${script}-${patch}" >> "$GITHUB_OUTPUT"
 
-      - name: Restore Linux server native bundle
-        id: native-cache
+      - name: Restore Linux peer native bundle
+        id: linux-native-cache
         uses: actions/cache/restore@v4
         with:
           path: native-cache
-          key: ${{ steps.native-key.outputs.key }}
+          key: ${{ steps.linux-native-key.outputs.key }}
 
-      - name: Set up sccache
-        if: steps.native-cache.outputs.cache-hit != 'true'
+      - name: Set up sccache for Linux peer
+        if: steps.linux-native-cache.outputs.cache-hit != 'true'
         uses: mozilla-actions/sccache-action@v0.0.11
         with:
           version: "v0.18.0"
 
-      - name: Build Linux server native bundle on cache miss
-        if: steps.native-cache.outputs.cache-hit != 'true'
+      - name: Build Linux peer native bundle on cache miss
+        if: steps.linux-native-cache.outputs.cache-hit != 'true'
         run: >
           python tools/build_csharp.py
           --native-only
           --use-sccache
           --native-output native-cache/libzt.so
 
-      - name: Save Linux server native bundle
-        if: steps.native-cache.outputs.cache-hit != 'true'
+      - name: Save Linux peer native bundle
+        if: steps.linux-native-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: native-cache
-          key: ${{ steps.native-key.outputs.key }}
+          key: ${{ steps.linux-native-key.outputs.key }}
 
-      - name: Publish Linux E2E server runtime
+      - name: Publish Linux peer runtime
         run: >
           python tools/build_csharp.py
           --managed-only
@@ -249,49 +249,8 @@ jobs:
           --output runtime-csharp
           --runtime linux-x64
 
-      - name: Prepare Android E2E exit
-        run: >
-          python ci/csharp_e2e_server.py prepare
-          --runtime runtime-csharp
-          --overlay-port 42242
-          --overlay-udp-port 42243
-
-      - name: Publish Android rendezvous
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.ANDROID_RENDEZVOUS_ARTIFACT }}
-          path: evidence/csharp-server/rendezvous.json
-          if-no-files-found: error
-          retention-days: 2
-
-      - name: Hold server until Android client finishes
-        run: >
-          python ci/csharp_e2e_server.py hold
-          --client-artifact "${{ env.ANDROID_CLIENT_RESULT_ARTIFACT }}"
-          --timeout 1200
-
-      - name: Preserve Android E2E server evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: csharp-android-server-evidence-${{ github.run_id }}-${{ github.run_attempt }}
-          path: evidence/csharp-server/
-          if-no-files-found: warn
-          retention-days: 14
-
-  e2e-client:
-    name: Android arm64 APK E2E client
-    needs: build
-    runs-on: ubuntu-24.04
-    timeout-minutes: 35
-    env:
-      GITHUB_TOKEN: ${{ github.token }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      - name: Make Linux peer executable
+        run: chmod +x runtime-csharp/netloop
 
       - uses: actions/download-artifact@v4
         with:
@@ -306,7 +265,7 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
-      - name: Android arm64 APK cross-machine E2E
+      - name: Android arm64 APK E2E
         id: e2e
         continue-on-error: true
         uses: reactivecircus/android-emulator-runner@v2
@@ -319,11 +278,20 @@ jobs:
             -no-snapshot-save -no-window -gpu swiftshader_indirect
             -noaudio -no-boot-anim -camera-back none -camera-front none
           disable-animations: true
-          script: >-
-            python ci/android_e2e_client.py
-            --apk package/netloop-android-arm64-ci.apk
-            --rendezvous-artifact "${{ env.ANDROID_RENDEZVOUS_ARTIFACT }}"
-            --reset-cycles 3
+          script: |
+            set -euo pipefail
+            cleanup() {
+              python ci/csharp_e2e_server.py cleanup || true
+            }
+            trap cleanup EXIT
+            python ci/csharp_e2e_server.py prepare \
+              --runtime runtime-csharp \
+              --overlay-port 42242 \
+              --overlay-udp-port 42243
+            python ci/android_e2e_client.py \
+              --apk package/netloop-android-arm64-ci.apk \
+              --rendezvous-file evidence/csharp-server/rendezvous.json \
+              --reset-cycles 3
 
       - name: Ensure Android client result exists
         if: always()
@@ -378,6 +346,15 @@ jobs:
         with:
           name: csharp-android-client-evidence-${{ github.run_id }}-${{ github.run_attempt }}
           path: evidence/android-client/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Preserve Android Linux peer evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: csharp-android-server-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/csharp-server/
           if-no-files-found: warn
           retention-days: 14
 

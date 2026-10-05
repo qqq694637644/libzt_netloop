@@ -235,6 +235,17 @@ def hold(args: argparse.Namespace) -> int:
     return exit_code
 
 
+def cleanup(_args: argparse.Namespace) -> int:
+    collect_windows_evidence(EVIDENCE / "network")
+    if PIDS.exists():
+        pids = json.loads(PIDS.read_text(encoding="utf-8"))
+        kill_process_tree(int(pids.get("netloop_pid", 0)))
+        kill_process_tree(int(pids.get("http_pid", 0)))
+        kill_process_tree(int(pids.get("udp_pid", 0)))
+        kill_process_tree(int(pids.get("upstream_pid", 0)))
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -253,10 +264,15 @@ def main() -> int:
     wait = subparsers.add_parser("hold")
     wait.add_argument("--client-artifact", required=True)
     wait.add_argument("--timeout", type=float, default=600)
+    subparsers.add_parser("cleanup")
 
     args = parser.parse_args()
     try:
-        return prepare(args) if args.command == "prepare" else hold(args)
+        if args.command == "prepare":
+            return prepare(args)
+        if args.command == "hold":
+            return hold(args)
+        return cleanup(args)
     except Exception:
         EVIDENCE.mkdir(parents=True, exist_ok=True)
         (EVIDENCE / f"{args.command}_failure.txt").write_text(

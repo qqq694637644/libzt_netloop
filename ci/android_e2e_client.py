@@ -542,7 +542,9 @@ def run_reset_stress(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--apk", required=True)
-    parser.add_argument("--rendezvous-artifact", required=True)
+    rendezvous_source = parser.add_mutually_exclusive_group(required=True)
+    rendezvous_source.add_argument("--rendezvous-artifact")
+    rendezvous_source.add_argument("--rendezvous-file")
     parser.add_argument("--listen-port", type=int, default=19080)
     parser.add_argument("--reset-cycles", type=int, default=3)
     args = parser.parse_args()
@@ -565,18 +567,28 @@ def main() -> int:
     }
 
     try:
-        rendezvous_dir = EVIDENCE / "rendezvous"
-        wait_and_download(
-            args.rendezvous_artifact,
-            rendezvous_dir,
-            timeout=900,
-        )
-        files = list(rendezvous_dir.rglob("rendezvous.json"))
-        if not files:
-            raise FileNotFoundError(
-                "Android rendezvous artifact did not contain rendezvous.json"
+        if args.rendezvous_file:
+            rendezvous_path = Path(args.rendezvous_file).resolve()
+            if not rendezvous_path.exists():
+                raise FileNotFoundError(rendezvous_path)
+            rendezvous = json.loads(
+                rendezvous_path.read_text(encoding="utf-8")
             )
-        rendezvous = json.loads(files[0].read_text(encoding="utf-8"))
+        else:
+            rendezvous_dir = EVIDENCE / "rendezvous"
+            wait_and_download(
+                args.rendezvous_artifact,
+                rendezvous_dir,
+                timeout=900,
+            )
+            files = list(rendezvous_dir.rglob("rendezvous.json"))
+            if not files:
+                raise FileNotFoundError(
+                    "Android rendezvous artifact did not contain rendezvous.json"
+                )
+            rendezvous = json.loads(
+                files[0].read_text(encoding="utf-8")
+            )
         result["rendezvous"] = rendezvous
 
         apk = Path(args.apk).resolve()
