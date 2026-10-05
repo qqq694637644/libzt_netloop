@@ -258,29 +258,59 @@ public sealed class MainActivity : Activity
 
     private void RestartNetLoopService()
     {
-        var stopIntent = new Intent(this, typeof(NetLoopService))
-            .SetAction(NetLoopService.ActionStop);
-        StartServiceCompat(stopIntent);
-        _ = StartAfterStopAsync();
+        var serviceIntent = new Intent(this, typeof(NetLoopService));
+        var wasRunning = StopService(serviceIntent);
+        if (!wasRunning)
+        {
+            StartNetLoopService();
+            return;
+        }
+
+        _ = StartAfterProcessExitAsync();
     }
 
-    private async Task StartAfterStopAsync()
+    private async Task StartAfterProcessExitAsync()
     {
         try
         {
-            // The runtime lives in a dedicated process. Give the explicit stop
-            // enough time to destroy that process before starting a new one so
-            // the new service always reads the just-written config snapshot.
-            await Task.Delay(TimeSpan.FromSeconds(1)).ConfigureAwait(true);
-            var startIntent = new Intent(this, typeof(NetLoopService))
-                .SetAction(NetLoopService.ActionStart);
-            StartServiceCompat(startIntent);
+            var deadline = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(5);
+            while (IsNetLoopProcessRunning())
+            {
+                if (DateTimeOffset.UtcNow >= deadline)
+                {
+                    throw new TimeoutException(
+                        "Timed out waiting for old NetLoop service process to exit.");
+                }
+
+                await Task.Delay(
+                    TimeSpan.FromMilliseconds(50)).ConfigureAwait(true);
+            }
+
+            StartNetLoopService();
         }
         catch (Exception ex)
         {
             if (_status is not null)
                 _status.Text = $"Unable to restart NetLoop: {ex.Message}";
         }
+    }
+
+    private void StartNetLoopService()
+    {
+        var startIntent = new Intent(this, typeof(NetLoopService))
+            .SetAction(NetLoopService.ActionStart);
+        StartServiceCompat(startIntent);
+    }
+
+    private bool IsNetLoopProcessRunning()
+    {
+        var manager = GetSystemService(ActivityService) as ActivityManager;
+        var processName = $"{PackageName}:netloop";
+        return manager?.RunningAppProcesses?.Any(
+                   process => string.Equals(
+                       process.ProcessName,
+                       processName,
+                       StringComparison.Ordinal)) == true;
     }
 
     private void StartServiceCompat(Intent intent)
@@ -293,10 +323,7 @@ public sealed class MainActivity : Activity
 
     private void StopNetLoop()
     {
-        var intent = new Intent(this, typeof(NetLoopService))
-            .SetAction(NetLoopService.ActionStop);
-
-        StartServiceCompat(intent);
+        StopService(new Intent(this, typeof(NetLoopService)));
 
         if (_status is not null)
             _status.Text = "NetLoop foreground service stop requested.";

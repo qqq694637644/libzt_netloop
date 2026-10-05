@@ -29,8 +29,6 @@ public sealed class NetLoopService : Service
 #if NETLOOP_CI
     private Channel<string>? _ciResets;
 #endif
-    private int _explicitStop;
-
     public override void OnCreate()
     {
         base.OnCreate();
@@ -47,7 +45,6 @@ public sealed class NetLoopService : Service
                 ActionStop,
                 StringComparison.Ordinal))
         {
-            Interlocked.Exchange(ref _explicitStop, 1);
             EnsureForeground("Stopping NetLoop...");
             _stop?.Cancel();
             StopSelf();
@@ -212,7 +209,6 @@ public sealed class NetLoopService : Service
                 stack = ex.StackTrace
             });
             UpdateNotification($"NetLoop stopped: {ex.Message}");
-            Interlocked.Exchange(ref _explicitStop, 1);
             StopSelf();
         }
     }
@@ -290,14 +286,11 @@ public sealed class NetLoopService : Service
         StopForeground(StopForegroundFlags.Remove);
         base.OnDestroy();
 
-        if (Volatile.Read(ref _explicitStop) != 0)
-        {
-            // libzt documents node_free as process-final. The foreground
-            // service runs in its own process so an explicit user stop can
-            // terminate that process without killing the configuration UI.
-            global::Android.OS.Process.KillProcess(
-                global::Android.OS.Process.MyPid());
-        }
+        // libzt documents node_free as process-final. This service owns the
+        // dedicated :netloop process, so once the service is destroyed there
+        // is no useful managed/native state to preserve in this process.
+        global::Android.OS.Process.KillProcess(
+            global::Android.OS.Process.MyPid());
     }
 
     public override global::Android.OS.IBinder? OnBind(Intent? intent)
