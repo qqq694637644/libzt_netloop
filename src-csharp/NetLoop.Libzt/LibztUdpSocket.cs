@@ -11,6 +11,8 @@ public sealed class LibztUdpSocket : IAsyncDisposable
 {
     private const int SocketAddressBufferSize = 128;
     private const int MaxDatagramSize = 65_535;
+    private static readonly TimeSpan IoPollInterval =
+        TimeSpan.FromMilliseconds(10);
 
     private readonly SemaphoreSlim _sendLock = new(1, 1);
     private int _fd;
@@ -42,11 +44,11 @@ public sealed class LibztUdpSocket : IAsyncDisposable
             if (bind != LibztNative.Ok)
                 throw new LibztException("zts_bind(udp)", bind, LibztNative.GetLastSocketError(fd));
 
-            var timeout = LibztNative.SetReceiveTimeout(fd, 1, 0);
-            if (timeout != LibztNative.Ok)
+            var nonBlocking = LibztNative.SetBlocking(fd, 0);
+            if (nonBlocking != LibztNative.Ok)
                 throw new LibztException(
-                    "zts_set_recv_timeout(udp)",
-                    timeout,
+                    "zts_set_blocking(udp)",
+                    nonBlocking,
                     LibztNative.GetLastSocketError(fd));
 
             return new LibztUdpSocket(fd, bindAddress, bindPort);
@@ -69,26 +71,28 @@ public sealed class LibztUdpSocket : IAsyncDisposable
         await _sendLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await Task.Run(() => {
-                cancellationToken.ThrowIfCancellationRequested();
-                var fd = GetFd();
-                var bytes = payload.ToArray();
-                var payloadHandle = GCHandle.Alloc(bytes, GCHandleType.Pinned);
-                var address = Marshal.AllocHGlobal(SocketAddressBufferSize);
-                try
+            cancellationToken.ThrowIfCancellationRequested();
+            var bytes = payload.ToArray();
+            var payloadHandle = GCHandle.Alloc(bytes, GCHandleType.Pinned);
+            var address = Marshal.AllocHGlobal(SocketAddressBufferSize);
+            try
+            {
+                uint addressLength = SocketAddressBufferSize;
+                var convert = LibztNative.IpStringToSocketAddress(
+                    remoteEndPoint.Address.ToString(),
+                    checked((ushort)remoteEndPoint.Port),
+                    address,
+                    ref addressLength);
+                if (convert != LibztNative.Ok)
+                    throw new LibztException("zts_util_ipstr_to_saddr", convert, LibztNative.GetErrno());
+
+                if (addressLength > ushort.MaxValue)
+                    throw new InvalidOperationException($"libzt sockaddr length is invalid: {addressLength}");
+
+                while (true)
                 {
-                    uint addressLength = SocketAddressBufferSize;
-                    var convert = LibztNative.IpStringToSocketAddress(
-                        remoteEndPoint.Address.ToString(),
-                        checked((ushort)remoteEndPoint.Port),
-                        address,
-                        ref addressLength);
-                    if (convert != LibztNative.Ok)
-                        throw new LibztException("zts_util_ipstr_to_saddr", convert, LibztNative.GetErrno());
-
-                    if (addressLength > ushort.MaxValue)
-                        throw new InvalidOperationException($"libzt sockaddr length is invalid: {addressLength}");
-
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var fd = GetFd();
                     var sent = LibztNative.SendTo(
                         fd,
                         payloadHandle.AddrOfPinnedObject(),
@@ -96,17 +100,27 @@ public sealed class LibztUdpSocket : IAsyncDisposable
                         0,
                         address,
                         checked((ushort)addressLength));
-                    if (sent < 0)
-                        throw new LibztException("zts_bsd_sendto", sent, LibztNative.GetErrno());
-                    if (sent != bytes.Length)
-                        throw new IOException($"libzt UDP partial send: requested={bytes.Length}, sent={sent}");
+                    if (sent >= 0)
+                    {
+                        if (sent != bytes.Length)
+                            throw new IOException($"libzt UDP partial send: requested={bytes.Length}, sent={sent}");
+                        return;
+                    }
+
+                    var errno = LibztNative.GetErrno();
+                    if (!IsTransientIoError(errno))
+                        throw new LibztException("zts_bsd_sendto", sent, errno);
+
+                    await Task.Delay(
+                        IoPollInterval,
+                        cancellationToken).ConfigureAwait(false);
                 }
-                finally
-                {
-                    Marshal.FreeHGlobal(address);
-                    payloadHandle.Free();
-                }
-            }, CancellationToken.None).ConfigureAwait(false);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(address);
+                payloadHandle.Free();
+            }
         }
         finally
         {
@@ -116,52 +130,46 @@ public sealed class LibztUdpSocket : IAsyncDisposable
 
     public async ValueTask<LibztUdpDatagram> ReceiveFromAsync(CancellationToken cancellationToken)
     {
-        while (true)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var result = await Task.Run(
-                () => ReceiveOne(cancellationToken),
-                CancellationToken.None).ConfigureAwait(false);
-            if (result is not null)
-                return result;
-        }
-    }
-
-    private LibztUdpDatagram? ReceiveOne(CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        var fd = GetFd();
-        var bytes = new byte[MaxDatagramSize];
-        var payloadHandle = GCHandle.Alloc(bytes, GCHandleType.Pinned);
+        var buffer = Marshal.AllocHGlobal(MaxDatagramSize);
         var address = Marshal.AllocHGlobal(SocketAddressBufferSize);
         var addressLengthPointer = Marshal.AllocHGlobal(sizeof(uint));
+        var text = Marshal.AllocHGlobal(LibztNative.IpStringLength);
         try
         {
-            Marshal.WriteInt32(addressLengthPointer, SocketAddressBufferSize);
-            var received = LibztNative.ReceiveFrom(
-                fd,
-                payloadHandle.AddrOfPinnedObject(),
-                checked((uint)bytes.Length),
-                0,
-                address,
-                addressLengthPointer);
-
-            if (received < 0)
+            while (true)
             {
-                var errno = LibztNative.GetErrno();
-                if (IsTransientReceiveError(errno))
-                    return null;
+                cancellationToken.ThrowIfCancellationRequested();
+                var fd = GetFd();
+                Marshal.WriteInt32(
+                    addressLengthPointer,
+                    SocketAddressBufferSize);
+                var received = LibztNative.ReceiveFrom(
+                    fd,
+                    buffer,
+                    checked((uint)MaxDatagramSize),
+                    0,
+                    address,
+                    addressLengthPointer);
 
-                if (cancellationToken.IsCancellationRequested)
-                    throw new OperationCanceledException(cancellationToken);
+                if (received < 0)
+                {
+                    var errno = LibztNative.GetErrno();
+                    if (IsTransientIoError(errno))
+                    {
+                        await Task.Delay(
+                            IoPollInterval,
+                            cancellationToken).ConfigureAwait(false);
+                        continue;
+                    }
 
-                throw new LibztException("zts_bsd_recvfrom", received, errno);
-            }
+                    if (cancellationToken.IsCancellationRequested)
+                        throw new OperationCanceledException(cancellationToken);
 
-            var addressLength = checked((uint)Marshal.ReadInt32(addressLengthPointer));
-            var text = Marshal.AllocHGlobal(LibztNative.IpStringLength);
-            try
-            {
+                    throw new LibztException("zts_bsd_recvfrom", received, errno);
+                }
+
+                var addressLength = checked(
+                    (uint)Marshal.ReadInt32(addressLengthPointer));
                 ushort port = 0;
                 var convert = LibztNative.SocketAddressToString(
                     address,
@@ -174,25 +182,23 @@ public sealed class LibztUdpSocket : IAsyncDisposable
 
                 var ipText = Marshal.PtrToStringAnsi(text)
                     ?? throw new IOException("libzt returned an empty UDP source address.");
-                var payload = bytes.AsSpan(0, received).ToArray();
+                var payload = new byte[received];
+                Marshal.Copy(buffer, payload, 0, received);
                 return new LibztUdpDatagram(
                     new IPEndPoint(IPAddress.Parse(ipText), port),
                     payload);
             }
-            finally
-            {
-                Marshal.FreeHGlobal(text);
-            }
         }
         finally
         {
+            Marshal.FreeHGlobal(text);
             Marshal.FreeHGlobal(addressLengthPointer);
             Marshal.FreeHGlobal(address);
-            payloadHandle.Free();
+            Marshal.FreeHGlobal(buffer);
         }
     }
 
-    private static bool IsTransientReceiveError(int errno)
+    private static bool IsTransientIoError(int errno)
         => errno is LibztNative.EAgain
             or LibztNative.ETimedOut
             or LibztNative.WindowsETimedOut
@@ -203,7 +209,10 @@ public sealed class LibztUdpSocket : IAsyncDisposable
         var fd = Interlocked.Exchange(ref _fd, -1);
         if (fd >= 0)
             _ = LibztNative.Close(fd);
-        _sendLock.Dispose();
+        // Reset can close this socket while an in-flight SendToAsync is
+        // unwinding. Its finally block still calls Release(), so disposing the
+        // semaphore here creates a release-after-dispose race. It owns no
+        // native socket resource and can be left for GC.
         return ValueTask.CompletedTask;
     }
 

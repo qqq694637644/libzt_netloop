@@ -5,6 +5,9 @@ namespace NetLoop.Libzt;
 
 public sealed class LibztTcpListener : IAsyncDisposable
 {
+    private static readonly TimeSpan AcceptPollInterval =
+        TimeSpan.FromMilliseconds(20);
+
     private int _fd;
 
     private LibztTcpListener(int fd, string bindAddress, ushort port)
@@ -35,6 +38,13 @@ public sealed class LibztTcpListener : IAsyncDisposable
             if (listen != LibztNative.Ok)
                 throw new LibztException("zts_bsd_listen", listen, LibztNative.GetLastSocketError(fd));
 
+            var nonBlocking = LibztNative.SetBlocking(fd, 0);
+            if (nonBlocking != LibztNative.Ok)
+                throw new LibztException(
+                    "zts_set_blocking(listener)",
+                    nonBlocking,
+                    LibztNative.GetLastSocketError(fd));
+
             JsonLog.Info("libzt_tcp_listener_ready", new { address = bindAddress, port, backlog });
             return new LibztTcpListener(fd, bindAddress, port);
         }
@@ -47,47 +57,68 @@ public sealed class LibztTcpListener : IAsyncDisposable
 
     public async ValueTask<LibztTcpConnection> AcceptAsync(CancellationToken cancellationToken)
     {
-        var fd = GetFd();
-        var accepted = await Task.Run(() => {
-            var buffer = Marshal.AllocHGlobal(LibztNative.IpStringLength);
-            try
-            {
-                ushort port = 0;
-                using var registration = cancellationToken.Register(
-                    static state => LibztNative.Shutdown((int)state!, LibztNative.ShutReadWrite),
-                    fd);
-
-                var result = LibztNative.AcceptEasy(fd, buffer, LibztNative.IpStringLength, ref port);
-                if (result < 0)
-                {
-                    if (cancellationToken.IsCancellationRequested)
-                        throw new OperationCanceledException(cancellationToken);
-
-                    throw new LibztException("zts_bsd_accept_easy", result, LibztNative.GetLastSocketError(fd));
-                }
-
-                var remote = Marshal.PtrToStringAnsi(buffer) ?? "unknown";
-                return (Socket: result, Remote: remote, Port: port);
-            }
-            finally
-            {
-                Marshal.FreeHGlobal(buffer);
-            }
-        }).ConfigureAwait(false);
-
+        var buffer = Marshal.AllocHGlobal(LibztNative.IpStringLength);
         try
         {
-            LibztTcpConnector.ConfigureStream(accepted.Socket);
-            return new LibztTcpConnection(
-                accepted.Socket,
-                $"libzt-accepted:{accepted.Remote}:{accepted.Port}");
+            while (true)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var fd = GetFd();
+                ushort port = 0;
+                var result = LibztNative.AcceptEasy(fd, buffer, LibztNative.IpStringLength, ref port);
+                if (result >= 0)
+                {
+                    try
+                    {
+                        var blocking = LibztNative.SetBlocking(result, 1);
+                        if (blocking != LibztNative.Ok)
+                        {
+                            throw new LibztException(
+                                "zts_set_blocking(accepted)",
+                                blocking,
+                                LibztNative.GetLastSocketError(result));
+                        }
+
+                        LibztTcpConnector.ConfigureStream(result);
+                        var remote = Marshal.PtrToStringAnsi(buffer) ?? "unknown";
+                        return new LibztTcpConnection(
+                            result,
+                            $"libzt-accepted:{remote}:{port}");
+                    }
+                    catch
+                    {
+                        _ = LibztNative.Close(result);
+                        throw;
+                    }
+                }
+
+                var errno = LibztNative.GetErrno();
+                var socketError = LibztNative.GetLastSocketError(fd);
+                if (IsWouldBlock(errno) || IsWouldBlock(socketError))
+                {
+                    await Task.Delay(
+                        AcceptPollInterval,
+                        cancellationToken).ConfigureAwait(false);
+                    continue;
+                }
+
+                if (cancellationToken.IsCancellationRequested)
+                    throw new OperationCanceledException(cancellationToken);
+
+                throw new LibztException(
+                    "zts_accept",
+                    result,
+                    socketError != 0 ? socketError : errno);
+            }
         }
-        catch
+        finally
         {
-            _ = LibztNative.Close(accepted.Socket);
-            throw;
+            Marshal.FreeHGlobal(buffer);
         }
     }
+
+    private static bool IsWouldBlock(int error)
+        => error is LibztNative.EAgain or LibztNative.WindowsEWouldBlock;
 
     public ValueTask DisposeAsync()
     {
