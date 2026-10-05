@@ -39,7 +39,7 @@ index 8aa0a72..765cbf3 100644
  {
      ACQUIRE_SERVICE(ZTS_ERR_SERVICE);
 diff --git a/src/NodeService.cpp b/src/NodeService.cpp
-index 036f406..a8da9f0 100644
+index 036f406..6887675 100644
 --- a/src/NodeService.cpp
 +++ b/src/NodeService.cpp
 @@ -182,6 +182,7 @@ NodeService::NodeService()
@@ -71,36 +71,46 @@ index 036f406..a8da9f0 100644
                  _run_m.unlock();
              }
  
-@@ -384,16 +386,22 @@ NodeService::ReasonForTermination NodeService::run()
+@@ -384,22 +386,28 @@ NodeService::ReasonForTermination NodeService::run()
                  _lastRestart = now;
                  restarted = true;
              }
-+            if (networkChanged) {
-+                _lastRestart = now;
-+                restarted = true;
-+            }
- 
-             // If secondary port is not configured to a constant value and we've been offline for a while,
-             // bind a new secondary port. This is a workaround for a "coma" issue caused by buggy NATs that stop
-             // working on one port after a while.
+-
+-            // If secondary port is not configured to a constant value and we've been offline for a while,
+-            // bind a new secondary port. This is a workaround for a "coma" issue caused by buggy NATs that stop
+-            // working on one port after a while.
 -            if (_node->online()) {
 -                lastOnline = now;
 -            }
 -            else if ((_secondaryPort == 0) && ((now - lastOnline) > ZT_PATH_HEARTBEAT_PERIOD)) {
 -                _secondaryPort = _getRandomPort(minPort, maxPort);
 -                lastBindRefresh = 0;
-+            if (_secondaryPort == 0) {
-+                if (_node->online()) {
-+                    lastOnline = now;
-+                }
-+                if (((now - lastOnline) > ZT_PATH_HEARTBEAT_PERIOD) || restarted) {
-+                    _ports[1] = _getRandomPort(minPort, maxPort);
-+                    lastOnline = now;
-+                }
++            if (networkChanged) {
++                _lastRestart = now;
++                restarted = true;
              }
  
              // Refresh bindings in case device's interfaces have changed,
-@@ -412,6 +420,23 @@ NodeService::ReasonForTermination NodeService::run()
+             // and also sync routes to update any shadow routes (e.g. shadow
+             // default)
+             if (((now - lastBindRefresh) >= ZT_BINDER_REFRESH_PERIOD) || (restarted)) {
++                // ZeroTierOne 5542dbcc0 moved secondary-port rotation into the
++                // binder refresh cadence so a node does not keep changing
++                // ports before the new mapping has had a chance to connect.
++                if (_secondaryPort == 0) {
++                    if (_node->online()) {
++                        lastOnline = now;
++                    }
++                    else if (((now - lastOnline) > (ZT_PEER_PING_PERIOD * 2)) || restarted) {
++                        lastOnline = now;
++                        _ports[1] = _getRandomPort(minPort, maxPort);
++                    }
++                }
++
+                 lastBindRefresh = now;
+                 unsigned int p[3] = { 0 };
+                 unsigned int pc = 0;
+@@ -412,6 +420,35 @@ NodeService::ReasonForTermination NodeService::run()
                      // Only bother binding UDP ports if we aren't forcing TCP-relay mode
                      _binder.refresh(_phy, p, pc, explicitBind, *this);
                  }
@@ -121,10 +131,22 @@ index 036f406..a8da9f0 100644
 +                std::vector<InetAddress> boundAddrs(_binder.allBoundLocalInterfaceAddresses());
 +                for (std::vector<InetAddress>::const_iterator i(boundAddrs.begin()); i != boundAddrs.end(); ++i)
 +                    _node->addLocalInterfaceAddress(reinterpret_cast<const struct sockaddr_storage*>(&(*i)));
++
++                // Older libzt exposes a narrower syncManagedStuff() than
++                // ZeroTierOne 1.12+, but re-running it here is the equivalent
++                // available hook for refreshing the virtual network state
++                // after physical bindings change.
++                {
++                    Mutex::Lock _l(_nets_m);
++                    for (std::map<uint64_t, NetworkState>::iterator n(_nets.begin()); n != _nets.end(); ++n) {
++                        if (n->second.tap)
++                            syncManagedStuff(n->second);
++                    }
++                }
              }
  
              // Generate callback messages for user application
-@@ -467,27 +492,6 @@ NodeService::ReasonForTermination NodeService::run()
+@@ -467,27 +504,6 @@ NodeService::ReasonForTermination NodeService::run()
                  }
              }
  
@@ -152,7 +174,7 @@ index 036f406..a8da9f0 100644
              // Clean peers.d periodically
              if ((now - lastCleanedPeersDb) >= 3600000) {
                  lastCleanedPeersDb = now;
-@@ -566,6 +570,19 @@ void NodeService::terminate()
+@@ -566,6 +582,19 @@ void NodeService::terminate()
      _phy.whack();
  }
  
