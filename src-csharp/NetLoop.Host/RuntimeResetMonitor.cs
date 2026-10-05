@@ -13,8 +13,10 @@ internal sealed class RuntimeResetMonitor : IAsyncDisposable
     private readonly Action<string> _requestReset;
     private readonly CancellationTokenSource _stop = new();
     private readonly object _debounceGate = new();
+    private readonly object _availabilityGate = new();
     private CancellationTokenSource? _debounceCts;
     private Task? _commandLoop;
+    private bool _networkAvailable;
     private int _started;
     private int _disposed;
 
@@ -36,8 +38,12 @@ internal sealed class RuntimeResetMonitor : IAsyncDisposable
         if (Interlocked.Exchange(ref _started, 1) != 0)
             throw new InvalidOperationException("Runtime reset monitor is already started.");
 
-        NetworkChange.NetworkAddressChanged += OnNetworkAddressChanged;
-        NetworkChange.NetworkAvailabilityChanged += OnNetworkAvailabilityChanged;
+        lock (_availabilityGate)
+        {
+            NetworkChange.NetworkAddressChanged += OnNetworkAddressChanged;
+            NetworkChange.NetworkAvailabilityChanged += OnNetworkAvailabilityChanged;
+            _networkAvailable = NetworkInterface.GetIsNetworkAvailable();
+        }
 
         if (_commandFile is not null)
             _commandLoop = CommandLoopAsync(_stop.Token);
@@ -54,10 +60,19 @@ internal sealed class RuntimeResetMonitor : IAsyncDisposable
     private void OnNetworkAvailabilityChanged(
         object? sender,
         NetworkAvailabilityEventArgs eventArgs)
-        => ScheduleNetworkReset(
+    {
+        lock (_availabilityGate)
+        {
+            if (_networkAvailable == eventArgs.IsAvailable)
+                return;
+            _networkAvailable = eventArgs.IsAvailable;
+        }
+
+        ScheduleNetworkReset(
             eventArgs.IsAvailable
                 ? "network_available"
                 : "network_unavailable");
+    }
 
     private void ScheduleNetworkReset(string reason)
     {
