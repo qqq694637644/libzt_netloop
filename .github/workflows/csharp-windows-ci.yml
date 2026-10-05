@@ -215,6 +215,18 @@ jobs:
           --reset-stress
           --reset-cycles 10
 
+      - name: Publish reset timing summary
+        if: always()
+        shell: pwsh
+        run: |
+          $path = "evidence/csharp-client/reset_timing.tsv"
+          if (Test-Path $path) {
+            "### Runtime reset timing" >> $env:GITHUB_STEP_SUMMARY
+            '```text' >> $env:GITHUB_STEP_SUMMARY
+            Get-Content $path >> $env:GITHUB_STEP_SUMMARY
+            '```' >> $env:GITHUB_STEP_SUMMARY
+          }
+
       - name: Publish client result for machine A
         if: always()
         uses: actions/upload-artifact@v4

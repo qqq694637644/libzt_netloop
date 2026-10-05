@@ -48,41 +48,42 @@ def socks_connect(
 ) -> socket.socket:
     sock = socket.create_connection((proxy_host, proxy_port), timeout=timeout)
     sock.settimeout(timeout)
-    sock.sendall(b"\x05\x01\x00")
-    if recv_exact(sock, 2) != b"\x05\x00":
-        sock.close()
-        raise RuntimeError("SOCKS5 method negotiation failed")
-
     try:
-        raw_ip = socket.inet_pton(socket.AF_INET, target_host)
-        request = b"\x05\x01\x00\x01" + raw_ip
-    except OSError:
+        sock.sendall(b"\x05\x01\x00")
+        if recv_exact(sock, 2) != b"\x05\x00":
+            raise RuntimeError("SOCKS5 method negotiation failed")
+
         try:
-            raw_ip = socket.inet_pton(socket.AF_INET6, target_host)
-            request = b"\x05\x01\x00\x04" + raw_ip
+            raw_ip = socket.inet_pton(socket.AF_INET, target_host)
+            request = b"\x05\x01\x00\x01" + raw_ip
         except OSError:
-            host = target_host.encode("idna")
-            request = b"\x05\x01\x00\x03" + bytes([len(host)]) + host
+            try:
+                raw_ip = socket.inet_pton(socket.AF_INET6, target_host)
+                request = b"\x05\x01\x00\x04" + raw_ip
+            except OSError:
+                host = target_host.encode("idna")
+                request = b"\x05\x01\x00\x03" + bytes([len(host)]) + host
 
-    request += struct.pack("!H", target_port)
-    sock.sendall(request)
+        request += struct.pack("!H", target_port)
+        sock.sendall(request)
 
-    header = recv_exact(sock, 4)
-    if header[0] != 5 or header[1] != 0:
+        header = recv_exact(sock, 4)
+        if header[0] != 5 or header[1] != 0:
+            raise RuntimeError(f"SOCKS5 CONNECT failed: {header.hex()}")
+
+        if header[3] == 1:
+            recv_exact(sock, 4)
+        elif header[3] == 3:
+            recv_exact(sock, recv_exact(sock, 1)[0])
+        elif header[3] == 4:
+            recv_exact(sock, 16)
+        else:
+            raise RuntimeError(f"invalid SOCKS5 reply address type: {header[3]}")
+        recv_exact(sock, 2)
+        return sock
+    except Exception:
         sock.close()
-        raise RuntimeError(f"SOCKS5 CONNECT failed: {header.hex()}")
-
-    if header[3] == 1:
-        recv_exact(sock, 4)
-    elif header[3] == 3:
-        recv_exact(sock, recv_exact(sock, 1)[0])
-    elif header[3] == 4:
-        recv_exact(sock, 16)
-    else:
-        sock.close()
-        raise RuntimeError(f"invalid SOCKS5 reply address type: {header[3]}")
-    recv_exact(sock, 2)
-    return sock
+        raise
 
 
 def encode_socks_target(host: str, port: int) -> bytes:
@@ -470,6 +471,120 @@ def wait_for_reset_ready(
     )
 
 
+RESET_BUDGET_SECONDS = 3.0
+RESET_PROBE_TIMEOUT_SECONDS = 0.30
+RESET_PROBE_INTERVAL_SECONDS = 0.05
+
+
+def nearest_rank_percentile(values: list[float], percentile: int) -> float | None:
+    if not values:
+        return None
+    if not 1 <= percentile <= 100:
+        raise ValueError(f"invalid percentile {percentile}")
+    ordered = sorted(values)
+    rank = ((len(ordered) * percentile) + 99) // 100
+    return ordered[max(0, rank - 1)]
+
+
+def format_exception(exc: BaseException) -> str:
+    return f"{type(exc).__name__}: {exc}"
+
+
+def run_reset_probe_loop(
+    *,
+    started: float,
+    deadline: float,
+    old_runtime_closed: threading.Event,
+    old_runtime_state: dict[str, object],
+    action,
+) -> dict[str, object]:
+    attempts = 0
+    pre_abort_successes = 0
+    last_error: str | None = None
+
+    while time.monotonic() < deadline:
+        attempt_started = time.monotonic()
+        remaining = deadline - attempt_started
+        if remaining <= 0:
+            break
+
+        attempts += 1
+        attempt_timeout = min(RESET_PROBE_TIMEOUT_SECONDS, remaining)
+        try:
+            action(attempt_timeout)
+        except Exception as exc:
+            last_error = format_exception(exc)
+        else:
+            closed_at = old_runtime_state.get("closed_at")
+            if (
+                old_runtime_closed.is_set()
+                and isinstance(closed_at, float)
+                and attempt_started >= closed_at
+            ):
+                return {
+                    "ok": True,
+                    "ms": (time.monotonic() - started) * 1000.0,
+                    "attempts": attempts,
+                    "pre_abort_successes": pre_abort_successes,
+                    "last_error": last_error,
+                }
+
+            pre_abort_successes += 1
+            last_error = "probe completed before old runtime abort"
+
+        sleep_for = min(
+            RESET_PROBE_INTERVAL_SECONDS,
+            max(0.0, deadline - time.monotonic()),
+        )
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+
+    return {
+        "ok": False,
+        "ms": None,
+        "attempts": attempts,
+        "pre_abort_successes": pre_abort_successes,
+        "last_error": last_error or "no successful post-abort probe before deadline",
+    }
+
+
+def write_reset_timing_matrix(rows: list[dict[str, object]]) -> None:
+    header = [
+        "cycle",
+        "old_close_ms",
+        "tcp_ms",
+        "udp_ms",
+        "tcp_attempts",
+        "udp_attempts",
+        "status_ms",
+        "result",
+        "errors",
+    ]
+    lines = ["\t".join(header)]
+    for row in rows:
+        errors = row.get("errors") or []
+        lines.append(
+            "\t".join(
+                [
+                    str(row["cycle"]),
+                    "" if row.get("old_close_ms") is None else f"{row['old_close_ms']:.1f}",
+                    "" if row.get("tcp_ms") is None else f"{row['tcp_ms']:.1f}",
+                    "" if row.get("udp_ms") is None else f"{row['udp_ms']:.1f}",
+                    str(row.get("tcp_attempts", 0)),
+                    str(row.get("udp_attempts", 0)),
+                    "" if row.get("status_ms") is None else f"{row['status_ms']:.1f}",
+                    "PASS" if row.get("passed") else "FAIL",
+                    " | ".join(str(value) for value in errors),
+                ]
+            )
+        )
+
+    payload = "\n".join(lines) + "\n"
+    (EVIDENCE / "reset_timing.tsv").write_text(payload, encoding="utf-8")
+    print("Reset timing matrix:")
+    print(payload, end="")
+
+
 def run_reset_stress(
     proxy_port: int,
     rendezvous: dict,
@@ -478,150 +593,280 @@ def run_reset_stress(
     initial_status: dict,
     cycles: int,
 ) -> dict:
-    current = initial_status
-    node_id = str(current["node_id"])
-    samples_ms: list[float] = []
+    node_id = str(initial_status["node_id"])
+    process_id = int(initial_status["process_id"])
+    initial_reset_count = int(initial_status.get("reset_count", 0))
+    last_ready_status = initial_status
+    rows: list[dict[str, object]] = []
 
     for iteration in range(cycles):
-        process_id = int(current["process_id"])
-        expected_reset_count = int(current.get("reset_count", 0)) + 1
+        cycle = iteration + 1
+        expected_reset_count = initial_reset_count + cycle
+        row: dict[str, object] = {
+            "cycle": cycle,
+            "expected_reset_count": expected_reset_count,
+            "old_close_ms": None,
+            "tcp_ms": None,
+            "udp_ms": None,
+            "tcp_attempts": 0,
+            "udp_attempts": 0,
+            "status_ms": None,
+            "status_ok": False,
+            "passed": False,
+            "errors": [],
+        }
 
-        stale = socket.create_connection(
-            ("127.0.0.1", proxy_port),
-            timeout=1.0,
-        )
-        stale.settimeout(0.1)
+        stale: socket.socket | None = None
+        try:
+            stale = socket.create_connection(
+                ("127.0.0.1", proxy_port),
+                timeout=0.5,
+            )
+            stale.settimeout(0.05)
+        except Exception as exc:
+            row["errors"].append(
+                f"stale precondition failed: {format_exception(exc)}"
+            )
+
         started = time.monotonic()
-        deadline = started + 3.0
+        deadline = started + RESET_BUDGET_SECONDS
         stale_closed = threading.Event()
         stale_state: dict[str, object] = {}
+        tcp_state: dict[str, object] = {}
+        udp_state: dict[str, object] = {}
 
         def watch_stale_connection() -> None:
+            if stale is None:
+                stale_state["error"] = "no stale connection was established"
+                return
+
             while time.monotonic() < deadline:
                 try:
                     payload = stale.recv(1)
                     if payload:
-                        stale_state["error"] = AssertionError(
+                        stale_state["error"] = (
                             "stale local SOCKS connection produced data during reset"
                         )
-                    else:
-                        stale_state["closed_at"] = time.monotonic()
+                        return
+
+                    closed_at = time.monotonic()
+                    stale_state["closed_at"] = closed_at
+                    row["old_close_ms"] = (closed_at - started) * 1000.0
                     stale_closed.set()
                     return
                 except socket.timeout:
                     continue
-                except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
-                    stale_state["closed_at"] = time.monotonic()
+                except (
+                    ConnectionResetError,
+                    ConnectionAbortedError,
+                    BrokenPipeError,
+                    OSError,
+                ):
+                    closed_at = time.monotonic()
+                    stale_state["closed_at"] = closed_at
+                    row["old_close_ms"] = (closed_at - started) * 1000.0
                     stale_closed.set()
                     return
 
-            stale_state["error"] = AssertionError(
+            stale_state["error"] = (
                 "stale local SOCKS connection was not discarded within recovery window"
             )
-            stale_closed.set()
 
-        stale_thread = threading.Thread(
-            target=watch_stale_connection,
-            name=f"netloop-stale-{iteration}",
-            daemon=True,
-        )
-        stale_thread.start()
-
-        try:
-            write_json_atomic(
-                reset_command_path,
-                {"Id": expected_reset_count, "Command": "reset"},
-            )
-
-            last_tcp_error: Exception | None = None
-            fresh_tcp_after_abort = False
-            while time.monotonic() < deadline:
-                remaining = deadline - time.monotonic()
-                try:
-                    verify_peer_local_service(
+        def probe_tcp() -> None:
+            tcp_state.update(
+                run_reset_probe_loop(
+                    started=started,
+                    deadline=deadline,
+                    old_runtime_closed=stale_closed,
+                    old_runtime_state=stale_state,
+                    action=lambda timeout: verify_peer_local_service(
                         proxy_port,
                         rendezvous["server_ip"],
                         int(rendezvous["local_service_port"]),
-                        timeout=max(0.1, remaining),
-                    )
-                    if stale_closed.is_set() and "error" not in stale_state:
-                        fresh_tcp_after_abort = True
-                        last_tcp_error = None
-                        break
-
-                    # A probe can race the reset and still reach the old
-                    # listener. Never count that as recovery; close it and
-                    # require a later fresh connection after old-runtime abort
-                    # is observable.
-                    last_tcp_error = RuntimeError(
-                        "fresh TCP completed before old runtime was discarded"
-                    )
-                except Exception as exc:
-                    last_tcp_error = exc
-
-                if time.monotonic() >= deadline:
-                    break
-                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
-
-            if not stale_closed.is_set():
-                stale_closed.wait(max(0.0, deadline - time.monotonic()))
-            if stale_state.get("error") is not None:
-                raise stale_state["error"]  # type: ignore[misc]
-            if not fresh_tcp_after_abort:
-                raise AssertionError(
-                    f"fresh TCP did not recover within 3s: {last_tcp_error}"
-                ) from last_tcp_error
-
-            payload = f"netloop-reset-{iteration}".encode("ascii")
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise AssertionError(
-                    f"runtime reset {iteration} exhausted 3s before fresh UDP"
+                        timeout=timeout,
+                    ),
                 )
-            with SocksUdpAssociation(
-                "127.0.0.1",
-                proxy_port,
-                timeout=max(0.1, remaining),
-            ) as association:
-                _, _, response = association.roundtrip(
-                    rendezvous["server_ip"],
-                    int(rendezvous["local_udp_service_port"]),
-                    payload,
-                    timeout=max(0.1, deadline - time.monotonic()),
-                )
-            if response != payload:
-                raise AssertionError(
-                    f"fresh UDP after reset {iteration} mismatched: {response!r}"
-                )
-        finally:
-            stale.close()
-            stale_thread.join(timeout=0.2)
-
-        elapsed_ms = (time.monotonic() - started) * 1000.0
-        samples_ms.append(elapsed_ms)
-        if elapsed_ms > 3000:
-            raise AssertionError(
-                f"runtime reset {iteration} exceeded 3000ms: {elapsed_ms:.1f}ms"
             )
 
-        # Status is diagnostic/control-plane evidence only. It must confirm
-        # identity and reset_count, but file polling latency is intentionally
-        # excluded from the user-visible recovery budget above.
-        current = wait_for_reset_ready(
-            status_path,
-            expected_process_id=process_id,
-            expected_reset_count=expected_reset_count,
-            expected_node_id=node_id,
-            timeout=5.0,
-        )
+        def probe_udp() -> None:
+            payload = f"netloop-reset-{cycle}".encode("ascii")
 
-    return {
+            def udp_attempt(timeout: float) -> None:
+                with SocksUdpAssociation(
+                    "127.0.0.1",
+                    proxy_port,
+                    timeout=timeout,
+                ) as association:
+                    _, _, response = association.roundtrip(
+                        rendezvous["server_ip"],
+                        int(rendezvous["local_udp_service_port"]),
+                        payload,
+                        timeout=timeout,
+                    )
+                if response != payload:
+                    raise AssertionError(
+                        f"fresh UDP mismatch: expected={payload!r}, observed={response!r}"
+                    )
+
+            udp_state.update(
+                run_reset_probe_loop(
+                    started=started,
+                    deadline=deadline,
+                    old_runtime_closed=stale_closed,
+                    old_runtime_state=stale_state,
+                    action=udp_attempt,
+                )
+            )
+
+        threads: list[threading.Thread] = []
+        try:
+            try:
+                write_json_atomic(
+                    reset_command_path,
+                    {"Id": expected_reset_count, "Command": "reset"},
+                )
+            except Exception as exc:
+                row["errors"].append(
+                    f"reset command write failed: {format_exception(exc)}"
+                )
+
+            threads = [
+                threading.Thread(
+                    target=watch_stale_connection,
+                    name=f"netloop-stale-{cycle}",
+                    daemon=True,
+                ),
+                threading.Thread(
+                    target=probe_tcp,
+                    name=f"netloop-tcp-probe-{cycle}",
+                    daemon=True,
+                ),
+                threading.Thread(
+                    target=probe_udp,
+                    name=f"netloop-udp-probe-{cycle}",
+                    daemon=True,
+                ),
+            ]
+            for thread in threads:
+                thread.start()
+
+            join_deadline = deadline + RESET_PROBE_TIMEOUT_SECONDS + 0.1
+            for thread in threads:
+                thread.join(max(0.0, join_deadline - time.monotonic()))
+
+            if stale_state.get("error") is not None:
+                row["errors"].append(f"old-close: {stale_state['error']}")
+            if row.get("old_close_ms") is None:
+                row["errors"].append("old-close: no close/reset observed")
+
+            row["tcp_ms"] = tcp_state.get("ms")
+            row["tcp_attempts"] = tcp_state.get("attempts", 0)
+            if not tcp_state.get("ok"):
+                row["errors"].append(
+                    f"tcp: {tcp_state.get('last_error') or 'probe failed'}"
+                )
+
+            row["udp_ms"] = udp_state.get("ms")
+            row["udp_attempts"] = udp_state.get("attempts", 0)
+            if not udp_state.get("ok"):
+                row["errors"].append(
+                    f"udp: {udp_state.get('last_error') or 'probe failed'}"
+                )
+
+            status_started = time.monotonic()
+            try:
+                ready_status = wait_for_reset_ready(
+                    status_path,
+                    expected_process_id=process_id,
+                    expected_reset_count=expected_reset_count,
+                    expected_node_id=node_id,
+                    timeout=5.0,
+                )
+                last_ready_status = ready_status
+                row["status_ms"] = (
+                    time.monotonic() - status_started
+                ) * 1000.0
+                row["status_ok"] = True
+                row["observed_reset_count"] = int(
+                    ready_status.get("reset_count", -1)
+                )
+            except Exception as exc:
+                row["errors"].append(
+                    f"status: {format_exception(exc)}"
+                )
+
+            old_close_ok = (
+                isinstance(row.get("old_close_ms"), float)
+                and row["old_close_ms"] <= RESET_BUDGET_SECONDS * 1000.0
+            )
+            tcp_ok = (
+                tcp_state.get("ok") is True
+                and isinstance(row.get("tcp_ms"), float)
+                and row["tcp_ms"] <= RESET_BUDGET_SECONDS * 1000.0
+            )
+            udp_ok = (
+                udp_state.get("ok") is True
+                and isinstance(row.get("udp_ms"), float)
+                and row["udp_ms"] <= RESET_BUDGET_SECONDS * 1000.0
+            )
+            row["passed"] = (
+                old_close_ok
+                and tcp_ok
+                and udp_ok
+                and row.get("status_ok") is True
+                and not row["errors"]
+            )
+        finally:
+            if stale is not None:
+                stale.close()
+            for thread in threads:
+                thread.join(timeout=0.05)
+            rows.append(row)
+
+    write_reset_timing_matrix(rows)
+
+    old_close_samples = [
+        float(row["old_close_ms"])
+        for row in rows
+        if isinstance(row.get("old_close_ms"), float)
+    ]
+    tcp_samples = [
+        float(row["tcp_ms"])
+        for row in rows
+        if isinstance(row.get("tcp_ms"), float)
+    ]
+    udp_samples = [
+        float(row["udp_ms"])
+        for row in rows
+        if isinstance(row.get("udp_ms"), float)
+    ]
+    passed = sum(1 for row in rows if row.get("passed") is True)
+    metrics = {
         "cycles": cycles,
-        "samples_ms": samples_ms,
-        "max_ms": max(samples_ms) if samples_ms else 0.0,
-        "final_reset_count": int(current.get("reset_count", 0)),
-        "final_process_id": int(current.get("process_id", 0)),
+        "passed": passed,
+        "failed": cycles - passed,
+        "success": passed == cycles,
+        "identity_preserved": all(
+            row.get("status_ok") is True for row in rows
+        ),
+        "rows": rows,
+        "old_close_p95_ms": nearest_rank_percentile(old_close_samples, 95),
+        "old_close_max_ms": max(old_close_samples) if old_close_samples else None,
+        "tcp_p95_ms": nearest_rank_percentile(tcp_samples, 95),
+        "tcp_max_ms": max(tcp_samples) if tcp_samples else None,
+        "udp_p95_ms": nearest_rank_percentile(udp_samples, 95),
+        "udp_max_ms": max(udp_samples) if udp_samples else None,
+        "expected_final_reset_count": initial_reset_count + cycles,
+        "observed_final_reset_count": int(
+            last_ready_status.get("reset_count", initial_reset_count)
+        ),
+        "final_process_id": process_id,
     }
+    (EVIDENCE / "reset_stress.json").write_text(
+        json.dumps(metrics, indent=2),
+        encoding="utf-8",
+    )
+    return metrics
 
 
 def retry(label: str, action, attempts: int = 8, delay: float = 3.0):
@@ -769,7 +1014,7 @@ def main() -> int:
         result["egress_ip_matches"] = True
 
         if args.reset_stress:
-            result["reset_metrics"] = run_reset_stress(
+            reset_metrics = run_reset_stress(
                 args.listen_port,
                 rendezvous,
                 status_path,
@@ -777,18 +1022,38 @@ def main() -> int:
                 status,
                 args.reset_cycles,
             )
-            result["reset_stress"] = True
-            result["identity_preserved"] = True
-            result["restart_recovery"] = True
+            result["reset_metrics"] = reset_metrics
+            result["reset_stress"] = bool(reset_metrics["success"])
+            result["identity_preserved"] = bool(
+                reset_metrics["identity_preserved"]
+            )
+            result["restart_recovery"] = bool(reset_metrics["success"])
+            if not reset_metrics["success"]:
+                raise AssertionError(
+                    "runtime reset stress failed: "
+                    f"{reset_metrics['passed']}/{reset_metrics['cycles']} cycles passed; "
+                    f"see reset_timing.tsv and reset_stress.json"
+                )
             result["success"] = True
             print(json.dumps(result, indent=2))
             return 0
 
         stale_tunnels: list[socket.socket] = []
         try:
-            for _ in range(4):
+            for index in range(4):
                 stale_tunnels.append(
-                    socks_connect("127.0.0.1", args.listen_port, "api.ipify.org", 443)
+                    retry(
+                        f"restart_stale_tunnel_{index + 1}",
+                        lambda: socks_connect(
+                            "127.0.0.1",
+                            args.listen_port,
+                            "api.ipify.org",
+                            443,
+                            timeout=3.0,
+                        ),
+                        attempts=4,
+                        delay=0.25,
+                    )
                 )
             kill_process_tree(client_pid)
             client_pid = 0
