@@ -7,7 +7,8 @@
     <ApplicationTitle>NetLoop</ApplicationTitle>
     <ApplicationVersion>1</ApplicationVersion>
     <ApplicationDisplayVersion>0.1.0</ApplicationDisplayVersion>
-    <RuntimeIdentifier>android-arm64</RuntimeIdentifier>
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">android-arm64</RuntimeIdentifier>
+    <NetLoopAndroidAbi Condition="'$(NetLoopAndroidAbi)' == ''">arm64-v8a</NetLoopAndroidAbi>
     <AndroidPackageFormat>apk</AndroidPackageFormat>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
@@ -33,10 +34,10 @@
   </ItemGroup>
 
   <ItemGroup Condition="'$(LibztNativePath)' != ''">
-    <AndroidNativeLibrary Include="$(LibztNativePath)" Abi="arm64-v8a" />
+    <AndroidNativeLibrary Include="$(LibztNativePath)" Abi="$(NetLoopAndroidAbi)" />
   </ItemGroup>
 
   <Target Name="RequireLibztNative" BeforeTargets="Build" Condition="'$(LibztNativePath)' == ''">
-    <Error Text="LibztNativePath must point to the arm64-v8a libzt.so built for Android." />
+    <Error Text="LibztNativePath must point to the $(NetLoopAndroidAbi) libzt.so built for Android." />
   </Target>
 </Project>

@@ -122,8 +122,11 @@ def main() -> int:
     parser.add_argument("--clean", action="store_true")
     args = parser.parse_args()
 
-    if args.abi != "arm64-v8a":
-        raise ValueError("NetLoop Android v1 supports only arm64-v8a.")
+    if args.abi not in {"arm64-v8a", "x86_64"}:
+        raise ValueError(
+            "NetLoop Android supports arm64-v8a release builds and "
+            "x86_64 CI emulator builds."
+        )
     if args.api < 24:
         raise ValueError("Android API level must be >= 24.")
 

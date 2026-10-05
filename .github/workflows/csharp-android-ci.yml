@@ -134,41 +134,6 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Publish CI automation APK
-        run: >
-          dotnet publish src-csharp/NetLoop.Android/NetLoop.Android.csproj
-          --configuration Release
-          --framework net10.0-android36.0
-          --runtime android-arm64
-          -p:LibztNativePath="$PWD/native-cache/android-arm64/libzt.so"
-          -p:AndroidPackageFormat=apk
-          -p:NetLoopCiAutomation=true
-          -p:AndroidDebuggable=true
-
-      - name: Collect CI automation APK
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p dist-android-e2e
-          apk="$(find src-csharp/NetLoop.Android/bin/Release/net10.0-android36.0/android-arm64 -type f -name '*-Signed.apk' -print -quit)"
-          if [[ -z "$apk" ]]; then
-            apk="$(find src-csharp/NetLoop.Android/bin/Release/net10.0-android36.0/android-arm64 -type f -name '*.apk' -print -quit)"
-          fi
-          test -n "$apk"
-          cp "$apk" dist-android-e2e/netloop-android-arm64-ci.apk
-          unzip -Z1 "$apk" | tee dist-android-e2e/apk-contents.txt
-          grep -q '^lib/arm64-v8a/libzt.so$' dist-android-e2e/apk-contents.txt
-          abis="$(awk -F/ '$1 == "lib" {print $2}' dist-android-e2e/apk-contents.txt | sort -u | paste -sd, -)"
-          test "$abis" = "arm64-v8a"
-
-      - name: Upload Android CI automation APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.ANDROID_E2E_APK_ARTIFACT }}
-          path: dist-android-e2e/
-          if-no-files-found: error
-          retention-days: 2
-
       - name: Build summary
         if: always()
         shell: bash
@@ -184,9 +149,128 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
+  build-e2e-x64:
+    name: Build Android x86_64 E2E APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up .NET Android workload
+        uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+          workloads: android
+
+      - name: Resolve Android x86_64 native cache key
+        id: native-key
+        shell: bash
+        run: |
+          set -euo pipefail
+          libzt="$(git ls-tree HEAD external/libzt | awk '{print $3}')"
+          cmake="$(git hash-object CMakeLists.txt)"
+          script="$(git hash-object tools/build_android_native.py)"
+          patch1="$(git hash-object patches/libzt/0001-host-network-change-refresh.patch)"
+          patch2="$(git hash-object patches/libzt/0002-android-pinvoke.patch)"
+          ndk_revision="$(awk -F= '/Pkg.Revision/ {gsub(/ /, "", $2); print $2}' "$ANDROID_NDK_HOME/source.properties")"
+          echo "ndk_revision=$ndk_revision" >> "$GITHUB_OUTPUT"
+          echo "key=libzt-pinvoke-android-x86_64-${ndk_revision}-${libzt}-${cmake}-${script}-${patch1}-${patch2}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore compiled Android x86_64 libzt bundle
+        id: native-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: native-cache/android-x64
+          key: ${{ steps.native-key.outputs.key }}
+
+      - name: Set up sccache
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: "v0.18.0"
+
+      - name: Build Android x86_64 libzt on cache miss
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        run: >
+          python tools/build_android_native.py
+          --ndk "$ANDROID_NDK_HOME"
+          --api 24
+          --abi x86_64
+          --build-dir build-android-native-x86_64
+          --use-sccache
+          --output native-cache/android-x64/libzt.so
+
+      - name: Verify Android x86_64 native bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f native-cache/android-x64/libzt.so
+          file native-cache/android-x64/libzt.so | tee native-cache/android-x64/file.txt
+          grep -Eq 'x86-64|x86_64|X86-64' native-cache/android-x64/file.txt
+          if [[ -f native-cache/android-x64/libzt.so.manifest.json ]]; then
+            cat native-cache/android-x64/libzt.so.manifest.json
+          fi
+
+      - name: Save compiled Android x86_64 libzt bundle immediately
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: native-cache/android-x64
+          key: ${{ steps.native-key.outputs.key }}
+
+      - name: Publish x86_64 CI automation APK
+        run: >
+          dotnet publish src-csharp/NetLoop.Android/NetLoop.Android.csproj
+          --configuration Release
+          --framework net10.0-android36.0
+          --runtime android-x64
+          -p:NetLoopAndroidAbi=x86_64
+          -p:LibztNativePath="$PWD/native-cache/android-x64/libzt.so"
+          -p:AndroidPackageFormat=apk
+          -p:NetLoopCiAutomation=true
+          -p:AndroidDebuggable=true
+
+      - name: Collect x86_64 CI automation APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist-android-e2e
+          apk="$(find src-csharp/NetLoop.Android/bin/Release/net10.0-android36.0/android-x64 -type f -name '*-Signed.apk' -print -quit)"
+          if [[ -z "$apk" ]]; then
+            apk="$(find src-csharp/NetLoop.Android/bin/Release/net10.0-android36.0/android-x64 -type f -name '*.apk' -print -quit)"
+          fi
+          test -n "$apk"
+          cp "$apk" dist-android-e2e/netloop-android-x64-ci.apk
+          unzip -Z1 "$apk" | tee dist-android-e2e/apk-contents.txt
+          grep -q '^lib/x86_64/libzt.so$' dist-android-e2e/apk-contents.txt
+          abis="$(awk -F/ '$1 == "lib" {print $2}' dist-android-e2e/apk-contents.txt | sort -u | paste -sd, -)"
+          test "$abis" = "x86_64"
+
+      - name: Upload Android x86_64 CI automation APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ANDROID_E2E_APK_ARTIFACT }}
+          path: dist-android-e2e/
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: E2E build summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Android x86_64 E2E build"
+            echo "- NDK: ${{ steps.native-key.outputs.ndk_revision }}"
+            echo "- native bundle cache hit: ${{ steps.native-cache.outputs.cache-hit }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   e2e-client:
-    name: Android arm64 APK E2E client
-    needs: build
+    name: Android x86_64 emulator E2E client
+    needs: build-e2e-x64
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     env:
@@ -264,8 +348,9 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+          test -e /dev/kvm
 
-      - name: Android arm64 APK E2E
+      - name: Android x86_64 APK E2E
         id: e2e
         continue-on-error: true
         uses: reactivecircus/android-emulator-runner@v2
@@ -336,7 +421,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      - name: Preserve Android Linux peer evidence
+      - name: Preserve Android peer evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:

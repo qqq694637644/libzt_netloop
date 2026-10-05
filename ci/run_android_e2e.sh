@@ -12,6 +12,6 @@ python ci/csharp_e2e_server.py prepare \
   --overlay-udp-port 42243
 
 python ci/android_e2e_client.py \
-  --apk package/netloop-android-arm64-ci.apk \
+  --apk package/netloop-android-x64-ci.apk \
   --rendezvous-file evidence/csharp-server/rendezvous.json \
   --reset-cycles 3

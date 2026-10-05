@@ -560,7 +560,7 @@ def main() -> int:
     result: dict[str, object] = {
         "success": False,
         "apk_installed": False,
-        "arm_translation_available": False,
+        "native_x86_64_available": False,
         "client_joined": False,
         "peer_local_service": False,
         "peer_local_udp": False,
@@ -604,20 +604,25 @@ def main() -> int:
         adb("install", "-r", str(apk), timeout=180)
         result["apk_installed"] = True
 
+        primary_abi = adb(
+            "shell",
+            "getprop",
+            "ro.product.cpu.abi",
+        ).stdout.strip()
         abi_list = adb(
             "shell",
             "getprop",
             "ro.product.cpu.abilist",
         ).stdout.strip()
+        result["emulator_primary_abi"] = primary_abi
         result["emulator_abi_list"] = abi_list
-        if "arm64-v8a" not in {
-            value.strip() for value in abi_list.split(",")
-        }:
+        if primary_abi != "x86_64":
             raise RuntimeError(
-                "Android emulator does not advertise arm64-v8a translation: "
-                f"{abi_list}"
+                "Android E2E requires native x86_64 execution, "
+                f"not ABI translation: primary={primary_abi}, "
+                f"abilist={abi_list}"
             )
-        result["arm_translation_available"] = True
+        result["native_x86_64_available"] = True
 
         adb(
             "forward",
