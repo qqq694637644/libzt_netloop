@@ -6,7 +6,11 @@ namespace NetLoop.Libzt;
 public sealed class LibztTcpConnector : IProxyConnector
 {
     private static readonly TimeSpan RetryDelay = TimeSpan.FromMilliseconds(250);
-    private const int AttemptTimeoutMilliseconds = 2_000;
+    // zts_connect() already performs its own transport-triggered retry loop.
+    // Keep each blocking native attempt short so the caller can discard the
+    // socket and try a genuinely fresh one while a peer path is converging
+    // after a physical network change.
+    private const int AttemptTimeoutMilliseconds = 500;
 
     private readonly TimeSpan _connectTimeout;
 

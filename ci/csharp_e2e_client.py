@@ -576,8 +576,17 @@ def run_reset_stress(
                 ("127.0.0.1", proxy_port),
                 timeout=0.5,
             )
+            stale.settimeout(0.5)
+            stale.sendall(b"\x05\x01\x00")
+            if recv_exact(stale, 2) != b"\x05\x00":
+                raise RuntimeError(
+                    "stale SOCKS sentinel did not complete method negotiation"
+                )
             stale.settimeout(0.05)
         except Exception as exc:
+            if stale is not None:
+                stale.close()
+                stale = None
             row["errors"].append(
                 f"stale precondition failed: {format_exception(exc)}"
             )
