@@ -49,7 +49,9 @@ public sealed class CiAutomationReceiver : BroadcastReceiver
                 requestError = ex;
             }
 
-            var pending = GoAsync();
+            var pending = GoAsync()
+                ?? throw new InvalidOperationException(
+                    "Unable to keep CI UDP broadcast alive.");
             var applicationContext =
                 context.ApplicationContext ?? context;
             var requestId = (
