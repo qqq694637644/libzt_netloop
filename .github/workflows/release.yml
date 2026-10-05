@@ -5,6 +5,17 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      throughput_e2e:
+        description: Run one-shot Windows/Linux/Android throughput E2E
+        required: true
+        default: false
+        type: boolean
+      throughput_file_size_mib:
+        description: MiB downloaded by each throughput stream
+        required: true
+        default: "32"
+        type: string
 
 concurrency:
   group: csharp-release-${{ github.ref }}
@@ -394,3 +405,405 @@ jobs:
           else
             gh release create "$GITHUB_REF_NAME" release/* --generate-notes --title "$GITHUB_REF_NAME"
           fi
+
+  throughput-windows-server:
+    name: Throughput Windows exit
+    if: github.event_name == 'workflow_dispatch' && inputs.throughput_e2e
+    needs: windows
+    runs-on: windows-latest
+    timeout-minutes: 40
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-win-x64
+          path: package
+
+      - name: Deploy Windows runtime
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force runtime-csharp | Out-Null
+          Expand-Archive package\netloop-win-x64.zip -DestinationPath runtime-csharp -Force
+
+      - name: Prepare Windows exit
+        run: >
+          python ci/throughput_exit_server.py prepare
+          --runtime runtime-csharp
+          --overlay-port 44242
+          --overlay-udp-port 44243
+
+      - name: Publish Windows rendezvous
+        uses: actions/upload-artifact@v4
+        with:
+          name: throughput-win-rendezvous-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/throughput-server/rendezvous.json
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Hold Windows exit
+        run: >
+          python ci/throughput_exit_server.py hold
+          --client-artifact "throughput-win-result-${{ github.run_id }}-${{ github.run_attempt }}"
+          --timeout 1800
+
+      - name: Preserve Windows exit evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: throughput-win-server-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/throughput-server/
+          if-no-files-found: warn
+          retention-days: 7
+
+  throughput-windows-client:
+    name: Throughput Windows 1/8/32
+    if: github.event_name == 'workflow_dispatch' && inputs.throughput_e2e
+    needs: windows
+    runs-on: windows-latest
+    timeout-minutes: 40
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-win-x64
+          path: package
+
+      - name: Deploy Windows runtime
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force runtime-csharp | Out-Null
+          Expand-Archive package\netloop-win-x64.zip -DestinationPath runtime-csharp -Force
+
+      - name: Run Windows throughput
+        id: throughput
+        continue-on-error: true
+        run: >
+          python ci/csharp_throughput_client.py
+          --runtime runtime-csharp
+          --rendezvous-artifact "throughput-win-rendezvous-${{ github.run_id }}-${{ github.run_attempt }}"
+          --file-size-mib "${{ inputs.throughput_file_size_mib }}"
+          --concurrency "1,8,32"
+
+      - name: Publish Windows throughput result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: throughput-win-result-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/throughput-client/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Add Windows throughput summary
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path evidence/throughput-client/throughput.tsv) {
+            "### Windows -> Windows default-exit throughput" >> $env:GITHUB_STEP_SUMMARY
+            '~~~text' >> $env:GITHUB_STEP_SUMMARY
+            Get-Content evidence/throughput-client/throughput.tsv >> $env:GITHUB_STEP_SUMMARY
+            '~~~' >> $env:GITHUB_STEP_SUMMARY
+          }
+
+      - name: Fail when Windows throughput failed
+        if: steps.throughput.outcome != 'success'
+        run: python -c "raise SystemExit('Windows throughput E2E failed')"
+
+  throughput-linux-server:
+    name: Throughput Linux exit
+    if: github.event_name == 'workflow_dispatch' && inputs.throughput_e2e
+    needs: linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-linux-x64
+          path: package
+
+      - name: Deploy Linux runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p runtime-csharp
+          tar -xzf package/netloop-linux-x64.tar.gz -C runtime-csharp
+          chmod +x runtime-csharp/netloop
+
+      - name: Prepare Linux exit
+        run: >
+          python ci/throughput_exit_server.py prepare
+          --runtime runtime-csharp
+          --overlay-port 45242
+          --overlay-udp-port 45243
+
+      - name: Publish Linux rendezvous
+        uses: actions/upload-artifact@v4
+        with:
+          name: throughput-linux-rendezvous-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/throughput-server/rendezvous.json
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Hold Linux exit
+        run: >
+          python ci/throughput_exit_server.py hold
+          --client-artifact "throughput-linux-result-${{ github.run_id }}-${{ github.run_attempt }}"
+          --timeout 1800
+
+      - name: Preserve Linux exit evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: throughput-linux-server-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/throughput-server/
+          if-no-files-found: warn
+          retention-days: 7
+
+  throughput-linux-client:
+    name: Throughput Linux 1/8/32
+    if: github.event_name == 'workflow_dispatch' && inputs.throughput_e2e
+    needs: linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-linux-x64
+          path: package
+
+      - name: Deploy Linux runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p runtime-csharp
+          tar -xzf package/netloop-linux-x64.tar.gz -C runtime-csharp
+          chmod +x runtime-csharp/netloop
+
+      - name: Run Linux throughput
+        id: throughput
+        continue-on-error: true
+        run: >
+          python ci/csharp_throughput_client.py
+          --runtime runtime-csharp
+          --rendezvous-artifact "throughput-linux-rendezvous-${{ github.run_id }}-${{ github.run_attempt }}"
+          --file-size-mib "${{ inputs.throughput_file_size_mib }}"
+          --concurrency "1,8,32"
+
+      - name: Publish Linux throughput result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: throughput-linux-result-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/throughput-client/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Add Linux throughput summary
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f evidence/throughput-client/throughput.tsv ]]; then
+            {
+              echo "### Linux -> Linux default-exit throughput"
+              echo '~~~text'
+              cat evidence/throughput-client/throughput.tsv
+              echo '~~~'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Fail when Linux throughput failed
+        if: steps.throughput.outcome != 'success'
+        run: python -c "raise SystemExit('Linux throughput E2E failed')"
+
+  throughput-android-build:
+    name: Build Android x86_64 throughput APK
+    if: github.event_name == 'workflow_dispatch' && inputs.throughput_e2e
+    needs: metadata
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SCCACHE_GHA_VERSION: libzt-netloop-throughput-android-v1
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+          workloads: android
+
+      - name: Resolve Android x86_64 native cache key
+        id: native-key
+        shell: bash
+        run: |
+          set -euo pipefail
+          libzt="$(git ls-tree HEAD external/libzt | awk '{print $3}')"
+          cmake="$(git hash-object CMakeLists.txt)"
+          script="$(git hash-object tools/build_android_native.py)"
+          patch1="$(git hash-object patches/libzt/0001-host-network-change-refresh.patch)"
+          patch2="$(git hash-object patches/libzt/0002-android-pinvoke.patch)"
+          ndk_revision="$(awk -F= '/Pkg.Revision/ {gsub(/ /, "", $2); print $2}' "$ANDROID_NDK_HOME/source.properties")"
+          echo "key=libzt-pinvoke-android-x86_64-${ndk_revision}-${libzt}-${cmake}-${script}-${patch1}-${patch2}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Android x86_64 native bundle
+        id: native-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: native-cache/android-x64
+          key: ${{ steps.native-key.outputs.key }}
+
+      - name: Set up sccache
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: "v0.18.0"
+
+      - name: Build Android x86_64 native bundle
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        run: >
+          python tools/build_android_native.py
+          --ndk "$ANDROID_NDK_HOME"
+          --api 24
+          --abi x86_64
+          --build-dir build-android-native-x86_64
+          --use-sccache
+          --output native-cache/android-x64/libzt.so
+
+      - name: Save Android x86_64 native bundle
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: native-cache/android-x64
+          key: ${{ steps.native-key.outputs.key }}
+
+      - name: Publish Android x86_64 CI APK
+        run: >
+          dotnet publish src-csharp/NetLoop.Android/NetLoop.Android.csproj
+          --configuration Release
+          --framework net10.0-android36.0
+          --runtime android-x64
+          -p:NetLoopAndroidAbi=x86_64
+          -p:LibztNativePath="$PWD/native-cache/android-x64/libzt.so"
+          -p:AndroidPackageFormat=apk
+          -p:NetLoopCiAutomation=true
+          -p:AndroidDebuggable=true
+
+      - name: Collect Android x86_64 APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p throughput-android
+          apk="$(find src-csharp/NetLoop.Android/bin/Release/net10.0-android36.0/android-x64 -type f -name '*-Signed.apk' -print -quit)"
+          if [[ -z "$apk" ]]; then
+            apk="$(find src-csharp/NetLoop.Android/bin/Release/net10.0-android36.0/android-x64 -type f -name '*.apk' -print -quit)"
+          fi
+          test -n "$apk"
+          cp "$apk" throughput-android/netloop-android-x64-ci.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: throughput-android-apk-${{ github.run_id }}-${{ github.run_attempt }}
+          path: throughput-android/netloop-android-x64-ci.apk
+          if-no-files-found: error
+          retention-days: 2
+
+  throughput-android:
+    name: Throughput Android 1/8/32
+    if: github.event_name == 'workflow_dispatch' && inputs.throughput_e2e
+    needs: throughput-android-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: throughput-android-apk-${{ github.run_id }}-${{ github.run_attempt }}
+          path: package
+
+      - name: Enable KVM
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -e /dev/kvm
+
+      - name: Run Android pair throughput
+        id: throughput
+        continue-on-error: true
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_5
+          emulator-options: >-
+            -no-snapshot-save -no-window -gpu swiftshader_indirect
+            -noaudio -no-boot-anim -camera-back none -camera-front none
+            -memory 1536
+          disable-animations: true
+          script: python ci/android_pair_throughput.py --apk package/netloop-android-x64-ci.apk --file-size-mib "${{ inputs.throughput_file_size_mib }}" --concurrency "1,8,32"
+
+      - name: Preserve Android throughput evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: throughput-android-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/android-throughput/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Add Android throughput summary
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f evidence/android-throughput/throughput.tsv ]]; then
+            {
+              echo "### Android -> Android default-exit throughput"
+              echo '~~~text'
+              cat evidence/android-throughput/throughput.tsv
+              echo '~~~'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Fail when Android throughput failed
+        if: steps.throughput.outcome != 'success'
+        run: python -c "raise SystemExit('Android throughput E2E failed')"
