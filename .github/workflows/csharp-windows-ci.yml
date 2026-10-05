@@ -154,7 +154,11 @@ jobs:
           path: package
 
       - name: Deploy runtime
-        run: python ci/deploy.py --source package --destination runtime-csharp --all-files
+        shell: pwsh
+        run: |
+          if (Test-Path runtime-csharp) { Remove-Item runtime-csharp -Recurse -Force }
+          New-Item -ItemType Directory -Force runtime-csharp | Out-Null
+          Copy-Item package\* runtime-csharp -Recurse -Force
 
       - name: Join ad-hoc network and prepare exit
         run: python ci/csharp_e2e_server.py prepare --runtime runtime-csharp
@@ -203,7 +207,11 @@ jobs:
           path: package
 
       - name: Deploy runtime
-        run: python ci/deploy.py --source package --destination runtime-csharp --all-files
+        shell: pwsh
+        run: |
+          if (Test-Path runtime-csharp) { Remove-Item runtime-csharp -Recurse -Force }
+          New-Item -ItemType Directory -Force runtime-csharp | Out-Null
+          Copy-Item package\* runtime-csharp -Recurse -Force
 
       - name: Cross-machine peer-local and default-exit E2E
         id: e2e
@@ -273,7 +281,11 @@ jobs:
           path: package
 
       - name: Deploy runtime
-        run: python ci/deploy.py --source package --destination runtime-csharp --all-files
+        shell: pwsh
+        run: |
+          if (Test-Path runtime-csharp) { Remove-Item runtime-csharp -Recurse -Force }
+          New-Item -ItemType Directory -Force runtime-csharp | Out-Null
+          Copy-Item package\* runtime-csharp -Recurse -Force
 
       - name: Prepare authenticated upstream SOCKS5 exit
         run: >
@@ -332,7 +344,11 @@ jobs:
           path: package
 
       - name: Deploy runtime
-        run: python ci/deploy.py --source package --destination runtime-csharp --all-files
+        shell: pwsh
+        run: |
+          if (Test-Path runtime-csharp) { Remove-Item runtime-csharp -Recurse -Force }
+          New-Item -ItemType Directory -Force runtime-csharp | Out-Null
+          Copy-Item package\* runtime-csharp -Recurse -Force
 
       - name: Cross-machine authenticated upstream SOCKS5 E2E
         id: e2e
