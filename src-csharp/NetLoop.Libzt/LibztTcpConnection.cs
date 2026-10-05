@@ -19,19 +19,24 @@ public sealed class LibztTcpConnection : IProxyConnection
 
     public System.Net.EndPoint? RemoteEndPoint => null;
 
-    public ValueTask<int> ReadAsync(byte[] buffer, int count, CancellationToken cancellationToken)
+    public async ValueTask<int> ReadAsync(
+        byte[] buffer,
+        int count,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(buffer);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(count);
         if (count > buffer.Length)
             throw new ArgumentOutOfRangeException(nameof(count));
 
-        return new ValueTask<int>(Task.Run(() => {
+        while (true)
+        {
             cancellationToken.ThrowIfCancellationRequested();
             var fd = GetFd();
-            using var registration = cancellationToken.Register(
-                static state => LibztNative.Shutdown((int)state!, LibztNative.ShutReadWrite),
-                fd);
+            await LibztSocketPoller.WaitAsync(
+                fd,
+                LibztNative.PollIn,
+                cancellationToken).ConfigureAwait(false);
 
             var handle = GCHandle.Alloc(buffer, GCHandleType.Pinned);
             try
@@ -43,57 +48,71 @@ public sealed class LibztTcpConnection : IProxyConnection
                 if (cancellationToken.IsCancellationRequested)
                     throw new OperationCanceledException(cancellationToken);
 
-                throw new LibztException("zts_bsd_read", result, LibztNative.GetErrno());
+                var errno = LibztNative.GetErrno();
+                if (LibztSocketPoller.IsWouldBlock(errno))
+                    continue;
+
+                throw new LibztException("zts_bsd_read", result, errno);
             }
             finally
             {
                 handle.Free();
             }
-        }));
+        }
     }
 
-    public ValueTask WriteAsync(byte[] buffer, int count, CancellationToken cancellationToken)
+    public async ValueTask WriteAsync(
+        byte[] buffer,
+        int count,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(buffer);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(count);
         if (count > buffer.Length)
             throw new ArgumentOutOfRangeException(nameof(count));
 
-        return new ValueTask(Task.Run(() => {
-            cancellationToken.ThrowIfCancellationRequested();
-            var fd = GetFd();
-            using var registration = cancellationToken.Register(
-                static state => LibztNative.Shutdown((int)state!, LibztNative.ShutReadWrite),
-                fd);
-
-            var handle = GCHandle.Alloc(buffer, GCHandleType.Pinned);
-            try
+        var handle = GCHandle.Alloc(buffer, GCHandleType.Pinned);
+        try
+        {
+            var basePointer = handle.AddrOfPinnedObject();
+            var offset = 0;
+            while (offset < count)
             {
-                var basePointer = handle.AddrOfPinnedObject();
-                var offset = 0;
-                while (offset < count)
+                cancellationToken.ThrowIfCancellationRequested();
+                var fd = GetFd();
+                await LibztSocketPoller.WaitAsync(
+                    fd,
+                    LibztNative.PollOut,
+                    cancellationToken).ConfigureAwait(false);
+
+                var requested = count - offset;
+                var result = LibztNative.Write(
+                    fd,
+                    basePointer + offset,
+                    checked((uint)requested));
+
+                if (result < 0)
                 {
-                    var requested = count - offset;
-                    var result = LibztNative.Write(
-                        fd,
-                        basePointer + offset,
-                        checked((uint)requested));
+                    if (cancellationToken.IsCancellationRequested)
+                        throw new OperationCanceledException(cancellationToken);
 
-                    if (result <= 0)
-                    {
-                        if (cancellationToken.IsCancellationRequested)
-                            throw new OperationCanceledException(cancellationToken);
-                        throw new LibztException("zts_bsd_write", result, LibztNative.GetErrno());
-                    }
+                    var errno = LibztNative.GetErrno();
+                    if (LibztSocketPoller.IsWouldBlock(errno))
+                        continue;
 
-                    offset += result;
+                    throw new LibztException("zts_bsd_write", result, errno);
                 }
+
+                if (result == 0)
+                    throw new IOException("libzt TCP write returned zero.");
+
+                offset += result;
             }
-            finally
-            {
-                handle.Free();
-            }
-        }));
+        }
+        finally
+        {
+            handle.Free();
+        }
     }
 
     public ValueTask ShutdownWriteAsync(CancellationToken cancellationToken)

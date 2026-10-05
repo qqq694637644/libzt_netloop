@@ -5,9 +5,6 @@ namespace NetLoop.Libzt;
 
 public sealed class LibztTcpListener : IAsyncDisposable
 {
-    private static readonly TimeSpan AcceptPollInterval =
-        TimeSpan.FromMilliseconds(20);
-
     private int _fd;
 
     private LibztTcpListener(int fd, string bindAddress, ushort port)
@@ -64,18 +61,23 @@ public sealed class LibztTcpListener : IAsyncDisposable
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 var fd = GetFd();
+                await LibztSocketPoller.WaitAsync(
+                    fd,
+                    LibztNative.PollIn,
+                    cancellationToken).ConfigureAwait(false);
+
                 ushort port = 0;
                 var result = LibztNative.AcceptEasy(fd, buffer, LibztNative.IpStringLength, ref port);
                 if (result >= 0)
                 {
                     try
                     {
-                        var blocking = LibztNative.SetBlocking(result, 1);
-                        if (blocking != LibztNative.Ok)
+                        var nonBlocking = LibztNative.SetBlocking(result, 0);
+                        if (nonBlocking != LibztNative.Ok)
                         {
                             throw new LibztException(
                                 "zts_set_blocking(accepted)",
-                                blocking,
+                                nonBlocking,
                                 LibztNative.GetLastSocketError(result));
                         }
 
@@ -94,13 +96,9 @@ public sealed class LibztTcpListener : IAsyncDisposable
 
                 var errno = LibztNative.GetErrno();
                 var socketError = LibztNative.GetLastSocketError(fd);
-                if (IsWouldBlock(errno) || IsWouldBlock(socketError))
-                {
-                    await Task.Delay(
-                        AcceptPollInterval,
-                        cancellationToken).ConfigureAwait(false);
+                if (LibztSocketPoller.IsWouldBlock(errno)
+                    || LibztSocketPoller.IsWouldBlock(socketError))
                     continue;
-                }
 
                 if (cancellationToken.IsCancellationRequested)
                     throw new OperationCanceledException(cancellationToken);
@@ -116,9 +114,6 @@ public sealed class LibztTcpListener : IAsyncDisposable
             Marshal.FreeHGlobal(buffer);
         }
     }
-
-    private static bool IsWouldBlock(int error)
-        => error is LibztNative.EAgain or LibztNative.WindowsEWouldBlock;
 
     public ValueTask DisposeAsync()
     {

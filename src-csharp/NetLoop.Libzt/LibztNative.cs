@@ -39,6 +39,10 @@ internal static class LibztNative
     // SO_RCVTIMEO. Keep these explicit until the native ABI is normalized.
     internal const int WindowsETimedOut = 138;
     internal const int WindowsEWouldBlock = 140;
+    internal const short PollIn = 0x001;
+    internal const short PollOut = 0x002;
+    internal const short PollError = 0x004;
+    internal const short PollInvalid = 0x008;
 
     internal const int IpStringLength = 46;
 
@@ -178,6 +182,12 @@ internal static class LibztNative
     [DllImport(LibraryName, EntryPoint = "CSharp_zts_set_blocking")]
     internal static extern int SetBlocking(int fd, int enabled);
 
+    [DllImport(LibraryName, EntryPoint = "CSharp_zts_bsd_poll")]
+    internal static extern int Poll(
+        ref PollFd fds,
+        uint count,
+        int timeoutMilliseconds);
+
     [DllImport(LibraryName, EntryPoint = "CSharp_zts_bsd_setsockopt")]
     internal static extern int SetSocketOption(int fd, int level, int option, nint value, ushort valueLength);
 
@@ -225,5 +235,13 @@ internal static class LibztNative
         internal nint Address;
         internal nint Cache;
         internal int Length;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct PollFd
+    {
+        internal int Fd;
+        internal short Events;
+        internal short Revents;
     }
 }

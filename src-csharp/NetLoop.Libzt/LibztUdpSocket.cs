@@ -11,8 +11,6 @@ public sealed class LibztUdpSocket : IAsyncDisposable
 {
     private const int SocketAddressBufferSize = 128;
     private const int MaxDatagramSize = 65_535;
-    private static readonly TimeSpan IoPollInterval =
-        TimeSpan.FromMilliseconds(10);
 
     private readonly SemaphoreSlim _sendLock = new(1, 1);
     private int _fd;
@@ -93,6 +91,11 @@ public sealed class LibztUdpSocket : IAsyncDisposable
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                     var fd = GetFd();
+                    await LibztSocketPoller.WaitAsync(
+                        fd,
+                        LibztNative.PollOut,
+                        cancellationToken).ConfigureAwait(false);
+
                     var sent = LibztNative.SendTo(
                         fd,
                         payloadHandle.AddrOfPinnedObject(),
@@ -108,12 +111,8 @@ public sealed class LibztUdpSocket : IAsyncDisposable
                     }
 
                     var errno = LibztNative.GetErrno();
-                    if (!IsTransientIoError(errno))
+                    if (!LibztSocketPoller.IsWouldBlock(errno))
                         throw new LibztException("zts_bsd_sendto", sent, errno);
-
-                    await Task.Delay(
-                        IoPollInterval,
-                        cancellationToken).ConfigureAwait(false);
                 }
             }
             finally
@@ -140,6 +139,11 @@ public sealed class LibztUdpSocket : IAsyncDisposable
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 var fd = GetFd();
+                await LibztSocketPoller.WaitAsync(
+                    fd,
+                    LibztNative.PollIn,
+                    cancellationToken).ConfigureAwait(false);
+
                 Marshal.WriteInt32(
                     addressLengthPointer,
                     SocketAddressBufferSize);
@@ -154,13 +158,8 @@ public sealed class LibztUdpSocket : IAsyncDisposable
                 if (received < 0)
                 {
                     var errno = LibztNative.GetErrno();
-                    if (IsTransientIoError(errno))
-                    {
-                        await Task.Delay(
-                            IoPollInterval,
-                            cancellationToken).ConfigureAwait(false);
+                    if (LibztSocketPoller.IsWouldBlock(errno))
                         continue;
-                    }
 
                     if (cancellationToken.IsCancellationRequested)
                         throw new OperationCanceledException(cancellationToken);
@@ -197,12 +196,6 @@ public sealed class LibztUdpSocket : IAsyncDisposable
             Marshal.FreeHGlobal(buffer);
         }
     }
-
-    private static bool IsTransientIoError(int errno)
-        => errno is LibztNative.EAgain
-            or LibztNative.ETimedOut
-            or LibztNative.WindowsETimedOut
-            or LibztNative.WindowsEWouldBlock;
 
     public ValueTask DisposeAsync()
     {

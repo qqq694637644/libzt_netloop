@@ -76,6 +76,15 @@ public sealed class LibztTcpConnector : IProxyConnector
 
                     if (result == LibztNative.Ok)
                     {
+                        var nonBlocking = LibztNative.SetBlocking(fd, 0);
+                        if (nonBlocking != LibztNative.Ok)
+                        {
+                            throw new LibztException(
+                                "zts_set_blocking(connected)",
+                                nonBlocking,
+                                LibztNative.GetLastSocketError(fd));
+                        }
+
                         if (attempt > 1)
                         {
                             JsonLog.Info("libzt_connect_recovered", new {
