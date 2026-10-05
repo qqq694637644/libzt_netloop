@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import http.client
 import json
 from pathlib import Path
@@ -14,6 +14,9 @@ import csharp_e2e_client as desktop_e2e
 
 TARGET_HOST = "speed.cloudflare.com"
 TARGET_PORT = 443
+MAX_PREPARE_PARALLELISM = 8
+PREPARE_ATTEMPTS = 3
+PREPARE_RETRY_DELAY_SECONDS = 0.25
 
 
 def count_route_decisions(
@@ -70,6 +73,36 @@ def _prepare_tls(
     except Exception:
         raw.close()
         raise
+
+
+def _prepare_tls_with_retry(
+    proxy_host: str,
+    proxy_port: int,
+    *,
+    timeout: float,
+    setup_gate: threading.Semaphore,
+) -> tuple[ssl.SSLSocket, int]:
+    last_error: Exception | None = None
+    for attempt in range(1, PREPARE_ATTEMPTS + 1):
+        try:
+            with setup_gate:
+                return (
+                    _prepare_tls(
+                        proxy_host,
+                        proxy_port,
+                        timeout=timeout,
+                    ),
+                    attempt,
+                )
+        except Exception as exc:
+            last_error = exc
+            if attempt < PREPARE_ATTEMPTS:
+                time.sleep(PREPARE_RETRY_DELAY_SECONDS * attempt)
+
+    raise RuntimeError(
+        "throughput connection preparation failed after "
+        f"{PREPARE_ATTEMPTS} attempts: {last_error}"
+    ) from last_error
 
 
 def _download_prepared(
@@ -151,17 +184,43 @@ def run_stage(
         raise ValueError("size_bytes must be >= 1")
 
     stage_started = time.monotonic()
+    setup_parallelism = min(concurrency, MAX_PREPARE_PARALLELISM)
+    setup_gate = threading.Semaphore(setup_parallelism)
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
-        prepared = list(
-            executor.map(
-                lambda _: _prepare_tls(
-                    proxy_host,
-                    proxy_port,
-                    timeout=timeout,
-                ),
-                range(concurrency),
+        prepare_futures = [
+            executor.submit(
+                _prepare_tls_with_retry,
+                proxy_host,
+                proxy_port,
+                timeout=timeout,
+                setup_gate=setup_gate,
             )
-        )
+            for _ in range(concurrency)
+        ]
+        prepared_results: list[tuple[ssl.SSLSocket, int]] = []
+        prepare_errors: list[Exception] = []
+        for future in as_completed(prepare_futures):
+            try:
+                prepared_results.append(future.result())
+            except Exception as exc:
+                prepare_errors.append(exc)
+
+        if prepare_errors:
+            for tls, _ in prepared_results:
+                try:
+                    tls.close()
+                except Exception:
+                    pass
+            raise RuntimeError(
+                f"{len(prepare_errors)} of {concurrency} throughput "
+                "connections failed during preparation; "
+                f"first_error={prepare_errors[0]}"
+            ) from prepare_errors[0]
+
+        prepared = [tls for tls, _ in prepared_results]
+        prepare_attempts = [
+            attempts for _, attempts in prepared_results
+        ]
         setup_finished = time.monotonic()
         start = threading.Event()
         futures = [
@@ -194,6 +253,11 @@ def run_stage(
         "concurrency": concurrency,
         "bytes_per_flow": size_bytes,
         "total_bytes": total_bytes,
+        "setup_parallelism": setup_parallelism,
+        "prepare_attempts_total": sum(prepare_attempts),
+        "prepare_retries": sum(
+            attempts - 1 for attempts in prepare_attempts
+        ),
         "setup_seconds": setup_finished - stage_started,
         "transfer_seconds": transfer_seconds,
         "end_to_end_seconds": end_to_end_seconds,
@@ -240,7 +304,8 @@ def run_matrix(
 
 def write_tsv(path, rows: list[dict[str, object]]) -> None:
     lines = [
-        "concurrency\tfile_mib\ttotal_mib\tsetup_s\ttransfer_s\t"
+        "concurrency\tfile_mib\ttotal_mib\tsetup_parallelism\t"
+        "prepare_retries\tsetup_s\ttransfer_s\t"
         "aggregate_mbps\tend_to_end_mbps\tflow_min_mbps\t"
         "flow_mean_mbps\tflow_max_mbps\tttfb_mean_ms"
     ]
@@ -253,6 +318,8 @@ def write_tsv(path, rows: list[dict[str, object]]) -> None:
                     str(row["concurrency"]),
                     f"{bytes_per_flow / 1024 / 1024:.0f}",
                     f"{total_bytes / 1024 / 1024:.0f}",
+                    str(row["setup_parallelism"]),
+                    str(row["prepare_retries"]),
                     f"{float(row['setup_seconds']):.3f}",
                     f"{float(row['transfer_seconds']):.3f}",
                     f"{float(row['aggregate_mbps']):.2f}",
