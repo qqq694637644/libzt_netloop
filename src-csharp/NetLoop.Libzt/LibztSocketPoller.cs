@@ -9,9 +9,9 @@ internal static class LibztSocketPoller
         int fd,
         short events,
         CancellationToken cancellationToken,
-        object? nativeGate = null,
-        Func<int>? currentFdProvider = null,
-        string disposedObjectName = "libzt socket")
+        object nativeGate,
+        Func<int> currentFdProvider,
+        string disposedObjectName)
     {
         while (true)
         {
@@ -24,26 +24,26 @@ internal static class LibztSocketPoller
             };
             int result;
             int socketError = 0;
-            if (nativeGate is null)
+            lock (nativeGate)
             {
-                result = PollOnce(
+                EnsureCurrentFd(
                     fd,
+                    currentFdProvider,
+                    cancellationToken,
+                    disposedObjectName);
+                result = LibztNative.Poll(
                     ref descriptor,
-                    out socketError);
-            }
-            else
-            {
-                lock (nativeGate)
+                    1,
+                    0);
+
+                var requestedReady = result > 0
+                    && (descriptor.Revents & events) != 0;
+                var hasPollError = result > 0
+                    && (descriptor.Revents
+                        & (LibztNative.PollError | LibztNative.PollInvalid)) != 0;
+                if (result < 0 || (!requestedReady && hasPollError))
                 {
-                    EnsureCurrentFd(
-                        fd,
-                        currentFdProvider,
-                        cancellationToken,
-                        disposedObjectName);
-                    result = PollOnce(
-                        fd,
-                        ref descriptor,
-                        out socketError);
+                    socketError = LibztNative.GetLastSocketError(fd);
                 }
             }
 
@@ -55,36 +55,16 @@ internal static class LibztSocketPoller
                 throw new LibztException(
                     "zts_bsd_poll",
                     result,
-                    nativeGate is null
-                        ? LibztNative.GetErrno()
-                        : socketError);
+                    socketError);
             }
 
             if (result > 0)
             {
-                var hasPollError = (descriptor.Revents
-                    & (LibztNative.PollError | LibztNative.PollInvalid)) != 0;
-
-                if (nativeGate is not null && hasPollError)
-                {
-                    if (cancellationToken.IsCancellationRequested)
-                        throw new OperationCanceledException(cancellationToken);
-
-                    if (socketError == 0)
-                    {
-                        throw new IOException(
-                            "libzt socket poll reported an error "
-                            + $"for fd {fd} (revents=0x{descriptor.Revents:x}).");
-                    }
-
-                    throw new LibztException(
-                        "zts_bsd_poll(revents)",
-                        LibztNative.ErrSocket,
-                        socketError);
-                }
-
                 if ((descriptor.Revents & events) != 0)
                     return;
+
+                var hasPollError = (descriptor.Revents
+                    & (LibztNative.PollError | LibztNative.PollInvalid)) != 0;
 
                 if (hasPollError)
                 {
@@ -113,38 +93,17 @@ internal static class LibztSocketPoller
 
     private static void EnsureCurrentFd(
         int expectedFd,
-        Func<int>? currentFdProvider,
+        Func<int> currentFdProvider,
         CancellationToken cancellationToken,
         string disposedObjectName)
     {
-        if (currentFdProvider is null
-            || currentFdProvider() == expectedFd)
-        {
+        if (currentFdProvider() == expectedFd)
             return;
-        }
 
         if (cancellationToken.IsCancellationRequested)
             throw new OperationCanceledException(cancellationToken);
 
         throw new ObjectDisposedException(disposedObjectName);
-    }
-
-    private static int PollOnce(
-        int fd,
-        ref LibztNative.PollFd descriptor,
-        out int socketError)
-    {
-        var result = LibztNative.Poll(
-            ref descriptor,
-            1,
-            0);
-        var hasSocketError = result < 0
-            || (descriptor.Revents
-                & (LibztNative.PollError | LibztNative.PollInvalid)) != 0;
-        socketError = hasSocketError
-            ? LibztNative.GetLastSocketError(fd)
-            : 0;
-        return result;
     }
 
     internal static bool IsWouldBlock(int error)

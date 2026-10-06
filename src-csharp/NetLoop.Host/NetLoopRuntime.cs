@@ -49,17 +49,18 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
     {
         var overlayBind = SelectOverlayBindAddress(state.ManagedAddresses);
         ValidateConfiguredOverlayAddresses(options, state.ManagedAddresses, overlayBind);
+        var defaultExit = options.DefaultExit
+            ?? throw new InvalidOperationException("Default exit is required.");
         var peers = options.Peers.ToHashSet();
-        if (options.DefaultExit is not null
-            && !overlayBind.Equals(options.DefaultExit))
+        if (!overlayBind.Equals(defaultExit))
         {
-            peers.Add(options.DefaultExit);
+            peers.Add(defaultExit);
         }
 
         var snapshot = new OverlayNetworkSnapshot(
             overlayBind,
             peers);
-        var selector = new RouteSelector(snapshot, options.DefaultExit);
+        var selector = new RouteSelector(snapshot, defaultExit);
 
         var libztConnector = new LibztTcpConnector(PeerConnectTimeout);
         var loopbackConnector = new LoopbackTcpConnector(options.ConnectTimeout);

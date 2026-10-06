@@ -40,7 +40,8 @@ v2rayNG owns:
 - TUN / hev-socks5-tunnel
 - Xray runtime
 - Android per-app routing
-- DNS and Xray routing
+- DNS interception/resolution plumbing
+- Xray traffic capture and protocol conversion
 - user-facing UI
 
 NetLoop owns:
@@ -55,6 +56,10 @@ NetLoop owns:
 - runtime reset
 
 The integration boundary for traffic remains SOCKS5 over localhost.
+
+When NetLoop mode is enabled, Xray does not choose the final Internet egress.
+All ordinary TCP, UDP, and DNS traffic that is not explicitly blocked is sent
+to the NetLoop SOCKS endpoint, and NetLoop owns peer routing and the final exit.
 
 Do not replace SOCKS5 with Binder, JNI, shared memory, or a custom packet protocol.
 
@@ -80,7 +85,6 @@ IPC carries only:
 - stop
 - configuration
 - current status
-- status notifications
 
 It never carries TCP or UDP content.
 
@@ -134,6 +138,7 @@ NetLoop
 Enabled          [ on/off ]
 
 Network ID       8056c2e21c000001
+Peer Managed IPs 172.26.0.20, 172.26.0.30, 172.26.0.254
 Default Exit     172.26.0.254
 
 Status           Ready
@@ -144,12 +149,13 @@ SOCKS            127.0.0.1:1080
 
 For the first version:
 
-- SOCKS host is fixed to `127.0.0.1`.
-- SOCKS port defaults to `1080`.
+- SOCKS is fixed to `127.0.0.1:1080`.
 - NetLoop state directory is internal to the NetLoop app.
 - overlay TCP/UDP ports keep their existing defaults.
-- only `networkId` and `defaultExit` are required for the normal UI.
-- optional peers may remain hidden from the initial UI unless they are required by an actual deployment.
+- `networkId`, explicit `peers`, and `defaultExit` are the required routing configuration.
+- `peers` contains every other participating node's primary Managed IP that this device must be able to reach directly.
+- `defaultExit` is required on every node; the exit node sets it to its own primary Managed IP.
+- do not add peer discovery, topology sync, or a controller-side peer database.
 
 Normal operation:
 
@@ -224,35 +230,29 @@ CONTROL_API_VERSION = 1
 Commands:
 
 ```text
-GET_API_VERSION
-GET_STATUS
 START
 STOP
-REGISTER_STATUS_CLIENT
-UNREGISTER_STATUS_CLIENT
+GET_STATUS
 ```
 
 Suggested START content:
 
 ```json
 {
+  "api_version": 1,
   "network_id": "8056c2e21c000001",
-  "default_exit": "172.26.0.254",
-  "socks_port": 1080
-}
-```
-
-If peer configuration is required later, extend the same content with:
-
-```json
-{
   "peers": [
-    "172.26.0.11"
-  ]
+    "172.26.0.20",
+    "172.26.0.30",
+    "172.26.0.254"
+  ],
+  "default_exit": "172.26.0.254"
 }
 ```
 
-Do not add compatibility layers for multiple historical schema versions. If the API version is incompatible, fail clearly.
+The request `api_version` must equal `CONTROL_API_VERSION`; otherwise reject
+START immediately. Do not add compatibility layers for multiple historical
+schema versions.
 
 ### 5.3 Status model
 
@@ -273,15 +273,15 @@ Status content:
   "state": "READY",
   "node_id": "abcdef1234",
   "primary_overlay_address": "172.26.0.10",
-  "socks_host": "127.0.0.1",
-  "socks_port": 1080,
   "last_error": null
 }
 ```
 
-A status callback is preferred over polling.
-
-v2rayNG may still issue `GET_STATUS` after binding or reconnecting.
+After START, v2rayNG polls `GET_STATUS` every 250 ms while state is STARTING.
+Stop polling once state becomes READY or ERROR. After a Binder reconnect,
+issue `GET_STATUS` once to recover current state. A Binder disconnect while
+NetLoop is expected to be running is itself a lifecycle signal; no callback
+registry is required.
 
 ---
 
@@ -301,7 +301,7 @@ Responsibilities:
 
 - hold the current public status
 - serialize START / STOP requests
-- publish status changes
+- answer current status queries
 - persist the latest runtime configuration snapshot
 - start the existing foreground `NetLoopService`
 - stop the existing foreground `NetLoopService`
@@ -321,7 +321,7 @@ Responsibilities:
 
 - accept explicit cross-app bindings
 - implement control protocol v1
-- send status callbacks
+- reject commands whose Binder calling UID does not belong to the expected v2rayNG package
 - reject malformed configuration
 - forward lifecycle requests to `NetLoopRuntimeController`
 
@@ -410,8 +410,8 @@ Add preferences for:
 ```text
 PREF_NETLOOP_ENABLED
 PREF_NETLOOP_NETWORK_ID
+PREF_NETLOOP_PEERS
 PREF_NETLOOP_DEFAULT_EXIT
-PREF_NETLOOP_SOCKS_PORT
 ```
 
 Do not duplicate ZeroTier identity/state in v2rayNG.
@@ -428,10 +428,10 @@ Responsibilities:
 
 - detect whether `com.libzt.netloop` is installed
 - bind/unbind the control service
-- verify `CONTROL_API_VERSION`
-- send START/STOP
+- send START with `CONTROL_API_VERSION`
+- send STOP
+- poll GET_STATUS while STARTING and after reconnect
 - wait for READY
-- receive status changes
 - expose state to UI/service lifecycle
 - surface a concise failure reason
 
@@ -443,6 +443,7 @@ The v2rayNG settings page should provide:
 
 - enable/disable
 - network ID
+- peer Managed IP list
 - default exit
 - current plugin state
 - current node ID
@@ -699,7 +700,17 @@ Do not add:
 
 The control service should use an explicit component name.
 
-If caller filtering is desired, keep it lightweight and only allow the expected v2rayNG package/UID.
+Caller filtering is mandatory. Hard-code the expected personal v2rayNG package,
+`com.v2ray.ang`, in the NetLoop control service. For every Messenger command,
+read the Messenger `Message.sendingUid`, resolve packages for that UID with
+`PackageManager`, and process the command only if the expected package is
+present. Reject all other callers. Do not defer this check to a Handler-time
+`Binder.getCallingUid()` lookup because the Handler may no longer be executing
+inside the original incoming Binder transaction.
+
+If the personal v2rayNG fork uses another fixed application ID, change this one
+source constant together with the fork. Do not add certificate infrastructure,
+configurable ACLs, OAuth, or a general authorization framework.
 
 ---
 
@@ -767,8 +778,8 @@ Implement:
 - START
 - STOP
 - GET_STATUS
-- status callbacks
 - persisted runtime config snapshot
+- hard-coded v2rayNG caller UID/package check
 
 Do not modify SOCKS/libzt routing behavior.
 
@@ -779,7 +790,7 @@ Implement:
 - NetLoopPluginManager
 - install detection
 - bind/rebind
-- API version check
+- START request API version check
 - start/wait READY
 - stop
 - status presentation
@@ -790,10 +801,15 @@ At the end of this phase, v2rayNG can fully operate NetLoop without opening the 
 
 When NetLoop mode is enabled:
 
-- replace runtime proxy outbound with localhost SOCKS
-- preserve existing v2rayNG routing/DNS logic
-- keep TCP and UDP enabled
+- replace the runtime Internet outbound with SOCKS `127.0.0.1:1080`
+- route all ordinary TCP and UDP traffic to that NetLoop SOCKS outbound
+- route intercepted DNS through the same NetLoop path so name resolution also exits through the configured default exit
+- preserve explicit block rules only
+- do not preserve `direct`, alternate remote proxy outbounds, balancers, or region-based egress selection in NetLoop mode
 - prevent Xray start until NetLoop is READY
+
+In v1, Xray owns capture and protocol conversion, while NetLoop exclusively owns
+peer routing and final egress selection.
 
 ### Phase 4 - VPN exclusion correctness
 
@@ -878,8 +894,10 @@ The v1 product is intentionally only:
 
 ```text
 v2rayNG
-    → localhost SOCKS5
+    → all non-blocked TCP / UDP / DNS
+    → SOCKS5 127.0.0.1:1080
     → NetLoop
+    → self / explicit peer / required default exit
     → ZeroTier exit B
     → Internet
 ```
@@ -898,6 +916,8 @@ The integration is complete when all of the following are true:
 - NetLoop remains a separate C#/.NET Android runtime.
 - Xray talks to NetLoop only through localhost SOCKS5.
 - NetLoop physical sockets never recurse into the v2rayNG VPN.
-- TCP and UDP both exit through the configured ZeroTier exit B.
+- peer Managed IPs are explicitly configured in v2rayNG and passed to NetLoop.
+- `default_exit` is required on every node, including the exit node itself.
+- non-blocked TCP, UDP, and DNS all exit through the configured ZeroTier exit B.
 - Network switching does not require manually reopening either app.
 - Both projects can still be built and upgraded independently.

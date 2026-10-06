@@ -54,9 +54,12 @@ internal sealed record AndroidConfig(
 
         var peers = ParsePeers(config.Peers);
         var defaultExitText = config.DefaultExit.Trim();
-        var defaultExit = defaultExitText.Length == 0
-            ? null
-            : IPAddress.Parse(defaultExitText);
+        if (defaultExitText.Length == 0)
+        {
+            throw new InvalidOperationException(
+                "Configure the default exit Managed IP before starting NetLoop.");
+        }
+        var defaultExit = IPAddress.Parse(defaultExitText);
         var overlayPort = ParsePort(
             config.OverlayPort,
             "overlay TCP",
@@ -66,7 +69,20 @@ internal sealed record AndroidConfig(
             "overlay UDP",
             42043);
 
-        var upstreamHost = config.UpstreamHost.Trim();
+        var upstreamHost = EmptyToNull(config.UpstreamHost);
+        var upstreamUsername = EmptyToNull(config.UpstreamUser);
+        var upstreamPassword = EmptyToNull(config.UpstreamPassword);
+        if (upstreamHost is null
+            && (upstreamUsername is not null || upstreamPassword is not null))
+        {
+            throw new InvalidOperationException(
+                "Upstream SOCKS5 credentials require an upstream host.");
+        }
+        if (upstreamPassword is not null && upstreamUsername is null)
+        {
+            throw new InvalidOperationException(
+                "Upstream SOCKS5 username is required when a password is set.");
+        }
         var upstreamPortText = config.UpstreamPort.Trim();
         if (!ushort.TryParse(upstreamPortText, out var upstreamPort)
             || upstreamPort == 0)
@@ -84,19 +100,18 @@ internal sealed record AndroidConfig(
         var options = new HostOptions {
             NetworkId = networkId,
             StateDirectory = stateDirectory,
-            SocksAddress = IPAddress.Loopback,
             SocksPort = 1080,
             OverlayPort = overlayPort,
             OverlayUdpPort = overlayUdpPort,
             DefaultExit = defaultExit,
             Peers = peers,
-            Egress = upstreamHost.Length == 0
+            Egress = upstreamHost is null
                 ? "direct"
                 : "upstream-socks5",
-            UpstreamHost = upstreamHost.Length == 0 ? null : upstreamHost,
+            UpstreamHost = upstreamHost,
             UpstreamPort = upstreamPort,
-            UpstreamUsername = EmptyToNull(config.UpstreamUser),
-            UpstreamPassword = EmptyToNull(config.UpstreamPassword),
+            UpstreamUsername = upstreamUsername,
+            UpstreamPassword = upstreamPassword,
             StartupTimeout = TimeSpan.FromSeconds(120),
             ConnectTimeout = TimeSpan.FromSeconds(20),
             UdpIdleTimeout = TimeSpan.FromSeconds(60),

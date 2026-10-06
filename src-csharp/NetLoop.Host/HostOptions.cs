@@ -8,7 +8,6 @@ internal sealed class HostOptions
         [
             "--network",
             "--state-dir",
-            "--socks-host",
             "--socks-port",
             "--overlay-port",
             "--overlay-udp-port",
@@ -30,7 +29,7 @@ internal sealed class HostOptions
 
     internal ulong NetworkId { get; init; }
     internal required string StateDirectory { get; init; }
-    internal IPAddress SocksAddress { get; init; } = IPAddress.Loopback;
+    internal IPAddress SocksAddress => IPAddress.Loopback;
     internal ushort SocksPort { get; init; } = 1080;
     internal ushort OverlayPort { get; init; } = 42042;
     internal ushort OverlayUdpPort { get; init; } = 42043;
@@ -72,7 +71,13 @@ internal sealed class HostOptions
                 throw new ArgumentException($"Missing value for {key}");
 
             if (!values.TryGetValue(key, out var list))
+            {
                 values[key] = list = [];
+            }
+            else if (key != "--peer")
+            {
+                throw new ArgumentException($"Duplicate option: {key}");
+            }
             list.Add(args[index]);
         }
 
@@ -87,9 +92,7 @@ internal sealed class HostOptions
 
         var peerValues = Values(values, "--peer");
         var peers = peerValues.Select(IPAddress.Parse).Distinct().ToArray();
-        var defaultExit = Optional(values, "--default-exit") is { } exit
-            ? IPAddress.Parse(exit)
-            : null;
+        var defaultExit = IPAddress.Parse(Required(values, "--default-exit"));
 
         var egress = Optional(values, "--egress") ?? "direct";
         if (egress is not ("direct" or "upstream-socks5"))
@@ -110,7 +113,6 @@ internal sealed class HostOptions
         return new HostOptions {
             NetworkId = networkId,
             StateDirectory = stateDirectory,
-            SocksAddress = IPAddress.Parse(Optional(values, "--socks-host") ?? "127.0.0.1"),
             SocksPort = ParsePort(Optional(values, "--socks-port") ?? "1080", "--socks-port"),
             OverlayPort = ParsePort(Optional(values, "--overlay-port") ?? "42042", "--overlay-port"),
             OverlayUdpPort = ParsePort(Optional(values, "--overlay-udp-port") ?? "42043", "--overlay-udp-port"),
@@ -155,15 +157,14 @@ internal sealed class HostOptions
 
     internal static string Usage =>
         """
-        netloop --network <hex> --state-dir <dir> [options]
+        netloop --network <hex> --state-dir <dir> --default-exit <managed-ip> [options]
 
         Options:
-          --socks-host <ip>           Local SOCKS5 address (default 127.0.0.1)
           --socks-port <port>         Local SOCKS5 port (default 1080)
           --overlay-port <port>       NetLoop peer Agent TCP port (default 42042)
           --overlay-udp-port <port>   NetLoop peer Agent UDP port (default 42043)
           --peer <managed-ip>         Peer primary Managed IP; repeatable
-          --default-exit <managed-ip> Primary Managed IP of default egress peer
+          --default-exit <managed-ip> Required primary Managed IP of default egress peer
           --egress <mode>             direct | upstream-socks5 (default direct)
           --upstream-host <host>      Upstream SOCKS5 host
           --upstream-port <port>      Upstream SOCKS5 port (default 1080)

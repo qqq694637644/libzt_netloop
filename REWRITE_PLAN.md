@@ -86,9 +86,11 @@ Agent 和 RouteSelector 都只使用这个地址；status 只暴露
 
 统一出网是核心功能，不是附加功能。
 
-每个 Node 可以配置：
+每个 Node 必须配置：
 
     default_exit = 172.26.0.254
+
+出口节点自身也填写自己的 primary overlay address。没有 `default_exit` 时直接拒绝启动，不回退到本机出网。
 
 路由逻辑保持极简：
 

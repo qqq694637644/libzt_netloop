@@ -406,8 +406,6 @@ def start_client(
         rendezvous["network_id"],
         "--state-dir",
         str(ROOT / "state" / "csharp-ci-client"),
-        "--socks-host",
-        "127.0.0.1",
         "--socks-port",
         str(listen_port),
         "--overlay-port",

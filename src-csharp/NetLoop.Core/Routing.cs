@@ -37,9 +37,9 @@ public sealed class OverlayNetworkSnapshot
 public sealed class RouteSelector
 {
     private readonly OverlayNetworkSnapshot _network;
-    private readonly IPAddress? _defaultExit;
+    private readonly IPAddress _defaultExit;
 
-    public RouteSelector(OverlayNetworkSnapshot network, IPAddress? defaultExit)
+    public RouteSelector(OverlayNetworkSnapshot network, IPAddress defaultExit)
     {
         _network = network;
         _defaultExit = defaultExit;
@@ -64,12 +64,9 @@ public sealed class RouteSelector
         if (overlayIngress)
             return new RouteDecision(RouteKind.LocalEgress, null, "overlay peer selected this node as final egress");
 
-        if (_defaultExit is not null && _network.IsSelf(_defaultExit))
+        if (_network.IsSelf(_defaultExit))
             return new RouteDecision(RouteKind.LocalEgress, null, "this node is the configured default exit");
 
-        if (_defaultExit is not null)
-            return new RouteDecision(RouteKind.DefaultExit, _defaultExit, "non-overlay target uses configured default exit");
-
-        return new RouteDecision(RouteKind.LocalEgress, null, "no default exit configured; this node is local egress");
+        return new RouteDecision(RouteKind.DefaultExit, _defaultExit, "non-overlay target uses configured default exit");
     }
 }
