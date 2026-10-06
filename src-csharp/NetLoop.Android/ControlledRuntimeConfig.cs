@@ -1,6 +1,5 @@
 using System.Globalization;
 using System.Net;
-using System.Text.Json;
 using Android.Content;
 using NetLoop.Host;
 
@@ -8,8 +7,6 @@ namespace NetLoop.Android;
 
 internal sealed class ControlledRuntimeConfig
 {
-    private const string ConfigFileName = "netloop-runtime-config.json";
-
     private ControlledRuntimeConfig(
         ulong networkId,
         IPAddress defaultExit,
@@ -79,57 +76,6 @@ internal sealed class ControlledRuntimeConfig
                 .ToArray());
     }
 
-    internal static ControlledRuntimeConfig Load(Context context)
-        => TryLoad(context)
-           ?? throw new InvalidOperationException(
-               "Controlled NetLoop runtime configuration is missing.");
-
-    internal static ControlledRuntimeConfig? TryLoad(Context context)
-    {
-        var path = GetConfigPath(context);
-        if (!File.Exists(path))
-            return null;
-
-        var snapshot = JsonSerializer.Deserialize<Snapshot>(
-                           File.ReadAllText(path),
-                           new JsonSerializerOptions {
-                               PropertyNameCaseInsensitive = true
-                           })
-                       ?? throw new InvalidOperationException(
-                           "Controlled NetLoop runtime configuration is empty.");
-
-        return Parse(
-            snapshot.NetworkId,
-            snapshot.DefaultExit,
-            snapshot.Peers ?? []);
-    }
-
-    internal void Save(Context context)
-    {
-        var snapshot = new Snapshot(
-            NetworkId.ToString("x16", CultureInfo.InvariantCulture),
-            DefaultExit.ToString(),
-            Peers.Select(static peer => peer.ToString()).ToArray());
-
-        var path = GetConfigPath(context);
-        var temp = path + ".tmp";
-        File.WriteAllText(
-            temp,
-            JsonSerializer.Serialize(
-                snapshot,
-                new JsonSerializerOptions {
-                    WriteIndented = true
-                }));
-        File.Move(temp, path, true);
-    }
-
-    internal static void Clear(Context context)
-    {
-        var path = GetConfigPath(context);
-        if (File.Exists(path))
-            File.Delete(path);
-    }
-
     internal HostOptions BuildRuntimeOptions(Context context)
         => new() {
             NetworkId = NetworkId,
@@ -162,19 +108,6 @@ internal sealed class ControlledRuntimeConfig
         return Peers.SequenceEqual(other.Peers);
     }
 
-    private static string GetConfigPath(Context context)
-    {
-        var directory = context.FilesDir?.AbsolutePath
-            ?? throw new InvalidOperationException(
-                "Android FilesDir is unavailable.");
-        return Path.Combine(directory, ConfigFileName);
-    }
-
     private static string AddressSortKey(IPAddress address)
         => $"{(int)address.AddressFamily:D4}:{Convert.ToHexString(address.GetAddressBytes())}";
-
-    private sealed record Snapshot(
-        string NetworkId,
-        string DefaultExit,
-        string[]? Peers);
 }

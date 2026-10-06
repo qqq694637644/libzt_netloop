@@ -59,8 +59,9 @@ The integration boundary for traffic remains SOCKS5 over localhost.
 
 When NetLoop mode is enabled, Xray does not choose the final Internet egress.
 Captured TCP, UDP, and DNS traffic is sent to the NetLoop SOCKS endpoint, and
-NetLoop owns peer routing and the final exit. Existing v2rayNG routing rules,
-including block rules, do not participate in NetLoop mode.
+NetLoop owns peer routing and the final exit. Existing v2rayNG direct/proxy/
+balancer/regional routing rules do not participate in NetLoop mode. Existing
+explicit block rules may be preserved before the final NetLoop catch-all.
 
 Do not replace SOCKS5 with Binder, JNI, shared memory, or a custom packet protocol.
 
@@ -188,7 +189,7 @@ if start_status.state == READY:
 if start_status.state == STARTING:
     poll GET_STATUS every 250 ms
     READY → start Xray and establish VPN/TUN
-    ERROR → fail
+    STOPPED or Binder disconnect → fail
 ```
 
 This is the only v1 startup/rebind decision flow.
@@ -199,7 +200,7 @@ unambiguous configuration transition.
 
 START itself is also frozen:
 
-- STOPPED/ERROR + START -> start with the supplied configuration.
+- STOPPED + START -> start with the supplied configuration.
 - READY/STARTING + START with the same normalized configuration -> idempotent;
   return the current status and do not restart anything.
 - READY/STARTING + START with a different configuration -> reject with
@@ -209,8 +210,8 @@ Configuration equality compares only the v1 controlled fields:
 `network_id`, `default_exit`, and the normalized optional `peers` set.
 No hot reload or implicit STOP/START is performed.
 
-The running runtime must also have been started from the controlled
-`netloop-runtime-config.json` snapshot. A standalone runtime is never considered
+The running runtime must also have been started from the controlled in-memory
+configuration. A standalone runtime is never considered
 equal to a controlled START, even if `network_id`, `default_exit`, and
 `peers` happen to match, because standalone egress may include upstream SOCKS.
 In that case START rejects with "stop before changing configuration".
@@ -312,15 +313,17 @@ fields are never inherited by v2rayNG-controlled mode. This prevents accidental
 Xray -> NetLoop -> Xray proxy recursion and intentionally does not implement
 proxy chaining in v1.
 
-Keep the two persisted inputs physically separate:
+During the transition period, keep standalone persisted configuration separate
+from controlled state:
 
 ```text
-netloop-config.json          standalone UI configuration
-netloop-runtime-config.json  v2rayNG-controlled configuration
+netloop-config.json          standalone UI configuration (temporary)
+controlled config            memory only, supplied by START(full config)
 ```
 
-Do not reuse one JSON file with a mode field and do not merge one snapshot into
-the other.
+Do not persist the controlled configuration and do not merge the standalone
+snapshot into it. v2rayNG is the controlled-mode source of truth and sends the
+full desired configuration after every bind/rebind.
 
 ### 5.3 Status model
 
@@ -330,7 +333,6 @@ Keep the public status model small:
 STOPPED
 STARTING
 READY
-ERROR
 ```
 
 Status content:
@@ -340,19 +342,23 @@ Status content:
   "api_version": 1,
   "state": "READY",
   "node_id": "abcdef1234",
-  "primary_overlay_address": "172.26.0.10",
-  "last_error": null
+  "primary_overlay_address": "172.26.0.10"
 }
 ```
 
 `GET_STATUS` is the single version-and-state query. v2rayNG calls it immediately
 after binding and validates `api_version`, then always sends START with the
-desired configuration. START either starts STOPPED/ERROR, idempotently validates
+desired configuration. START either starts STOPPED, idempotently validates
 READY/STARTING with the same configuration, or rejects a different running
 configuration. While STARTING, poll every 250 ms and stop once state becomes
-READY or ERROR. After a Binder reconnect, repeat this same GET_STATUS -> START
+READY or STOPPED. After a Binder reconnect, repeat this same GET_STATUS -> START
 flow. A Binder disconnect while NetLoop is expected to be running is itself a
 lifecycle signal; no callback registry is required.
+
+There is no stable public `ERROR` state. Synchronous request/validation failures
+are returned directly as control errors. An asynchronous runtime failure stops
+`NetLoopService`, the process-final `:netloop` process exits, and v2rayNG
+observes Binder disconnect.
 
 ---
 
@@ -373,14 +379,12 @@ Responsibilities:
 - hold the current public status
 - serialize START / STOP requests
 - answer current status queries
-- persist the controlled runtime configuration in
-  `netloop-runtime-config.json`, separate from standalone
-  `netloop-config.json`
-- remember whether the active runtime was started from the controlled snapshot;
+- keep the active controlled runtime configuration in process memory only
+- remember whether the active runtime was started from controlled START;
   standalone runtime state never satisfies controlled START idempotency
 - start the existing foreground `NetLoopService`
 - stop the existing foreground `NetLoopService`
-- expose READY / ERROR information to `NetLoopControlService`
+- expose STOPPED / STARTING / READY information to `NetLoopControlService`
 
 Do not move the actual SOCKS/libzt runtime into the control service.
 
@@ -408,17 +412,14 @@ The existing `NetLoopService` remains:
 
 The control service should run in the same `:netloop` process so it can observe runtime status without introducing another IPC layer inside NetLoop.
 
-### 6.3 Persist only a runtime snapshot
+### 6.3 Controlled configuration is memory-only
 
 v2rayNG is the user-facing source of truth.
 
-NetLoop persists the last accepted runtime configuration only so Android process/service restart can recover without requiring the UI process to remain alive.
-
-Example internal file:
-
-```text
-files/netloop-runtime-config.json
-```
+NetLoop does not persist controlled `network_id`, `default_exit`, or `peers`.
+Every bind/rebind follows GET_STATUS -> START(full desired config). If the
+`:netloop` process dies, the in-memory configuration dies with it and v2rayNG
+supplies the desired configuration again.
 
 NetLoop continues to own:
 
@@ -431,6 +432,10 @@ libzt state
 ```
 
 The user should not need to edit NetLoop configuration separately.
+
+Controlled starts use `START_NOT_STICKY`. Android must not independently revive
+a controlled NetLoop runtime from stale desired state. The temporary standalone
+path may remain sticky while it is still used by existing Android CI/E2E.
 
 ### 6.4 Reuse existing runtime
 
@@ -448,7 +453,10 @@ Default exit peer
 
 Do not fork a second runtime implementation for plugin mode.
 
-Standalone UI and v2rayNG control must call the same runtime controller.
+Standalone UI and v2rayNG control reuse the same data-plane runtime. The
+standalone Android UI/config is transitional and should be deleted after the
+controlled path passes physical-device acceptance; do not build a compatibility
+migration layer for it.
 
 ### 6.5 Existing process-final shutdown
 
@@ -527,7 +535,6 @@ The v2rayNG settings page should provide:
 - current plugin state
 - current node ID
 - current Managed IP
-- last error
 
 Normal users should not need to open the NetLoop app.
 
@@ -538,6 +545,19 @@ NetLoop plugin is not installed.
 ```
 
 For the personal-use version, a simple error is enough. No marketplace/download/update framework is required.
+
+The v2rayNG manifest declares the known companion package explicitly:
+
+```xml
+<queries>
+    <package android:name="com.libzt.netloop" />
+</queries>
+```
+
+Do not add NetLoop-specific `QUERY_ALL_PACKAGES`; the integration needs only the
+known companion package visibility contract. If the host app independently
+needs broader package visibility for other existing features, that is outside
+the NetLoop plugin contract.
 
 ---
 
@@ -611,6 +631,44 @@ NetLoop disabled
 ```
 
 Do not introduce proxy-chain semantics in v1.
+
+### 8.4 Support both Android TUN engines
+
+NetLoop mode supports both existing v2rayNG TUN engines. Do not force one engine
+globally.
+
+Xray TUN path:
+
+```text
+Android VPN/TUN fd
+    ↓
+Xray tun inbound
+    ↓
+Xray SOCKS outbound 127.0.0.1:1080
+    ↓
+NetLoop
+```
+
+HEV path:
+
+```text
+Android VPN/TUN fd
+    ↓
+hev-socks5-tunnel
+    ↓
+Xray internal SOCKS inbound 127.0.0.1:10808
+    ↓
+Xray SOCKS outbound 127.0.0.1:1080
+    ↓
+NetLoop
+```
+
+`PREF_USE_HEV_TUNNEL` selects the engine. In NetLoop mode both engines use the
+same full-capture Android VPN routes and the same final NetLoop SOCKS outbound.
+HEV must be configured with IPv6 enabled regardless of the normal
+`PREF_IPV6_ENABLED` value, because NetLoop mode is always dual-stack. The
+internal HEV-facing SOCKS inbound is fixed, loopback-only, unauthenticated, and
+exists only for the HEV path; Xray TUN mode does not expose it.
 
 ---
 
@@ -719,14 +777,14 @@ binder disconnect
     ↓
 stop/pause the current NetLoop-mode data path
     ↓
-surface ERROR
+surface disconnected/failed state in v2rayNG UI
     ↓
 make one legal best-effort rebind/restart attempt
     ↓
 if Android permits the restart:
     run the canonical GET_STATUS/version/state flow from section 4
 else:
-    remain stopped/error until the user presses Connect again
+    remain stopped until the user presses Connect again
 ```
 
 Do not silently continue sending Xray traffic into a dead localhost SOCKS port.
@@ -744,6 +802,10 @@ bind NetLoop
     ↓
 run the canonical GET_STATUS/version/state flow from section 4
 ```
+
+NetLoop controlled mode itself is not sticky and has no persisted controlled
+configuration. Recovery is always initiated from v2rayNG with a fresh
+START(full desired config).
 
 ---
 
@@ -878,7 +940,7 @@ Implement:
 - START
 - STOP
 - GET_STATUS
-- persisted runtime config snapshot
+- in-memory controlled runtime config only
 - hard-coded v2rayNG caller UID/package check
 
 Do not modify SOCKS/libzt routing behavior.
@@ -908,13 +970,15 @@ When NetLoop mode is enabled:
   the active profile's routing rules
 - route all captured TCP and UDP traffic to that NetLoop SOCKS outbound
 - route intercepted DNS through the same NetLoop path so name resolution also exits through the configured default exit
-- ignore all existing user/profile routing rules in NetLoop mode, including
-  block/private-IP/direct rules, alternate proxy outbounds, balancers, regional
-  rules, and the selected remote server profile
+- preserve only explicit block rules; ignore private-IP/direct rules, alternate
+  proxy outbounds, balancers, regional rules, and the selected remote server
+  profile
 - prevent Xray start until NetLoop is READY
 - force VPN route capture of both `0.0.0.0/0` and `::/0`, configure both
   IPv4 and IPv6 VPN interface addresses, and ignore both normal LAN-bypass and
   normal IPv6-enable preferences
+- support both existing TUN engines: Xray TUN and HEV; the engine preference
+  changes only the VPN-to-Xray ingress path, never the final NetLoop egress
 
 In v1, Xray owns capture and protocol conversion, while NetLoop exclusively owns
 peer routing and final egress selection.
@@ -938,12 +1002,16 @@ both address families explicitly.
 
 ### Phase 5 - UI cleanup
 
-Once control integration is stable:
+After the controlled path passes physical-device acceptance:
 
 - make v2rayNG the only normal UI
-- optionally remove NetLoop launcher entry
+- delete the standalone NetLoop Android network/upstream configuration UI and
+  `netloop-config.json` path in one breaking cleanup
+- remove the standalone Android START path and its sticky recovery behavior
+- remove the NetLoop launcher entry unless a read-only diagnostic Activity is retained
 - retain a minimal NetLoop diagnostic screen only if useful
 - do not duplicate configuration screens
+- do not add migration/compatibility fallback for the removed standalone mode
 
 ---
 
@@ -968,9 +1036,12 @@ v2rayNG:
   LAN-bypass and IPv6 preferences
 - inspect/assert the generated NetLoop-mode Xray JSON, not only the Kotlin
   builder code: captured TCP/UDP and DNS must resolve to the NetLoop SOCKS
-  path, with no inherited user/profile routing rule, block rule, final
-  `TAG_DIRECT`, alternate proxy outbound, balancer, regional routing, or
-  domestic-DNS direct egress
+  path, with no inherited user/profile direct/proxy rule, final `TAG_DIRECT`,
+  alternate proxy outbound, balancer, regional routing, or domestic-DNS direct
+  egress; explicit block rules are the only preserved user routing rules
+- validate both NetLoop ingress variants at config/build level: Xray TUN must
+  contain one tun inbound and no HEV-facing SOCKS inbound; HEV must contain the
+  fixed loopback `127.0.0.1:10808` SOCKS inbound and no Xray tun inbound
 
 Do not require Android emulator E2E as part of routine CI.
 
@@ -982,21 +1053,26 @@ Minimum acceptance cases:
 
 1. NetLoop not installed -> v2rayNG gives a clear error.
 2. NetLoop installed but stopped -> one Connect action starts both components.
-3. NetLoop READY -> Xray uses `127.0.0.1:1080`.
-4. TCP public IP is remote exit B.
-5. UDP public IP is remote exit B.
-6. DNS leak check shows DNS queries also leave through the NetLoop/exit-B path,
+3. Xray TUN mode: NetLoop READY -> Xray tun inbound -> SOCKS outbound
+   `127.0.0.1:1080`.
+4. HEV mode: NetLoop READY -> HEV -> Xray internal SOCKS
+   `127.0.0.1:10808` -> SOCKS outbound `127.0.0.1:1080`.
+5. Both Xray TUN and HEV capture IPv4 + IPv6 regardless of the normal IPv6
+   preference.
+6. TCP public IP is remote exit B in both TUN engines.
+7. UDP public IP is remote exit B in both TUN engines.
+8. DNS leak check shows DNS queries also leave through the NetLoop/exit-B path,
    not the Android device's local network resolver path.
-7. Wi-Fi -> cellular switch:
+9. Wi-Fi -> cellular switch:
    - NetLoop sees the physical network change.
    - old NetLoop sessions are reset.
    - new TCP/UDP sessions recover.
    - no VPN recursion occurs.
-8. cellular -> Wi-Fi switch behaves the same.
-9. Stop in v2rayNG stops Xray/VPN and NetLoop.
-10. Restart v2rayNG service while NetLoop is already READY -> v2rayNG rebinds and continues correctly.
-11. Kill NetLoop process while v2rayNG is active -> v2rayNG detects disconnect,
-    stops/pauses NetLoop mode, surfaces ERROR, and makes at most one legal
+10. cellular -> Wi-Fi switch behaves the same.
+11. Stop in v2rayNG stops Xray/VPN and NetLoop.
+12. Restart v2rayNG service while NetLoop is already READY -> v2rayNG rebinds and continues correctly.
+13. Kill NetLoop process while v2rayNG is active -> v2rayNG detects disconnect,
+    stops/pauses NetLoop mode, surfaces a disconnected/failed state, and makes at most one legal
     best-effort restart attempt. If Android rejects the background FGS start,
     recovery waits for the next user Connect action.
 

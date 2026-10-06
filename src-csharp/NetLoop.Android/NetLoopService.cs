@@ -71,35 +71,26 @@ public sealed class NetLoopService : Service
             _ = ObserveRunnerAsync(_runner);
         }
 
-        return StartCommandResult.Sticky;
+        return string.Equals(
+                   intent?.Action,
+                   ActionStartControlled,
+                   StringComparison.Ordinal)
+               ? StartCommandResult.NotSticky
+               : StartCommandResult.Sticky;
     }
 
     private async Task RunNetLoopAsync(
         string? startAction,
         CancellationToken cancellationToken)
     {
-        ControlledRuntimeConfig? controlledConfig;
-        HostOptions options;
-        if (string.Equals(
-                startAction,
-                ActionStart,
-                StringComparison.Ordinal))
-        {
-            ControlledRuntimeConfig.Clear(this);
-            controlledConfig = null;
-            options = AndroidConfig.Load(this).RuntimeOptions;
-        }
-        else
-        {
-            controlledConfig = string.Equals(
-                                   startAction,
-                                   ActionStartControlled,
-                                   StringComparison.Ordinal)
-                               ? ControlledRuntimeConfig.Load(this)
-                               : ControlledRuntimeConfig.TryLoad(this);
-            options = controlledConfig?.BuildRuntimeOptions(this)
+        var controlledConfig = string.Equals(
+            startAction,
+            ActionStartControlled,
+            StringComparison.Ordinal)
+            ? NetLoopRuntimeController.GetControlledConfigForService()
+            : null;
+        var options = controlledConfig?.BuildRuntimeOptions(this)
                       ?? AndroidConfig.Load(this).RuntimeOptions;
-        }
 
         NetLoopRuntimeController.ReportRuntimeStarting(controlledConfig);
 
@@ -241,7 +232,6 @@ public sealed class NetLoopService : Service
         }
         catch (Exception ex)
         {
-            NetLoopRuntimeController.ReportError(ex);
 #if NETLOOP_CI
             CiAutomationStatus.WriteError(this, ex);
 #endif

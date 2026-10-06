@@ -6,15 +6,13 @@ internal enum NetLoopPublicState
 {
     Stopped,
     Starting,
-    Ready,
-    Error
+    Ready
 }
 
 internal sealed record NetLoopPublicStatus(
     NetLoopPublicState State,
     string? NodeId,
-    string? PrimaryOverlayAddress,
-    string? LastError);
+    string? PrimaryOverlayAddress);
 
 internal sealed record NetLoopControlResult(
     bool Success,
@@ -30,7 +28,6 @@ internal static class NetLoopRuntimeController
     private static bool _standaloneRuntime;
     private static string? _nodeId;
     private static string? _primaryOverlayAddress;
-    private static string? _lastError;
 
     internal static NetLoopPublicStatus GetStatus()
     {
@@ -62,13 +59,11 @@ internal static class NetLoopRuntimeController
                     "stop before changing configuration");
             }
 
-            desired.Save(context);
             _controlledConfig = desired;
             _standaloneRuntime = false;
             _state = NetLoopPublicState.Starting;
             _nodeId = null;
             _primaryOverlayAddress = null;
-            _lastError = null;
         }
 
         try
@@ -87,7 +82,7 @@ internal static class NetLoopRuntimeController
         }
         catch (Exception ex)
         {
-            ReportError(ex);
+            ReportStopped();
             return new NetLoopControlResult(
                 false,
                 GetStatus(),
@@ -104,7 +99,6 @@ internal static class NetLoopRuntimeController
             _standaloneRuntime = false;
             _nodeId = null;
             _primaryOverlayAddress = null;
-            _lastError = null;
         }
 
         context.StopService(new Intent(context, typeof(NetLoopService)));
@@ -120,7 +114,20 @@ internal static class NetLoopRuntimeController
             _standaloneRuntime = controlledConfig is null;
             _nodeId = null;
             _primaryOverlayAddress = null;
-            _lastError = null;
+        }
+    }
+
+    internal static ControlledRuntimeConfig GetControlledConfigForService()
+    {
+        lock (Gate)
+        {
+            if (_standaloneRuntime || _controlledConfig is null)
+            {
+                throw new InvalidOperationException(
+                    "Controlled NetLoop runtime configuration is unavailable.");
+            }
+
+            return _controlledConfig;
         }
     }
 
@@ -131,7 +138,6 @@ internal static class NetLoopRuntimeController
             _state = NetLoopPublicState.Starting;
             _nodeId = null;
             _primaryOverlayAddress = null;
-            _lastError = null;
         }
     }
 
@@ -144,7 +150,6 @@ internal static class NetLoopRuntimeController
             _state = NetLoopPublicState.Ready;
             _nodeId = nodeId.ToString("x10");
             _primaryOverlayAddress = primaryOverlayAddress;
-            _lastError = null;
         }
     }
 
@@ -157,20 +162,6 @@ internal static class NetLoopRuntimeController
             _standaloneRuntime = false;
             _nodeId = null;
             _primaryOverlayAddress = null;
-            _lastError = null;
-        }
-    }
-
-    internal static void ReportError(Exception error)
-    {
-        lock (Gate)
-        {
-            _state = NetLoopPublicState.Error;
-            _nodeId = null;
-            _primaryOverlayAddress = null;
-            _lastError = string.IsNullOrWhiteSpace(error.Message)
-                ? error.GetType().Name
-                : error.Message;
         }
     }
 
@@ -178,6 +169,5 @@ internal static class NetLoopRuntimeController
         => new(
             _state,
             _nodeId,
-            _primaryOverlayAddress,
-            _lastError);
+            _primaryOverlayAddress);
 }

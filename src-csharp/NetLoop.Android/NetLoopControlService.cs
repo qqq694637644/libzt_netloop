@@ -67,7 +67,6 @@ public sealed class NetLoopControlService : Service
                         new NetLoopPublicStatus(
                             NetLoopPublicState.Stopped,
                             null,
-                            null,
                             null));
                     new Handler(Looper.MainLooper!).Post(
                         () => NetLoopRuntimeController.Stop(this));
@@ -182,14 +181,12 @@ public sealed class NetLoopControlService : Service
             status.State switch {
                 NetLoopPublicState.Starting => "STARTING",
                 NetLoopPublicState.Ready => "READY",
-                NetLoopPublicState.Error => "ERROR",
                 _ => "STOPPED"
             });
         data.PutString("node_id", status.NodeId);
         data.PutString(
             "primary_overlay_address",
             status.PrimaryOverlayAddress);
-        data.PutString("last_error", status.LastError);
         data.PutString("error", error);
         return data;
     }
