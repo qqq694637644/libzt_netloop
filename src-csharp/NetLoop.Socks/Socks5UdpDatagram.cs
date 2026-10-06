@@ -5,7 +5,7 @@ using NetLoop.Core;
 
 namespace NetLoop.Socks;
 
-public readonly record struct Socks5UdpPacket(ProxyTarget Target, ReadOnlyMemory<byte> Payload)
+public readonly record struct Socks5UdpPacket(ProxyTarget Target, ReadOnlyMemory<byte> Content)
 {
     public static bool TryParse(
         ReadOnlyMemory<byte> datagram,
@@ -103,17 +103,17 @@ public readonly record struct Socks5UdpPacket(ProxyTarget Target, ReadOnlyMemory
         return true;
     }
 
-    public static byte[] Build(ProxyTarget source, ReadOnlySpan<byte> payload)
+    public static byte[] Build(ProxyTarget source, ReadOnlySpan<byte> content)
     {
         var request = Socks5Protocol.BuildTargetRequest(0, source);
         // BuildTargetRequest emits VER/CMD/RSV/ATYP. SOCKS UDP needs RSV/FRAG/ATYP,
         // so drop VER and reuse the encoded ATYP/address/port.
-        var result = new byte[3 + (request.Length - 3) + payload.Length];
+        var result = new byte[3 + (request.Length - 3) + content.Length];
         result[0] = 0;
         result[1] = 0;
         result[2] = 0;
         request.AsSpan(3).CopyTo(result.AsSpan(3));
-        payload.CopyTo(result.AsSpan(request.Length));
+        content.CopyTo(result.AsSpan(request.Length));
         return result;
     }
 }

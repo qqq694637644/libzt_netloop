@@ -5,13 +5,13 @@ using System.Threading.Channels;
 
 namespace NetLoop.Core;
 
-public sealed record ProxyUdpDatagram(ProxyTarget Source, byte[] Payload);
+public sealed record ProxyUdpDatagram(ProxyTarget Source, byte[] Content);
 
 public interface IProxyUdpTransport : IAsyncDisposable
 {
     ValueTask SendAsync(
         ProxyTarget target,
-        ReadOnlyMemory<byte> payload,
+        ReadOnlyMemory<byte> content,
         CancellationToken cancellationToken);
 
     ValueTask<ProxyUdpDatagram> ReceiveAsync(CancellationToken cancellationToken);
@@ -63,7 +63,7 @@ public sealed class SystemUdpTransport : IProxyUdpTransport
 
     public async ValueTask SendAsync(
         ProxyTarget target,
-        ReadOnlyMemory<byte> payload,
+        ReadOnlyMemory<byte> content,
         CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
@@ -72,7 +72,7 @@ public sealed class SystemUdpTransport : IProxyUdpTransport
         TouchDestination(endpoint);
 
         var client = address.AddressFamily == AddressFamily.InterNetwork ? _ipv4 : _ipv6;
-        _ = await client.SendAsync(payload, endpoint, cancellationToken).ConfigureAwait(false);
+        _ = await client.SendAsync(content, endpoint, cancellationToken).ConfigureAwait(false);
     }
 
     public async ValueTask<ProxyUdpDatagram> ReceiveAsync(CancellationToken cancellationToken)

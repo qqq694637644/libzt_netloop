@@ -68,12 +68,12 @@ def build_stun_binding_request(transaction_id: bytes | None = None) -> tuple[byt
     )
 
 
-def parse_stun_public_ip(payload: bytes, transaction_id: bytes) -> str:
-    if len(payload) < 20:
+def parse_stun_public_ip(content: bytes, transaction_id: bytes) -> str:
+    if len(content) < 20:
         raise ValueError("truncated STUN response")
 
-    message_type, message_length, cookie = struct.unpack("!HHI", payload[:8])
-    response_transaction_id = payload[8:20]
+    message_type, message_length, cookie = struct.unpack("!HHI", content[:8])
+    response_transaction_id = content[8:20]
     if message_type != 0x0101:
         raise ValueError(f"unexpected STUN message type 0x{message_type:04x}")
     if cookie != STUN_MAGIC_COOKIE:
@@ -81,17 +81,17 @@ def parse_stun_public_ip(payload: bytes, transaction_id: bytes) -> str:
     if response_transaction_id != transaction_id:
         raise ValueError("STUN transaction ID mismatch")
 
-    end = min(len(payload), 20 + message_length)
+    end = min(len(content), 20 + message_length)
     offset = 20
     while offset + 4 <= end:
         attribute_type, attribute_length = struct.unpack(
-            "!HH", payload[offset : offset + 4]
+            "!HH", content[offset : offset + 4]
         )
         value_start = offset + 4
         value_end = value_start + attribute_length
         if value_end > end:
             raise ValueError("truncated STUN attribute")
-        value = payload[value_start:value_end]
+        value = content[value_start:value_end]
 
         if attribute_type in (0x0020, 0x0001) and len(value) >= 8:
             family = value[1]
@@ -135,8 +135,8 @@ def stun_public_ip(
                 with socket.socket(family, sock_type, protocol) as udp:
                     udp.settimeout(timeout)
                     udp.sendto(request, sockaddr)
-                    payload, _ = udp.recvfrom(4096)
-                    return parse_stun_public_ip(payload, transaction_id)
+                    content, _ = udp.recvfrom(4096)
+                    return parse_stun_public_ip(content, transaction_id)
             except Exception as exc:
                 last_error = exc
 

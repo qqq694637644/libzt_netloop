@@ -8,14 +8,14 @@ public static class JsonLog
 
     public static void Write(string level, string eventName, object? data = null)
     {
-        var payload = new Dictionary<string, object?> {
+        var content = new Dictionary<string, object?> {
             ["ts"] = DateTimeOffset.UtcNow,
             ["level"] = level,
             ["event"] = eventName,
             ["data"] = data
         };
 
-        var line = JsonSerializer.Serialize(payload);
+        var line = JsonSerializer.Serialize(content);
         lock (Gate)
         {
             Console.Out.WriteLine(line);

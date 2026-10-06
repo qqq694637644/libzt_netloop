@@ -54,7 +54,7 @@ internal sealed class OverlayUdpAgent : IAsyncDisposable
             while (!cancellationToken.IsCancellationRequested)
             {
                 var datagram = await _socket.ReceiveFromAsync(cancellationToken).ConfigureAwait(false);
-                if (!Socks5UdpPacket.TryParse(datagram.Payload, out var packet, out var error))
+                if (!Socks5UdpPacket.TryParse(datagram.Content, out var packet, out var error))
                 {
                     JsonLog.Info("overlay_udp_packet_dropped", new {
                         source = datagram.RemoteEndPoint.ToString(),
@@ -80,7 +80,7 @@ internal sealed class OverlayUdpAgent : IAsyncDisposable
                 {
                     await association.ForwardAsync(
                         packet.Target,
-                        packet.Payload,
+                        packet.Content,
                         cancellationToken).ConfigureAwait(false);
                 }
                 catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
@@ -200,7 +200,7 @@ internal sealed class OverlayUdpAgent : IAsyncDisposable
         ProxyUdpDatagram datagram,
         CancellationToken cancellationToken)
     {
-        var packet = Socks5UdpPacket.Build(datagram.Source, datagram.Payload);
+        var packet = Socks5UdpPacket.Build(datagram.Source, datagram.Content);
         await _socket.SendToAsync(packet, peer, cancellationToken).ConfigureAwait(false);
     }
 
@@ -292,7 +292,7 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
 
     internal async ValueTask ForwardAsync(
         ProxyTarget target,
-        ReadOnlyMemory<byte> payload,
+        ReadOnlyMemory<byte> content,
         CancellationToken cancellationToken)
     {
         var decision = _selector.Select(target, overlayIngress: true);
@@ -302,7 +302,7 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
             case RouteKind.LocalLoopback:
                 await _localTransport.SendAsync(
                     MapToLoopback(target),
-                    payload,
+                    content,
                     cancellationToken).ConfigureAwait(false);
                 break;
 
@@ -311,7 +311,7 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
                     cancellationToken).ConfigureAwait(false);
                 await egressTransport.SendAsync(
                     target,
-                    payload,
+                    content,
                     cancellationToken).ConfigureAwait(false);
                 break;
 

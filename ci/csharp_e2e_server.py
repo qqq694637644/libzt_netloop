@@ -41,8 +41,8 @@ def wait_for_udp_echo(host: str, port: int, timeout: float = 20.0) -> None:
                 udp.settimeout(1.0)
                 token = b"netloop-udp-ready"
                 udp.sendto(token, (host, port))
-                payload, _ = udp.recvfrom(1024)
-                if payload == token:
+                content, _ = udp.recvfrom(1024)
+                if content == token:
                     return
         except Exception as exc:
             last_error = exc

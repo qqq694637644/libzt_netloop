@@ -271,11 +271,11 @@ def parse_json_logcat(serial: str) -> list[dict]:
         if start < 0:
             continue
         try:
-            payload = json.loads(line[start:])
+            content = json.loads(line[start:])
         except json.JSONDecodeError:
             continue
-        if isinstance(payload, dict):
-            events.append(payload)
+        if isinstance(content, dict):
+            events.append(content)
     return events
 
 

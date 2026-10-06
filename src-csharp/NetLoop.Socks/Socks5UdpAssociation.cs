@@ -226,7 +226,7 @@ internal sealed class Socks5UdpAssociation : ISocks5UdpAssociation
 
             await _transport.SendAsync(
                 packet.Target,
-                packet.Payload,
+                packet.Content,
                 cancellationToken).ConfigureAwait(false);
         }
     }
@@ -245,7 +245,7 @@ internal sealed class Socks5UdpAssociation : ISocks5UdpAssociation
                 continue;
             }
 
-            var packet = Socks5UdpPacket.Build(datagram.Source, datagram.Payload);
+            var packet = Socks5UdpPacket.Build(datagram.Source, datagram.Content);
             _ = await _relay.SendAsync(packet, client, cancellationToken).ConfigureAwait(false);
             Touch();
         }

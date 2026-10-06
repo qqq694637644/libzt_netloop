@@ -159,7 +159,7 @@ internal static class CiAutomationStatus
             });
     }
 
-    private static void Write(Context context, object payload)
+    private static void Write(Context context, object content)
     {
         var path = GetExternalPath(context);
         var directory = Path.GetDirectoryName(path)
@@ -171,7 +171,7 @@ internal static class CiAutomationStatus
         File.WriteAllText(
             temp,
             JsonSerializer.Serialize(
-                payload,
+                content,
                 new JsonSerializerOptions {
                     WriteIndented = true
                 }));

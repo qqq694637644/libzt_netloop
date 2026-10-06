@@ -204,9 +204,9 @@ class Socks5TestProxy:
 
             for source in ready:
                 destination = peers[source]
-                payload = source.recv(65536)
-                if payload:
-                    destination.sendall(payload)
+                content = source.recv(65536)
+                if content:
+                    destination.sendall(content)
                     continue
 
                 readable.discard(source)
@@ -249,8 +249,8 @@ class Socks5TestProxy:
             while True:
                 ready, _, _ = select.select([client, relay], [], [], 1.0)
                 if client in ready:
-                    payload = client.recv(1)
-                    if not payload:
+                    content = client.recv(1)
+                    if not content:
                         return
                     # No application data is defined on the control connection.
 
@@ -267,9 +267,9 @@ class Socks5TestProxy:
 
                 if source_endpoint == client_endpoint:
                     try:
-                        host, port, payload = parse_udp_target(packet)
+                        host, port, content = parse_udp_target(packet)
                         destination = self.resolve_udp_target(host, port)
-                        relay.sendto(payload, destination)
+                        relay.sendto(content, destination)
                         allowed_remotes.add((destination[0], destination[1]))
                     except Exception:
                         traceback.print_exc()

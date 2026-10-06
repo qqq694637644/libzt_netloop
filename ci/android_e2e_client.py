@@ -121,7 +121,7 @@ def trigger_udp_probe(
     mode: str,
     rendezvous: dict,
     timeout_ms: int,
-    payload: str | None = None,
+    content: str | None = None,
 ) -> None:
     command = [
         "shell",
@@ -156,8 +156,8 @@ def trigger_udp_probe(
         "timeout_ms",
         str(timeout_ms),
     ]
-    if payload is not None:
-        command.extend(["--es", "payload", payload])
+    if content is not None:
+        command.extend(["--es", "content", content])
     adb(*command, timeout=15)
 
 
@@ -188,14 +188,14 @@ def run_device_udp_probe(
     rendezvous: dict,
     timeout_ms: int,
     wait_timeout: float,
-    payload: str | None = None,
+    content: str | None = None,
 ) -> dict:
     trigger_udp_probe(
         request_id=request_id,
         mode=mode,
         rendezvous=rendezvous,
         timeout_ms=timeout_ms,
-        payload=payload,
+        content=content,
     )
     return wait_for_udp_probe(
         request_id,
@@ -349,8 +349,8 @@ def wait_stale_close(
     sock.settimeout(0.05)
     while time.monotonic() < deadline:
         try:
-            payload = sock.recv(1)
-            if payload:
+            content = sock.recv(1)
+            if content:
                 state["error"] = (
                     "stale Android SOCKS connection produced data during reset"
                 )
@@ -452,7 +452,7 @@ def probe_udp_after_abort(
         return
 
     del proxy_port
-    payload = f"netloop-android-reset-{cycle}"
+    content = f"netloop-android-reset-{cycle}"
     association_attempts = 0
     attempts = 0
     last_error: str | None = None
@@ -478,7 +478,7 @@ def probe_udp_after_abort(
                     remaining,
                     max(0.25, timeout_ms / 1000.0 + 0.35),
                 ),
-                payload=payload,
+                content=content,
             )
             if probe.get("success") is True:
                 state.update(

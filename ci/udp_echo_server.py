@@ -15,8 +15,8 @@ def main() -> int:
     with socket.socket(family, socket.SOCK_DGRAM) as udp:
         udp.bind((args.host, args.port))
         while True:
-            payload, remote = udp.recvfrom(65535)
-            udp.sendto(payload, remote)
+            content, remote = udp.recvfrom(65535)
+            udp.sendto(content, remote)
 
 
 if __name__ == "__main__":

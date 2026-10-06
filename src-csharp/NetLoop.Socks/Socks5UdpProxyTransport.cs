@@ -183,7 +183,7 @@ internal sealed class Socks5UdpProxyTransport : IProxyUdpTransport
 
     public async ValueTask SendAsync(
         ProxyTarget target,
-        ReadOnlyMemory<byte> payload,
+        ReadOnlyMemory<byte> content,
         CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
@@ -191,7 +191,7 @@ internal sealed class Socks5UdpProxyTransport : IProxyUdpTransport
             cancellationToken,
             _stop.Token);
 
-        var packet = Socks5UdpPacket.Build(target, payload.Span);
+        var packet = Socks5UdpPacket.Build(target, content.Span);
         _ = await _udp.SendAsync(
             packet,
             _relay,
@@ -228,7 +228,7 @@ internal sealed class Socks5UdpProxyTransport : IProxyUdpTransport
 
             return new ProxyUdpDatagram(
                 packet.Target,
-                packet.Payload.ToArray());
+                packet.Content.ToArray());
         }
     }
 

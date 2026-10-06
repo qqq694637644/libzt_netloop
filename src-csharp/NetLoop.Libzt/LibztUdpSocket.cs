@@ -5,7 +5,7 @@ using NetLoop.Core;
 
 namespace NetLoop.Libzt;
 
-public sealed record LibztUdpDatagram(IPEndPoint RemoteEndPoint, byte[] Payload);
+public sealed record LibztUdpDatagram(IPEndPoint RemoteEndPoint, byte[] Content);
 
 public sealed class LibztUdpSocket : IAsyncDisposable
 {
@@ -59,19 +59,19 @@ public sealed class LibztUdpSocket : IAsyncDisposable
     }
 
     public async ValueTask SendToAsync(
-        ReadOnlyMemory<byte> payload,
+        ReadOnlyMemory<byte> content,
         IPEndPoint remoteEndPoint,
         CancellationToken cancellationToken)
     {
-        if (payload.Length > MaxDatagramSize)
-            throw new ArgumentOutOfRangeException(nameof(payload), "UDP datagram exceeds 65535 bytes.");
+        if (content.Length > MaxDatagramSize)
+            throw new ArgumentOutOfRangeException(nameof(content), "UDP datagram exceeds 65535 bytes.");
 
         await _sendLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var bytes = payload.ToArray();
-            var payloadHandle = GCHandle.Alloc(bytes, GCHandleType.Pinned);
+            var bytes = content.ToArray();
+            var contentHandle = GCHandle.Alloc(bytes, GCHandleType.Pinned);
             var address = Marshal.AllocHGlobal(SocketAddressBufferSize);
             try
             {
@@ -98,7 +98,7 @@ public sealed class LibztUdpSocket : IAsyncDisposable
 
                     var sent = LibztNative.SendTo(
                         fd,
-                        payloadHandle.AddrOfPinnedObject(),
+                        contentHandle.AddrOfPinnedObject(),
                         checked((uint)bytes.Length),
                         0,
                         address,
@@ -118,7 +118,7 @@ public sealed class LibztUdpSocket : IAsyncDisposable
             finally
             {
                 Marshal.FreeHGlobal(address);
-                payloadHandle.Free();
+                contentHandle.Free();
             }
         }
         finally
@@ -181,11 +181,11 @@ public sealed class LibztUdpSocket : IAsyncDisposable
 
                 var ipText = Marshal.PtrToStringAnsi(text)
                     ?? throw new IOException("libzt returned an empty UDP source address.");
-                var payload = new byte[received];
-                Marshal.Copy(buffer, payload, 0, received);
+                var content = new byte[received];
+                Marshal.Copy(buffer, content, 0, received);
                 return new LibztUdpDatagram(
                     new IPEndPoint(IPAddress.Parse(ipText), port),
-                    payload);
+                    content);
             }
         }
         finally

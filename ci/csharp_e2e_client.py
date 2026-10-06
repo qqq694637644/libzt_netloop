@@ -104,35 +104,35 @@ def encode_socks_target(host: str, port: int) -> bytes:
     return b"\x03" + bytes([len(encoded)]) + encoded + struct.pack("!H", port)
 
 
-def decode_socks_endpoint(payload: bytes, offset: int = 0) -> tuple[str, int, int]:
-    if offset >= len(payload):
+def decode_socks_endpoint(content: bytes, offset: int = 0) -> tuple[str, int, int]:
+    if offset >= len(content):
         raise ValueError("truncated SOCKS5 address")
 
-    address_type = payload[offset]
+    address_type = content[offset]
     offset += 1
     if address_type == 1:
-        if len(payload) < offset + 4 + 2:
+        if len(content) < offset + 4 + 2:
             raise ValueError("truncated SOCKS5 IPv4 address")
-        host = socket.inet_ntop(socket.AF_INET, payload[offset : offset + 4])
+        host = socket.inet_ntop(socket.AF_INET, content[offset : offset + 4])
         offset += 4
     elif address_type == 4:
-        if len(payload) < offset + 16 + 2:
+        if len(content) < offset + 16 + 2:
             raise ValueError("truncated SOCKS5 IPv6 address")
-        host = socket.inet_ntop(socket.AF_INET6, payload[offset : offset + 16])
+        host = socket.inet_ntop(socket.AF_INET6, content[offset : offset + 16])
         offset += 16
     elif address_type == 3:
-        if len(payload) < offset + 1:
+        if len(content) < offset + 1:
             raise ValueError("truncated SOCKS5 domain length")
-        length = payload[offset]
+        length = content[offset]
         offset += 1
-        if len(payload) < offset + length + 2:
+        if len(content) < offset + length + 2:
             raise ValueError("truncated SOCKS5 domain")
-        host = payload[offset : offset + length].decode("ascii")
+        host = content[offset : offset + length].decode("ascii")
         offset += length
     else:
         raise ValueError(f"invalid SOCKS5 address type {address_type}")
 
-    port = struct.unpack("!H", payload[offset : offset + 2])[0]
+    port = struct.unpack("!H", content[offset : offset + 2])[0]
     offset += 2
     return host, port, offset
 
@@ -197,7 +197,7 @@ class SocksUdpAssociation:
         self,
         target_host: str,
         target_port: int,
-        payload: bytes,
+        content: bytes,
         *,
         frag: int = 0,
     ) -> None:
@@ -205,7 +205,7 @@ class SocksUdpAssociation:
             raise ValueError("SOCKS5 UDP FRAG must fit in one byte")
         packet = b"\x00\x00" + bytes([frag]) + encode_socks_target(
             target_host, target_port
-        ) + payload
+        ) + content
         self.udp.sendto(packet, self.relay)
 
     def receive(self, timeout: float = 15.0) -> tuple[str, int, bytes]:
@@ -220,18 +220,18 @@ class SocksUdpAssociation:
             raise RuntimeError(f"invalid SOCKS5 UDP response: {packet[:20].hex()}")
         if packet[2] != 0:
             raise RuntimeError(f"unexpected SOCKS5 UDP response FRAG={packet[2]}")
-        host, port, payload_offset = decode_socks_endpoint(packet, 3)
-        return host, port, packet[payload_offset:]
+        host, port, content_offset = decode_socks_endpoint(packet, 3)
+        return host, port, packet[content_offset:]
 
     def roundtrip(
         self,
         target_host: str,
         target_port: int,
-        payload: bytes,
+        content: bytes,
         *,
         timeout: float = 15.0,
     ) -> tuple[str, int, bytes]:
-        self.send(target_host, target_port, payload)
+        self.send(target_host, target_port, content)
         return self.receive(timeout)
 
     def close_control(self) -> None:
@@ -259,12 +259,12 @@ class SocksUdpAssociation:
 
 
 def verify_peer_local_udp(proxy_port: int, peer_ip: str, service_port: int) -> None:
-    payload = b"netloop-peer-udp-echo"
+    content = b"netloop-peer-udp-echo"
     with SocksUdpAssociation("127.0.0.1", proxy_port) as association:
         response_host, response_port, response = association.roundtrip(
             peer_ip,
             service_port,
-            payload,
+            content,
         )
         if ipaddress.ip_address(response_host) != ipaddress.ip_address(peer_ip):
             raise AssertionError(
@@ -276,16 +276,16 @@ def verify_peer_local_udp(proxy_port: int, peer_ip: str, service_port: int) -> N
                 "peer UDP response source port mismatch: "
                 f"expected_port={service_port}, observed_port={response_port}"
             )
-        if response != payload:
+        if response != content:
             raise AssertionError(
-                f"peer UDP echo mismatch: expected={payload!r}, observed={response!r}"
+                f"peer UDP echo mismatch: expected={content!r}, observed={response!r}"
             )
 
 
 def verify_udp_frag_rejected(proxy_port: int, peer_ip: str, service_port: int) -> None:
-    payload = b"netloop-frag-must-drop"
+    content = b"netloop-frag-must-drop"
     with SocksUdpAssociation("127.0.0.1", proxy_port) as association:
-        association.send(peer_ip, service_port, payload, frag=1)
+        association.send(peer_ip, service_port, content, frag=1)
         try:
             association.receive(timeout=1.0)
         except (TimeoutError, socket.timeout, ConnectionResetError, OSError):
@@ -294,8 +294,8 @@ def verify_udp_frag_rejected(proxy_port: int, peer_ip: str, service_port: int) -
             raise AssertionError("SOCKS5 UDP FRAG != 0 unexpectedly produced a response")
 
         # A malformed datagram must not poison the live association.
-        _, _, response = association.roundtrip(peer_ip, service_port, payload)
-        if response != payload:
+        _, _, response = association.roundtrip(peer_ip, service_port, content)
+        if response != content:
             raise AssertionError("UDP association did not recover after FRAG rejection")
 
 
@@ -322,14 +322,14 @@ def verify_udp_control_close_cleanup(
 ) -> None:
     association = SocksUdpAssociation("127.0.0.1", proxy_port)
     try:
-        payload = b"netloop-control-lifetime"
-        _, _, response = association.roundtrip(peer_ip, service_port, payload)
-        if response != payload:
+        content = b"netloop-control-lifetime"
+        _, _, response = association.roundtrip(peer_ip, service_port, content)
+        if response != content:
             raise AssertionError("UDP association did not work before control close")
 
         association.close_control()
         time.sleep(1.0)
-        association.send(peer_ip, service_port, payload)
+        association.send(peer_ip, service_port, content)
         try:
             association.receive(timeout=1.5)
         except (TimeoutError, socket.timeout, ConnectionResetError, OSError):
@@ -350,14 +350,14 @@ def https_public_ip_via_socks(proxy_port: int) -> str:
             b"User-Agent: libzt-netloop-csharp-ci/1\r\n"
             b"Connection: close\r\n\r\n"
         )
-        payload = bytearray()
+        content = bytearray()
         while True:
             chunk = tls.recv(65536)
             if not chunk:
                 break
-            payload.extend(chunk)
+            content.extend(chunk)
 
-    header, body = bytes(payload).split(b"\r\n\r\n", 1)
+    header, body = bytes(content).split(b"\r\n\r\n", 1)
     if b" 200 " not in header.split(b"\r\n", 1)[0]:
         raise RuntimeError(f"ipify returned non-200 response: {header[:200]!r}")
     return body.decode("ascii").strip()
@@ -383,14 +383,14 @@ def verify_peer_local_service(
             b"Host: netloop-peer-local\r\n"
             b"Connection: close\r\n\r\n"
         )
-        payload = bytearray()
+        content = bytearray()
         while True:
             chunk = sock.recv(65536)
             if not chunk:
                 break
-            payload.extend(chunk)
-    if not bytes(payload).startswith(b"HTTP/1.0 200") and not bytes(payload).startswith(b"HTTP/1.1 200"):
-        raise RuntimeError(f"peer local-service request failed: {payload[:200]!r}")
+            content.extend(chunk)
+    if not bytes(content).startswith(b"HTTP/1.0 200") and not bytes(content).startswith(b"HTTP/1.1 200"):
+        raise RuntimeError(f"peer local-service request failed: {content[:200]!r}")
 
 
 def start_client(
@@ -436,10 +436,10 @@ def start_client(
     return start_detached(command, EVIDENCE / "netloop_process.log")
 
 
-def write_json_atomic(path: Path, payload: dict) -> None:
+def write_json_atomic(path: Path, content: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(payload), encoding="utf-8")
+    temp.write_text(json.dumps(content), encoding="utf-8")
     last_error: PermissionError | None = None
     for _ in range(50):
         try:
@@ -591,10 +591,10 @@ def write_reset_timing_matrix(rows: list[dict[str, object]]) -> None:
             )
         )
 
-    payload = "\n".join(lines) + "\n"
-    (EVIDENCE / "reset_timing.tsv").write_text(payload, encoding="utf-8")
+    content = "\n".join(lines) + "\n"
+    (EVIDENCE / "reset_timing.tsv").write_text(content, encoding="utf-8")
     print("Reset timing matrix:")
-    print(payload, end="")
+    print(content, end="")
 
 
 def run_reset_stress(
@@ -657,8 +657,8 @@ def run_reset_stress(
 
             while time.monotonic() < deadline:
                 try:
-                    payload = stale.recv(1)
-                    if payload:
+                    content = stale.recv(1)
+                    if content:
                         stale_state["error"] = (
                             "stale local SOCKS connection produced data during reset"
                         )
@@ -745,7 +745,7 @@ def run_reset_stress(
             )
 
         def probe_udp() -> None:
-            payload = f"netloop-reset-{cycle}".encode("ascii")
+            content = f"netloop-reset-{cycle}".encode("ascii")
             if not wait_for_old_runtime_abort(
                 deadline=deadline,
                 old_runtime_closed=stale_closed,
@@ -780,7 +780,7 @@ def run_reset_stress(
                             association.send(
                                 rendezvous["server_ip"],
                                 int(rendezvous["local_udp_service_port"]),
-                                payload,
+                                content,
                             )
                             remaining = deadline - time.monotonic()
                             if remaining <= 0:
@@ -826,10 +826,10 @@ def run_reset_stress(
                                     f"observed={response_port}"
                                 )
                                 continue
-                            if response != payload:
+                            if response != content:
                                 last_error = (
                                     "fresh UDP mismatch: "
-                                    f"expected={payload!r}, observed={response!r}"
+                                    f"expected={content!r}, observed={response!r}"
                                 )
                                 continue
 

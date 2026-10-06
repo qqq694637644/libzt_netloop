@@ -35,12 +35,12 @@ def count_route_decisions(
         errors="replace",
     ).splitlines():
         try:
-            payload = json.loads(line)
+            content = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if payload.get("event") != "route_decision":
+        if content.get("event") != "route_decision":
             continue
-        data = payload.get("data")
+        data = content.get("data")
         if not isinstance(data, dict):
             continue
         if (
@@ -147,7 +147,7 @@ def _download_prepared(
         finished = time.monotonic()
         if received != size_bytes:
             raise RuntimeError(
-                f"throughput payload size mismatch: expected={size_bytes}, received={received}"
+                f"throughput content size mismatch: expected={size_bytes}, received={received}"
             )
 
         elapsed = finished - started

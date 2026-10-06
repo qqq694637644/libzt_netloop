@@ -108,7 +108,7 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
 
     public async ValueTask SendAsync(
         ProxyTarget target,
-        ReadOnlyMemory<byte> payload,
+        ReadOnlyMemory<byte> content,
         CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
@@ -119,7 +119,7 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
             case RouteKind.LocalLoopback:
                 await _localTransport.SendAsync(
                     MapToLoopback(target),
-                    payload,
+                    content,
                     cancellationToken).ConfigureAwait(false);
                 return;
 
@@ -128,7 +128,7 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
                     cancellationToken).ConfigureAwait(false);
                 await egressTransport.SendAsync(
                     target,
-                    payload,
+                    content,
                     cancellationToken).ConfigureAwait(false);
                 return;
 
@@ -140,7 +140,7 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
                 var agent = new IPEndPoint(peer, _overlayUdpPort);
                 _allowedPeers.TryAdd(agent, 0);
 
-                var packet = Socks5UdpPacket.Build(target, payload.Span);
+                var packet = Socks5UdpPacket.Build(target, content.Span);
                 await _overlaySocket.SendToAsync(
                     packet,
                     agent,
@@ -247,7 +247,7 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
                 continue;
             }
 
-            if (!Socks5UdpPacket.TryParse(datagram.Payload, out var packet, out var error))
+            if (!Socks5UdpPacket.TryParse(datagram.Content, out var packet, out var error))
             {
                 JsonLog.Info("udp_overlay_response_dropped", new {
                     source = datagram.RemoteEndPoint.ToString(),
@@ -257,7 +257,7 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
             }
 
             await _received.Writer.WriteAsync(
-                new ProxyUdpDatagram(packet.Target, packet.Payload.ToArray()),
+                new ProxyUdpDatagram(packet.Target, packet.Content.ToArray()),
                 cancellationToken).ConfigureAwait(false);
         }
     }
