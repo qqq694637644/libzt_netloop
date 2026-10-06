@@ -694,6 +694,12 @@ TUN -> Xray -> NetLoop -> default exit -> 1.1.1.1:53
 
 Do not add DNS fallback, probing, or remote-LAN DNS behavior.
 
+The ordinary v2rayNG connection-delay test may still use the running Xray core
+in NetLoop mode. However, skip the legacy `SpeedtestManager.getRemoteIPInfo()`
+follow-up because NetLoop mode deliberately has no local HTTP inbound. Physical
+device acceptance verifies the exit IP through normal captured application
+traffic instead of reviving that HTTP proxy.
+
 ---
 
 ## 9. VPN recursion prevention
@@ -816,6 +822,14 @@ Do not add WorkManager, AlarmManager, exact alarms, watchdog services, special
 permissions, or other background-restart infrastructure for this case. Android
 background foreground-service restrictions mean an automatic cross-app restart
 cannot be treated as guaranteed.
+
+Likewise, when a settings change requests the normal v2rayNG automatic service
+restart while a NetLoop runtime is active, stop the current session and leave it
+stopped. Do not use the ordinary fixed-delay `stop -> 500 ms -> start` path for
+NetLoop because NetLoop STOP includes asynchronous cross-process teardown and a
+process-final `:netloop` exit. The user presses Connect again after changing
+settings. Explicit user-triggered restart behavior outside this settings-change
+flow may remain unchanged.
 
 ### v2rayNG process/service restart
 
