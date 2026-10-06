@@ -3,6 +3,7 @@ using System.Net;
 using System.Text.Json;
 using Android.Content;
 using NetLoop.Host;
+using NetLoop.Socks;
 
 namespace NetLoop.Android;
 
@@ -78,11 +79,7 @@ internal sealed record AndroidConfig(
             throw new InvalidOperationException(
                 "Upstream SOCKS5 credentials require an upstream host.");
         }
-        if ((upstreamUsername is null) != (upstreamPassword is null))
-        {
-            throw new InvalidOperationException(
-                "Upstream SOCKS5 username and password must be provided together.");
-        }
+        Socks5Credentials.Validate(upstreamUsername, upstreamPassword);
         var upstreamPortText = config.UpstreamPort.Trim();
         if (!ushort.TryParse(upstreamPortText, out var upstreamPort)
             || upstreamPort == 0)

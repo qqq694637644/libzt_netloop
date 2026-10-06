@@ -57,7 +57,7 @@ public sealed class MainActivity : Activity
             config.DefaultExit);
         _peers = AddField(
             root,
-            "Additional direct peer Managed IPs (optional; comma/space separated)",
+            "Direct peers (optional; empty = self + default exit only)",
             config.Peers);
         _upstreamHost = AddField(
             root,

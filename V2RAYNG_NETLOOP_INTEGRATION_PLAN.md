@@ -58,8 +58,9 @@ NetLoop owns:
 The integration boundary for traffic remains SOCKS5 over localhost.
 
 When NetLoop mode is enabled, Xray does not choose the final Internet egress.
-All ordinary TCP, UDP, and DNS traffic that is not explicitly blocked is sent
-to the NetLoop SOCKS endpoint, and NetLoop owns peer routing and the final exit.
+Captured TCP, UDP, and DNS traffic is sent to the NetLoop SOCKS endpoint, and
+NetLoop owns peer routing and the final exit. Existing v2rayNG routing rules,
+including block rules, do not participate in NetLoop mode.
 
 Do not replace SOCKS5 with Binder, JNI, shared memory, or a custom packet protocol.
 
@@ -158,6 +159,10 @@ For the first version:
 - `peers` is optional and contains only additional nodes whose primary Managed IP must be reachable directly.
 - `defaultExit` is required on every node; the exit node sets it to its own primary Managed IP.
 - a remote `defaultExit` is automatically included in NetLoop's effective peer set; do not duplicate it in `peers`.
+- `peers` is directional: A -> C requires C's primary Managed IP in A's
+  `peers`; C -> A separately requires A in C's `peers`. With an empty
+  `peers` list, a node can directly address only itself and its configured
+  default exit.
 - do not add peer discovery, topology sync, or a controller-side peer database.
 
 Normal operation:
@@ -172,13 +177,15 @@ status = GET_STATUS
 if status.api_version != CONTROL_API_VERSION:
     fail
 
-if status.state == READY:
+start_status = START(api_version, network_id, default_exit, optional peers)
+
+if START reports "stop before changing configuration":
+    fail and require the normal Disconnect -> Connect lifecycle
+
+if start_status.state == READY:
     start Xray and establish VPN/TUN
 
-if status.state == STOPPED or ERROR:
-    START(api_version, network_id, default_exit, optional peers)
-
-if status.state == STARTING or START was accepted:
+if start_status.state == STARTING:
     poll GET_STATUS every 250 ms
     READY → start Xray and establish VPN/TUN
     ERROR → fail
@@ -192,7 +199,7 @@ unambiguous configuration transition.
 
 START itself is also frozen:
 
-- STOPPED + START -> start with the supplied configuration.
+- STOPPED/ERROR + START -> start with the supplied configuration.
 - READY/STARTING + START with the same normalized configuration -> idempotent;
   return the current status and do not restart anything.
 - READY/STARTING + START with a different configuration -> reject with
@@ -201,6 +208,17 @@ START itself is also frozen:
 Configuration equality compares only the v1 controlled fields:
 `network_id`, `default_exit`, and the normalized optional `peers` set.
 No hot reload or implicit STOP/START is performed.
+
+The running runtime must also have been started from the controlled
+`netloop-runtime-config.json` snapshot. A standalone runtime is never considered
+equal to a controlled START, even if `network_id`, `default_exit`, and
+`peers` happen to match, because standalone egress may include upstream SOCKS.
+In that case START rejects with "stop before changing configuration".
+
+GET_STATUS is not a configuration-consistency query. v2rayNG always follows a
+successful version check with START(desired config), including when NetLoop is
+already READY or STARTING. The idempotent START rule is the only v1 configuration
+consistency check; do not add a config hash/fingerprint to status.
 
 Stop sequence:
 
@@ -294,6 +312,16 @@ fields are never inherited by v2rayNG-controlled mode. This prevents accidental
 Xray -> NetLoop -> Xray proxy recursion and intentionally does not implement
 proxy chaining in v1.
 
+Keep the two persisted inputs physically separate:
+
+```text
+netloop-config.json          standalone UI configuration
+netloop-runtime-config.json  v2rayNG-controlled configuration
+```
+
+Do not reuse one JSON file with a mode field and do not merge one snapshot into
+the other.
+
 ### 5.3 Status model
 
 Keep the public status model small:
@@ -318,11 +346,13 @@ Status content:
 ```
 
 `GET_STATUS` is the single version-and-state query. v2rayNG calls it immediately
-after binding, validates `api_version`, then either accepts READY, polls an
-existing STARTING state, or sends START for STOPPED/ERROR. While STARTING, poll
-every 250 ms and stop once state becomes READY or ERROR. After a Binder reconnect,
-repeat the same GET_STATUS flow. A Binder disconnect while NetLoop is expected
-to be running is itself a lifecycle signal; no callback registry is required.
+after binding and validates `api_version`, then always sends START with the
+desired configuration. START either starts STOPPED/ERROR, idempotently validates
+READY/STARTING with the same configuration, or rejects a different running
+configuration. While STARTING, poll every 250 ms and stop once state becomes
+READY or ERROR. After a Binder reconnect, repeat this same GET_STATUS -> START
+flow. A Binder disconnect while NetLoop is expected to be running is itself a
+lifecycle signal; no callback registry is required.
 
 ---
 
@@ -343,7 +373,11 @@ Responsibilities:
 - hold the current public status
 - serialize START / STOP requests
 - answer current status queries
-- persist the latest runtime configuration snapshot
+- persist the controlled runtime configuration in
+  `netloop-runtime-config.json`, separate from standalone
+  `netloop-config.json`
+- remember whether the active runtime was started from the controlled snapshot;
+  standalone runtime state never satisfies controlled START idempotency
 - start the existing foreground `NetLoopService`
 - stop the existing foreground `NetLoopService`
 - expose READY / ERROR information to `NetLoopControlService`
@@ -470,7 +504,10 @@ Responsibilities:
 - detect whether `com.libzt.netloop` is installed
 - bind/unbind the control service
 - issue GET_STATUS immediately after bind/rebind and validate its `api_version`
-- send START with `CONTROL_API_VERSION` only for STOPPED/ERROR
+- always send START with `CONTROL_API_VERSION` and the desired configuration
+  after the version check
+- treat a different-running-configuration START rejection as an error; do not
+  auto-STOP/START inside the Binder controller
 - send STOP
 - poll GET_STATUS while STARTING
 - wait for READY
@@ -621,13 +658,16 @@ those destinations from ever reaching Xray or NetLoop.
 When NetLoop mode is enabled, the VPN builder uses:
 
 ```text
-IPv4: 0.0.0.0/0
-IPv6: ::/0 when IPv6 capture is enabled
+VPN interface: configure both IPv4 and IPv6 TUN interface addresses
+IPv4 route:    0.0.0.0/0
+IPv6 route:    ::/0
 ```
 
 and relies on per-app exclusion for `com.v2ray.ang` and
 `com.libzt.netloop`. Do not dynamically derive ZeroTier CIDRs and do not
-preserve the user's normal LAN-bypass preference in NetLoop mode.
+preserve the user's normal LAN-bypass preference or normal IPv6-enable preference
+in NetLoop mode. NetLoop mode always captures both address families even when
+the physical Wi-Fi/cellular network has no native IPv6 Internet connectivity.
 
 ---
 
@@ -642,9 +682,10 @@ Required order:
 ```text
 1. User requests connect.
 2. v2rayNG binds NetLoop control service.
-3. v2rayNG runs the canonical GET_STATUS/version/state flow from section 4.
-4. If START is required, NetLoop enters STARTING with a fresh controlled
-   direct-egress configuration.
+3. v2rayNG GET_STATUS verifies the control API version.
+4. v2rayNG always sends START(desired config); START either starts a stopped
+   runtime, idempotently confirms the same READY/STARTING config, or rejects a
+   different running config.
 5. NetLoop starts libzt and local SOCKS.
 6. NetLoop reports READY.
 7. v2rayNG builds Xray config using localhost NetLoop SOCKS outbound.
@@ -850,7 +891,8 @@ Implement:
 - install detection
 - bind/rebind
 - GET_STATUS version/state check immediately after bind/rebind
-- START only when status is STOPPED/ERROR
+- START desired config after every successful version check, including READY and
+  STARTING, so existing START idempotency validates configuration consistency
 - start/wait READY
 - stop
 - status presentation
@@ -862,22 +904,37 @@ At the end of this phase, v2rayNG can fully operate NetLoop without opening the 
 When NetLoop mode is enabled:
 
 - replace the runtime Internet outbound with SOCKS `127.0.0.1:1080`
-- route all ordinary TCP and UDP traffic to that NetLoop SOCKS outbound
+- build a fresh minimal NetLoop-mode routing configuration instead of merging
+  the active profile's routing rules
+- route all captured TCP and UDP traffic to that NetLoop SOCKS outbound
 - route intercepted DNS through the same NetLoop path so name resolution also exits through the configured default exit
-- preserve explicit block rules only
-- do not preserve `direct`, alternate remote proxy outbounds, balancers, or region-based egress selection in NetLoop mode
+- ignore all existing user/profile routing rules in NetLoop mode, including
+  block/private-IP/direct rules, alternate proxy outbounds, balancers, regional
+  rules, and the selected remote server profile
 - prevent Xray start until NetLoop is READY
-- force VPN route capture of `0.0.0.0/0` and `::/0` when IPv6 is enabled;
-  ignore the normal LAN-bypass setting so private Managed IPs reach NetLoop
+- force VPN route capture of both `0.0.0.0/0` and `::/0`, configure both
+  IPv4 and IPv6 VPN interface addresses, and ignore both normal LAN-bypass and
+  normal IPv6-enable preferences
 
 In v1, Xray owns capture and protocol conversion, while NetLoop exclusively owns
 peer routing and final egress selection.
+
+Implement NetLoop mode as an early, dedicated runtime-config assembly branch.
+Do not first build the normal profile routing/DNS configuration and then try to
+filter rules out afterward. The NetLoop branch should construct only the
+localhost NetLoop SOCKS outbound, the minimal routing needed to send captured
+TCP/UDP to it, and DNS plumbing whose traffic also uses that path.
 
 ### Phase 4 - VPN exclusion correctness
 
 Update per-app VPN handling so `com.libzt.netloop` is never captured by the v2rayNG VPN while NetLoop mode is active.
 
 This phase is mandatory before considering the integration usable.
+
+In the current upstream v2rayNG layout, the NetLoop branch belongs in
+`CoreVpnService.configureNetworkSettings()`: it must bypass the normal
+`routingRulesetsBypassLan()` and `PREF_IPV6_ENABLED` decisions and configure
+both address families explicitly.
 
 ### Phase 5 - UI cleanup
 
@@ -906,11 +963,13 @@ NetLoop:
 v2rayNG:
 
 - Android compile/package for the target ABI/flavor used by this fork
-- assert NetLoop-mode VPN builder output uses full default routes rather than
-  the normal public-only/LAN-bypass route set
+- assert NetLoop-mode VPN builder output always has IPv4 + IPv6 interface
+  addresses and both `0.0.0.0/0` + `::/0` routes, independent of the normal
+  LAN-bypass and IPv6 preferences
 - inspect/assert the generated NetLoop-mode Xray JSON, not only the Kotlin
-  builder code: non-blocked TCP/UDP and DNS must resolve to the NetLoop SOCKS
-  path, with no final `TAG_DIRECT`, alternate proxy outbound, balancer, or
+  builder code: captured TCP/UDP and DNS must resolve to the NetLoop SOCKS
+  path, with no inherited user/profile routing rule, block rule, final
+  `TAG_DIRECT`, alternate proxy outbound, balancer, regional routing, or
   domestic-DNS direct egress
 
 Do not require Android emulator E2E as part of routine CI.
@@ -967,7 +1026,7 @@ The v1 product is intentionally only:
 
 ```text
 v2rayNG
-    → all non-blocked TCP / UDP / DNS
+    → captured TCP / UDP / DNS
     → SOCKS5 127.0.0.1:1080
     → NetLoop
     → self / explicit peer / required default exit
@@ -991,6 +1050,6 @@ The integration is complete when all of the following are true:
 - NetLoop physical sockets never recurse into the v2rayNG VPN.
 - optional direct peer Managed IPs are explicitly configured only when needed; the configured default exit is not duplicated in that list.
 - `default_exit` is required on every node, including the exit node itself.
-- non-blocked TCP, UDP, and DNS all exit through the configured ZeroTier exit B.
+- captured TCP, UDP, and DNS all use the NetLoop path and configured ZeroTier exit B.
 - Network switching does not require manually reopening either app.
 - Both projects can still be built and upgraded independently.

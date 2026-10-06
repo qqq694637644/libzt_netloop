@@ -22,6 +22,7 @@ public sealed class Socks5ProxyConnector : IProxyConnector
         TimeSpan? negotiationRetryWindow = null,
         TimeSpan? negotiationAttemptTimeout = null)
     {
+        Socks5Credentials.Validate(username, password);
         _transportConnector = transportConnector;
         _proxyEndpoint = proxyEndpoint;
         _username = username;

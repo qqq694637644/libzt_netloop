@@ -17,6 +17,7 @@ public sealed class Socks5UdpProxyTransportFactory : IProxyUdpTransportFactory
         string? username = null,
         string? password = null)
     {
+        Socks5Credentials.Validate(username, password);
         _transportConnector = transportConnector;
         _proxyEndpoint = proxyEndpoint;
         _username = username;

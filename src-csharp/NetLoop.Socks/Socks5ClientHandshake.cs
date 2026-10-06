@@ -11,19 +11,15 @@ internal static class Socks5ClientHandshake
         string? password,
         CancellationToken cancellationToken)
     {
-        if ((username is null) != (password is null))
-        {
-            throw new ArgumentException(
-                "SOCKS5 RFC1929 username and password must either both be set or both be absent.");
-        }
+        Socks5Credentials.Validate(username, password);
 
         byte[]? usernameBytes = null;
         byte[]? passwordBytes = null;
         var requestedMethod = Socks5Protocol.NoAuthentication;
         if (username is not null)
         {
-            (usernameBytes, passwordBytes) =
-                EncodeUsernamePassword(username, password!);
+            usernameBytes = Encoding.UTF8.GetBytes(username);
+            passwordBytes = Encoding.UTF8.GetBytes(password!);
             requestedMethod = Socks5Protocol.UsernamePassword;
         }
 
@@ -52,21 +48,6 @@ internal static class Socks5ClientHandshake
                 passwordBytes!,
                 cancellationToken).ConfigureAwait(false);
         }
-    }
-
-    private static (byte[] Username, byte[] Password) EncodeUsernamePassword(
-        string usernameText,
-        string passwordText)
-    {
-        var username = Encoding.UTF8.GetBytes(usernameText);
-        var password = Encoding.UTF8.GetBytes(passwordText);
-        if (username.Length is 0 or > 255 || password.Length is 0 or > 255)
-        {
-            throw new ArgumentException(
-                "SOCKS5 RFC1929 username and password must each be 1..255 UTF-8 bytes.");
-        }
-
-        return (username, password);
     }
 
     private static async ValueTask AuthenticateUsernamePasswordAsync(

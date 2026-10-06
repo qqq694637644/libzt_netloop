@@ -1,4 +1,5 @@
 using System.Net;
+using NetLoop.Socks;
 
 namespace NetLoop.Host;
 
@@ -119,11 +120,8 @@ internal sealed class HostOptions
                 "--upstream-host is required for --egress upstream-socks5.");
         }
 
-        if ((upstreamUsername is null) != (upstreamPassword is null))
-        {
-            throw new ArgumentException(
-                "--upstream-user and --upstream-password must be provided together.");
-        }
+        if (egress == "upstream-socks5")
+            Socks5Credentials.Validate(upstreamUsername, upstreamPassword);
 
         return new HostOptions {
             NetworkId = networkId,

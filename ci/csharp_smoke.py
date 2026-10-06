@@ -121,7 +121,45 @@ def main() -> int:
             "--upstream-user",
             "netloop",
         ],
-        "--upstream-user and --upstream-password must be provided together",
+        "must either both be set or both be absent",
+    )
+    assert_rejected(
+        executable,
+        runtime,
+        "empty RFC1929 credentials",
+        [
+            *base,
+            "--default-exit",
+            "172.26.0.254",
+            "--egress",
+            "upstream-socks5",
+            "--upstream-host",
+            "127.0.0.1",
+            "--upstream-user",
+            "",
+            "--upstream-password",
+            "",
+        ],
+        "must each be 1..255 UTF-8 bytes",
+    )
+    assert_rejected(
+        executable,
+        runtime,
+        "oversized RFC1929 username",
+        [
+            *base,
+            "--default-exit",
+            "172.26.0.254",
+            "--egress",
+            "upstream-socks5",
+            "--upstream-host",
+            "127.0.0.1",
+            "--upstream-user",
+            "u" * 256,
+            "--upstream-password",
+            "p",
+        ],
+        "must each be 1..255 UTF-8 bytes",
     )
     assert_rejected(
         executable,
