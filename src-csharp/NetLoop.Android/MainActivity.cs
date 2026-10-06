@@ -51,14 +51,14 @@ public sealed class MainActivity : Activity
             root,
             "ZeroTier network ID (hex)",
             config.NetworkId);
-        _peers = AddField(
-            root,
-            "Peer Managed IPs (comma/space separated)",
-            config.Peers);
         _defaultExit = AddField(
             root,
             "Default exit Managed IP (required)",
             config.DefaultExit);
+        _peers = AddField(
+            root,
+            "Additional direct peer Managed IPs (optional; comma/space separated)",
+            config.Peers);
         _upstreamHost = AddField(
             root,
             "Upstream SOCKS5 host (optional)",

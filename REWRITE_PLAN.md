@@ -78,9 +78,10 @@ IPv4 默认映射到 127.0.0.1，IPv6 默认映射到 ::1。后续可以提供�
 一个 Node 可能同时得到多个 Managed IP。第一版明确选择一个 deterministic canonical /
 primary overlay address：**优先数值最小的 IPv4，否则使用数值最小的 Managed IPv6**。TCP/UDP
 Agent 和 RouteSelector 都只使用这个地址；status 只暴露
-`primary_overlay_address`。`--peer` 填写对端 primary overlay address；
-`default_exit` 可以在所有节点共享同一个 primary 值，包括出口节点自己；
-其它 Managed IP 不进入 NetLoop 路由模型。
+`primary_overlay_address`。`default_exit` 是必填项，并在它不是本机时自动加入
+effective peers；`--peer` 只用于额外的、需要直接访问的对端 primary overlay
+address，不需要也不应该重复填写 `default_exit`。其它 Managed IP 不进入
+NetLoop 路由模型。
 
 ## 5. 统一出网
 
@@ -96,7 +97,7 @@ Agent 和 RouteSelector 都只使用这个地址；status 只暴露
 
     if target is self Managed IP:
         connect local loopback
-    else if target is an overlay Managed IP:
+    else if target is an explicit direct peer Managed IP:
         send SOCKS request directly to that peer
     else if this node is the selected exit:
         connect target using local egress backend
@@ -109,6 +110,9 @@ Agent 和 RouteSelector 都只使用这个地址；status 只暴露
     172.26.0.20:3000  -> C 本机服务
     example.com:443    -> default_exit B -> Internet
     8.8.8.8:443       -> default_exit B -> Internet
+
+其中访问 C 的示例要求 C 的 primary overlay address 显式出现在 A 的
+`--peer` 中；访问 default_exit B 不需要再把 B 重复写进 `--peer`。
 
 ### 5.1 域名解析
 

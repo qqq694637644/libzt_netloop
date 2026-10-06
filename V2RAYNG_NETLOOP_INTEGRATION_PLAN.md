@@ -138,8 +138,10 @@ NetLoop
 Enabled          [ on/off ]
 
 Network ID       8056c2e21c000001
-Peer Managed IPs 172.26.0.20, 172.26.0.30, 172.26.0.254
 Default Exit     172.26.0.254
+
+Advanced
+  Direct Peers   172.26.0.20, 172.26.0.30
 
 Status           Ready
 Node             abcdef1234
@@ -152,9 +154,10 @@ For the first version:
 - SOCKS is fixed to `127.0.0.1:1080`.
 - NetLoop state directory is internal to the NetLoop app.
 - overlay TCP/UDP ports keep their existing defaults.
-- `networkId`, explicit `peers`, and `defaultExit` are the required routing configuration.
-- `peers` contains every other participating node's primary Managed IP that this device must be able to reach directly.
+- `networkId` and `defaultExit` are required.
+- `peers` is optional and contains only additional nodes whose primary Managed IP must be reachable directly.
 - `defaultExit` is required on every node; the exit node sets it to its own primary Managed IP.
+- a remote `defaultExit` is automatically included in NetLoop's effective peer set; do not duplicate it in `peers`.
 - do not add peer discovery, topology sync, or a controller-side peer database.
 
 Normal operation:
@@ -164,18 +167,28 @@ User presses Connect in v2rayNG
     ↓
 v2rayNG binds NetLoop control service
     ↓
-v2rayNG sends desired NetLoop config
-    ↓
-NetLoop starts
-    ↓
-v2rayNG waits for READY
-    ↓
-v2rayNG starts Xray
-    ↓
-v2rayNG establishes VPN/TUN
-    ↓
-Xray proxy outbound points to 127.0.0.1:1080
+status = GET_STATUS
+
+if status.api_version != CONTROL_API_VERSION:
+    fail
+
+if status.state == READY:
+    start Xray and establish VPN/TUN
+
+if status.state == STOPPED or ERROR:
+    START(api_version, network_id, default_exit, optional peers)
+
+if status.state == STARTING or START was accepted:
+    poll GET_STATUS every 250 ms
+    READY → start Xray and establish VPN/TUN
+    ERROR → fail
 ```
+
+This is the only v1 startup/rebind decision flow.
+
+v1 does not live-reconfigure an already READY NetLoop runtime. Changing NetLoop
+settings requires the normal disconnect/reconnect cycle, which provides a single
+unambiguous configuration transition.
 
 Stop sequence:
 
@@ -235,20 +248,19 @@ STOP
 GET_STATUS
 ```
 
-Suggested START content:
+Suggested minimal START content:
 
 ```json
 {
   "api_version": 1,
   "network_id": "8056c2e21c000001",
-  "peers": [
-    "172.26.0.20",
-    "172.26.0.30",
-    "172.26.0.254"
-  ],
   "default_exit": "172.26.0.254"
 }
 ```
+
+An optional `peers` array may be added for additional explicit direct overlay
+peers. It may also be omitted or empty. `default_exit` is effective
+automatically when it is remote and must not be repeated in this array.
 
 The request `api_version` must equal `CONTROL_API_VERSION`; otherwise reject
 START immediately. Do not add compatibility layers for multiple historical
@@ -277,11 +289,12 @@ Status content:
 }
 ```
 
-After START, v2rayNG polls `GET_STATUS` every 250 ms while state is STARTING.
-Stop polling once state becomes READY or ERROR. After a Binder reconnect,
-issue `GET_STATUS` once to recover current state. A Binder disconnect while
-NetLoop is expected to be running is itself a lifecycle signal; no callback
-registry is required.
+`GET_STATUS` is the single version-and-state query. v2rayNG calls it immediately
+after binding, validates `api_version`, then either accepts READY, polls an
+existing STARTING state, or sends START for STOPPED/ERROR. While STARTING, poll
+every 250 ms and stop once state becomes READY or ERROR. After a Binder reconnect,
+repeat the same GET_STATUS flow. A Binder disconnect while NetLoop is expected
+to be running is itself a lifecycle signal; no callback registry is required.
 
 ---
 
@@ -428,9 +441,10 @@ Responsibilities:
 
 - detect whether `com.libzt.netloop` is installed
 - bind/unbind the control service
-- send START with `CONTROL_API_VERSION`
+- issue GET_STATUS immediately after bind/rebind and validate its `api_version`
+- send START with `CONTROL_API_VERSION` only for STOPPED/ERROR
 - send STOP
-- poll GET_STATUS while STARTING and after reconnect
+- poll GET_STATUS while STARTING
 - wait for READY
 - expose state to UI/service lifecycle
 - surface a concise failure reason
@@ -443,8 +457,8 @@ The v2rayNG settings page should provide:
 
 - enable/disable
 - network ID
-- peer Managed IP list
 - default exit
+- optional direct peer Managed IP list under an Advanced section
 - current plugin state
 - current node ID
 - current Managed IP
@@ -619,11 +633,7 @@ binder disconnect
     ↓
 rebind
     ↓
-GET_STATUS
-    ↓
-restart NetLoop if needed
-    ↓
-wait READY
+run the canonical GET_STATUS/version/state flow from section 4
 ```
 
 Do not silently continue sending Xray traffic into a dead localhost SOCKS port.
@@ -635,14 +645,7 @@ When VPN service restarts and NetLoop mode is enabled:
 ```text
 bind NetLoop
     ↓
-GET_STATUS
-    ↓
-if READY: reuse
-if STOPPED/ERROR: START
-    ↓
-wait READY
-    ↓
-start Xray/VPN
+run the canonical GET_STATUS/version/state flow from section 4
 ```
 
 ---
@@ -790,7 +793,8 @@ Implement:
 - NetLoopPluginManager
 - install detection
 - bind/rebind
-- START request API version check
+- GET_STATUS version/state check immediately after bind/rebind
+- START only when status is STOPPED/ERROR
 - start/wait READY
 - stop
 - status presentation
@@ -844,6 +848,10 @@ NetLoop:
 v2rayNG:
 
 - Android compile/package for the target ABI/flavor used by this fork
+- inspect/assert the generated NetLoop-mode Xray JSON, not only the Kotlin
+  builder code: non-blocked TCP/UDP and DNS must resolve to the NetLoop SOCKS
+  path, with no final `TAG_DIRECT`, alternate proxy outbound, balancer, or
+  domestic-DNS direct egress
 
 Do not require Android emulator E2E as part of routine CI.
 
@@ -858,15 +866,17 @@ Minimum acceptance cases:
 3. NetLoop READY -> Xray uses `127.0.0.1:1080`.
 4. TCP public IP is remote exit B.
 5. UDP public IP is remote exit B.
-6. Wi-Fi -> cellular switch:
+6. DNS leak check shows DNS queries also leave through the NetLoop/exit-B path,
+   not the Android device's local network resolver path.
+7. Wi-Fi -> cellular switch:
    - NetLoop sees the physical network change.
    - old NetLoop sessions are reset.
    - new TCP/UDP sessions recover.
    - no VPN recursion occurs.
-7. cellular -> Wi-Fi switch behaves the same.
-8. Stop in v2rayNG stops Xray/VPN and NetLoop.
-9. Restart v2rayNG service while NetLoop is already READY -> v2rayNG rebinds and continues correctly.
-10. Kill NetLoop process while v2rayNG is active -> v2rayNG detects disconnect and re-establishes the plugin before resuming traffic.
+8. cellular -> Wi-Fi switch behaves the same.
+9. Stop in v2rayNG stops Xray/VPN and NetLoop.
+10. Restart v2rayNG service while NetLoop is already READY -> v2rayNG rebinds and continues correctly.
+11. Kill NetLoop process while v2rayNG is active -> v2rayNG detects disconnect and re-establishes the plugin before resuming traffic.
 
 ---
 
@@ -916,7 +926,7 @@ The integration is complete when all of the following are true:
 - NetLoop remains a separate C#/.NET Android runtime.
 - Xray talks to NetLoop only through localhost SOCKS5.
 - NetLoop physical sockets never recurse into the v2rayNG VPN.
-- peer Managed IPs are explicitly configured in v2rayNG and passed to NetLoop.
+- optional direct peer Managed IPs are explicitly configured only when needed; the configured default exit is not duplicated in that list.
 - `default_exit` is required on every node, including the exit node itself.
 - non-blocked TCP, UDP, and DNS all exit through the configured ZeroTier exit B.
 - Network switching does not require manually reopening either app.

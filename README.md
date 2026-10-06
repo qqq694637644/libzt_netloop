@@ -25,7 +25,7 @@ Android CI also builds an x86_64-only test APK for the GitHub-hosted Android emu
 
 Each runtime chooses one **primary overlay address** for its peer TCP/UDP listeners: the numerically lowest Managed IPv4 address is preferred; if no IPv4 address exists, the numerically lowest Managed IPv6 address is used. The selected value is published as `primary_overlay_address` in the readiness status.
 
-Configure `--peer` with other nodes' `primary_overlay_address`. `--default-exit` is required on every node and may use the same value everywhere, including the exit node itself; when it equals the local primary address, NetLoop uses local egress directly instead of connecting to itself. Desktop SOCKS always binds to loopback; `--socks-host` is intentionally unsupported. A node may have additional Managed IPs, but NetLoop v1 ignores them for routing and only exposes services on the primary address; configuring a secondary local Managed IP as a peer or default exit is rejected at startup.
+`--default-exit` is required on every node and automatically becomes an effective peer when it is remote, so it must not be duplicated in `--peer`. Use repeatable `--peer` only for additional NetLoop nodes whose `primary_overlay_address` must be reachable directly. The exit node may use its own primary address as `--default-exit`; in that case NetLoop uses local egress instead of connecting to itself. Desktop SOCKS always binds to loopback; `--socks-host` is intentionally unsupported. A node may have additional Managed IPs, but NetLoop v1 ignores them for routing and only exposes services on the primary address; configuring a secondary local Managed IP as a peer or default exit is rejected at startup.
 
 ## Build
 
