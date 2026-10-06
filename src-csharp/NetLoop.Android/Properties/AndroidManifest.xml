@@ -19,5 +19,9 @@
           android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
           android:value="User-started local SOCKS5 proxy and ZeroTier peer service that must remain available across network changes." />
     </service>
+    <service
+        android:name="com.libzt.netloop.NetLoopControlService"
+        android:process=":netloop"
+        android:exported="true" />
   </application>
 </manifest>

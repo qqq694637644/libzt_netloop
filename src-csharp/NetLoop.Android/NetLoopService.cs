@@ -16,6 +16,8 @@ namespace NetLoop.Android;
 public sealed class NetLoopService : Service
 {
     internal const string ActionStart = "com.libzt.netloop.action.START";
+    internal const string ActionStartControlled =
+        "com.libzt.netloop.action.START_CONTROLLED";
 #if NETLOOP_CI
     internal const string ActionCiReset = "com.libzt.netloop.ci.RESET";
 #endif
@@ -58,9 +60,10 @@ public sealed class NetLoopService : Service
             _stop = new CancellationTokenSource();
             var token = _stop.Token;
 
+            var action = intent?.Action;
             _runner = Task.Factory
                 .StartNew(
-                    () => RunNetLoopAsync(token),
+                    () => RunNetLoopAsync(action, token),
                     token,
                     TaskCreationOptions.LongRunning,
                     TaskScheduler.Default)
@@ -71,10 +74,34 @@ public sealed class NetLoopService : Service
         return StartCommandResult.Sticky;
     }
 
-    private async Task RunNetLoopAsync(CancellationToken cancellationToken)
+    private async Task RunNetLoopAsync(
+        string? startAction,
+        CancellationToken cancellationToken)
     {
-        var config = AndroidConfig.Load(this);
-        var options = config.RuntimeOptions;
+        ControlledRuntimeConfig? controlledConfig;
+        HostOptions options;
+        if (string.Equals(
+                startAction,
+                ActionStart,
+                StringComparison.Ordinal))
+        {
+            ControlledRuntimeConfig.Clear(this);
+            controlledConfig = null;
+            options = AndroidConfig.Load(this).RuntimeOptions;
+        }
+        else
+        {
+            controlledConfig = string.Equals(
+                                   startAction,
+                                   ActionStartControlled,
+                                   StringComparison.Ordinal)
+                               ? ControlledRuntimeConfig.Load(this)
+                               : ControlledRuntimeConfig.TryLoad(this);
+            options = controlledConfig?.BuildRuntimeOptions(this)
+                      ?? AndroidConfig.Load(this).RuntimeOptions;
+        }
+
+        NetLoopRuntimeController.ReportRuntimeStarting(controlledConfig);
 
         await using var node = new LibztNode(
             options.NetworkId,
@@ -120,6 +147,9 @@ public sealed class NetLoopService : Service
             Volatile.Write(ref resetRuntimeOnNetworkChange, 1);
             runtime = await NetLoopRuntime.CreateAsync(options, state)
                 .ConfigureAwait(false);
+            NetLoopRuntimeController.ReportReady(
+                runtime.State.NodeId,
+                runtime.OverlayBindAddress.ToString());
 #if NETLOOP_CI
             CiAutomationStatus.WriteReady(
                 this,
@@ -153,6 +183,7 @@ public sealed class NetLoopService : Service
                     reset_count = resetCount
                 });
 
+                NetLoopRuntimeController.ReportRuntimeRestarting();
                 Volatile.Write(ref resetRuntimeOnNetworkChange, 0);
                 var discarded = runtime;
                 runtime = null;
@@ -166,6 +197,9 @@ public sealed class NetLoopService : Service
 
                 runtime = await NetLoopRuntime.CreateAsync(options, state)
                     .ConfigureAwait(false);
+                NetLoopRuntimeController.ReportReady(
+                    runtime.State.NodeId,
+                    runtime.OverlayBindAddress.ToString());
 
 #if NETLOOP_CI
                 CiAutomationStatus.WriteReady(
@@ -203,9 +237,11 @@ public sealed class NetLoopService : Service
         }
         catch (System.OperationCanceledException)
         {
+            NetLoopRuntimeController.ReportStopped();
         }
         catch (Exception ex)
         {
+            NetLoopRuntimeController.ReportError(ex);
 #if NETLOOP_CI
             CiAutomationStatus.WriteError(this, ex);
 #endif

@@ -88,11 +88,7 @@ internal sealed record AndroidConfig(
                 $"Invalid upstream SOCKS5 port: {upstreamPortText}");
         }
 
-        var stateDirectory = Path.Combine(
-            context.FilesDir?.AbsolutePath
-            ?? throw new InvalidOperationException(
-                "Android FilesDir is unavailable."),
-            "netloop-state");
+        var stateDirectory = GetStateDirectory(context);
 
         var options = new HostOptions {
             NetworkId = networkId,
@@ -120,6 +116,13 @@ internal sealed record AndroidConfig(
 
     internal static Snapshot LoadSnapshotOrDefault(Context context)
         => ReadSnapshot(context) ?? Snapshot.Empty;
+
+    internal static string GetStateDirectory(Context context)
+        => Path.Combine(
+            context.FilesDir?.AbsolutePath
+            ?? throw new InvalidOperationException(
+                "Android FilesDir is unavailable."),
+            "netloop-state");
 
     internal static void SaveSnapshot(
         Context context,

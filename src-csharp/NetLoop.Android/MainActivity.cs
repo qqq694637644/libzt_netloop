@@ -163,6 +163,7 @@ public sealed class MainActivity : Activity
                 "1080",
                 string.Empty,
                 string.Empty));
+        ControlledRuntimeConfig.Clear(this);
 
         CiAutomationStatus.Delete(this);
     }
@@ -199,6 +200,7 @@ public sealed class MainActivity : Activity
                 _upstreamPort?.Text ?? "1080",
                 _upstreamUser?.Text ?? string.Empty,
                 _upstreamPassword?.Text ?? string.Empty));
+        ControlledRuntimeConfig.Clear(this);
 
         if (OperatingSystem.IsAndroidVersionAtLeast(33)
             && CheckSelfPermission(Manifest.Permission.PostNotifications)
