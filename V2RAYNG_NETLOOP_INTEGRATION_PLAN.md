@@ -82,7 +82,7 @@ IPC carries only:
 - current status
 - status notifications
 
-It never carries TCP or UDP payload.
+It never carries TCP or UDP content.
 
 ### 2.3 Separate APKs are the primary design
 
@@ -111,7 +111,7 @@ The first implementation must follow these rules:
 
 1. No NativeAOT/JNI rewrite of NetLoop.
 2. No attempt to load C# directly inside the v2rayNG daemon process.
-3. No Binder/AIDL transport for network payload.
+3. No Binder/AIDL transport for network content.
 4. No new ZeroTier peer discovery.
 5. No dynamic route protocol between the two apps.
 6. No Xray-underlay mode in v1.
@@ -232,7 +232,7 @@ REGISTER_STATUS_CLIENT
 UNREGISTER_STATUS_CLIENT
 ```
 
-Suggested START payload:
+Suggested START content:
 
 ```json
 {
@@ -242,7 +242,7 @@ Suggested START payload:
 }
 ```
 
-If peer configuration is required later, extend the same payload with:
+If peer configuration is required later, extend the same content with:
 
 ```json
 {
@@ -265,7 +265,7 @@ READY
 ERROR
 ```
 
-Status payload:
+Status content:
 
 ```json
 {
