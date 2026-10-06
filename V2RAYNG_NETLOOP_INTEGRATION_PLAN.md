@@ -59,9 +59,9 @@ The integration boundary for traffic remains SOCKS5 over localhost.
 
 When NetLoop mode is enabled, Xray does not choose the final Internet egress.
 Captured TCP, UDP, and DNS traffic is sent to the NetLoop SOCKS endpoint, and
-NetLoop owns peer routing and the final exit. Existing v2rayNG direct/proxy/
-balancer/regional routing rules do not participate in NetLoop mode. Existing
-explicit block rules may be preserved before the final NetLoop catch-all.
+NetLoop owns peer routing and the final exit. No normal v2rayNG routing rule is
+inherited in NetLoop mode, including direct, block, balancer, regional, private
+IP, or process rules. Xray has one TCP/UDP catch-all to NetLoop.
 
 Do not replace SOCKS5 with Binder, JNI, shared memory, or a custom packet protocol.
 
@@ -670,6 +670,30 @@ HEV must be configured with IPv6 enabled regardless of the normal
 internal HEV-facing SOCKS inbound is fixed, loopback-only, unauthenticated, and
 exists only for the HEV path; Xray TUN mode does not expose it.
 
+### 8.5 Preserve the original destination before NetLoop
+
+NetLoop peer routing is keyed by the destination address presented by SOCKS.
+Therefore NetLoop mode disables Xray sniffing on every retained inbound:
+
+```text
+sniffing.enabled = false
+```
+
+Do not inherit normal v2rayNG `destOverride`, `routeOnly`, FakeDNS sniffing, or
+other destination-rewrite behavior. In particular, a connection to a ZeroTier
+Managed IP must reach NetLoop with that original Managed IP even when TLS SNI,
+HTTP Host, or QUIC metadata contains a domain name.
+
+NetLoop mode also ignores the historical `PREF_VPN_DNS` value. The Android VPN
+DNS server is fixed to `AppConfig.DNS_VPN` (`1.1.1.1`), and those DNS packets
+still follow the normal NetLoop data path:
+
+```text
+TUN -> Xray -> NetLoop -> default exit -> 1.1.1.1:53
+```
+
+Do not add DNS fallback, probing, or remote-LAN DNS behavior.
+
 ---
 
 ## 9. VPN recursion prevention
@@ -874,6 +898,11 @@ If the personal v2rayNG fork uses another fixed application ID, change this one
 source constant together with the fork. Do not add certificate infrastructure,
 configurable ACLs, OAuth, or a general authorization framework.
 
+The personal v2rayNG fork builds only the `playstore` flavor and therefore only
+the `com.v2ray.ang` application ID. Do not add `com.v2ray.ang.fdroid` to the
+NetLoop caller allowlist. CI/release workflows must build the playstore release
+variant explicitly.
+
 ---
 
 ## 14. Repository changes
@@ -970,9 +999,13 @@ When NetLoop mode is enabled:
   the active profile's routing rules
 - route all captured TCP and UDP traffic to that NetLoop SOCKS outbound
 - route intercepted DNS through the same NetLoop path so name resolution also exits through the configured default exit
-- preserve only explicit block rules; ignore private-IP/direct rules, alternate
-  proxy outbounds, balancers, regional rules, and the selected remote server
-  profile
+- discard every inherited routing rule and outbound, including block/private-IP/
+  direct/process rules, alternate proxy outbounds, balancers, regional rules,
+  and the selected remote server profile
+- disable sniffing on every retained inbound so Xray cannot replace Managed IP
+  destinations with SNI/Host/QUIC domain names before SOCKS
+- use only the fixed Android VPN DNS server `AppConfig.DNS_VPN`; do not read
+  historical `PREF_VPN_DNS` in NetLoop mode
 - prevent Xray start until NetLoop is READY
 - force VPN route capture of both `0.0.0.0/0` and `::/0`, configure both
   IPv4 and IPv6 VPN interface addresses, and ignore both normal LAN-bypass and
@@ -1030,15 +1063,17 @@ NetLoop:
 
 v2rayNG:
 
-- Android compile/package for the target ABI/flavor used by this fork
+- Android compile/package for `playstoreRelease` only; application ID must remain
+  `com.v2ray.ang`
 - assert NetLoop-mode VPN builder output always has IPv4 + IPv6 interface
   addresses and both `0.0.0.0/0` + `::/0` routes, independent of the normal
   LAN-bypass and IPv6 preferences
 - inspect/assert the generated NetLoop-mode Xray JSON, not only the Kotlin
   builder code: captured TCP/UDP and DNS must resolve to the NetLoop SOCKS
-  path, with no inherited user/profile direct/proxy rule, final `TAG_DIRECT`,
-  alternate proxy outbound, balancer, regional routing, or domestic-DNS direct
-  egress; explicit block rules are the only preserved user routing rules
+  path, with exactly one proxy outbound, exactly one TCP/UDP catch-all, and no
+  inherited block/direct/process rule, alternate proxy outbound, balancer,
+  regional routing, or domestic-DNS direct egress
+- assert every retained NetLoop inbound has sniffing disabled
 - validate both NetLoop ingress variants at config/build level: Xray TUN must
   contain one tun inbound and no HEV-facing SOCKS inbound; HEV must contain the
   fixed loopback `127.0.0.1:10808` SOCKS inbound and no Xray tun inbound
@@ -1062,16 +1097,24 @@ Minimum acceptance cases:
 6. TCP public IP is remote exit B in both TUN engines.
 7. UDP public IP is remote exit B in both TUN engines.
 8. DNS leak check shows DNS queries also leave through the NetLoop/exit-B path,
-   not the Android device's local network resolver path.
-9. Wi-Fi -> cellular switch:
+   use fixed `AppConfig.DNS_VPN`, and do not inherit an old `PREF_VPN_DNS` LAN
+   resolver.
+9. Connect directly to a peer Managed IP over HTTPS and QUIC with a hostname/SNI
+   that differs from the IP; the SOCKS destination must remain the Managed IP
+   and NetLoop must choose that peer rather than `default_exit`.
+10. Wi-Fi -> cellular switch:
    - NetLoop sees the physical network change.
    - old NetLoop sessions are reset.
    - new TCP/UDP sessions recover.
    - no VPN recursion occurs.
-10. cellular -> Wi-Fi switch behaves the same.
-11. Stop in v2rayNG stops Xray/VPN and NetLoop.
-12. Restart v2rayNG service while NetLoop is already READY -> v2rayNG rebinds and continues correctly.
-13. Kill NetLoop process while v2rayNG is active -> v2rayNG detects disconnect,
+11. cellular -> Wi-Fi switch behaves the same.
+12. Stop in v2rayNG stops Xray/VPN and NetLoop.
+13. Restart v2rayNG service while NetLoop is already READY -> v2rayNG rebinds and continues correctly.
+14. Cold-start both apps, then press Connect in the visible v2rayNG main UI.
+15. Try Quick Tile cold start and boot auto-start. If Android rejects the
+    cross-app foreground-service start, keep those entry points unsupported for
+    NetLoop mode rather than adding watchdog/WorkManager/AlarmManager machinery.
+16. Kill NetLoop process while v2rayNG is active -> v2rayNG detects disconnect,
     stops/pauses NetLoop mode, surfaces a disconnected/failed state, and makes at most one legal
     best-effort restart attempt. If Android rejects the background FGS start,
     recovery waits for the next user Connect action.
