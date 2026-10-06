@@ -48,7 +48,7 @@ internal sealed class RoutingConnector : IProxyConnector
 
         return decision.Kind switch {
             RouteKind.LocalLoopback => await _loopbackConnector.ConnectAsync(target, cancellationToken).ConfigureAwait(false),
-            RouteKind.DirectEgress => await _egressConnector.ConnectAsync(target, cancellationToken).ConfigureAwait(false),
+            RouteKind.LocalEgress => await _egressConnector.ConnectAsync(target, cancellationToken).ConfigureAwait(false),
             RouteKind.OverlayPeer or RouteKind.DefaultExit =>
                 await ConnectViaPeerAsync(decision, target, cancellationToken).ConfigureAwait(false),
             RouteKind.Reject => throw new IOException($"Route rejected for {target}: {decision.Reason}"),

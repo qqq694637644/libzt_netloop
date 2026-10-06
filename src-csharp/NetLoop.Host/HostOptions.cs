@@ -98,6 +98,14 @@ internal sealed class HostOptions
         var upstreamHost = Optional(values, "--upstream-host");
         if (egress == "upstream-socks5" && string.IsNullOrWhiteSpace(upstreamHost))
             throw new ArgumentException("--upstream-host is required for --egress upstream-socks5.");
+        var upstreamUsername = Optional(values, "--upstream-user");
+        var upstreamPassword = Optional(values, "--upstream-password");
+        if (upstreamPassword is not null
+            && string.IsNullOrWhiteSpace(upstreamUsername))
+        {
+            throw new ArgumentException(
+                "--upstream-user is required when --upstream-password is set.");
+        }
 
         return new HostOptions {
             NetworkId = networkId,
@@ -111,8 +119,8 @@ internal sealed class HostOptions
             Egress = egress,
             UpstreamHost = upstreamHost,
             UpstreamPort = ParsePort(Optional(values, "--upstream-port") ?? "1080", "--upstream-port"),
-            UpstreamUsername = Optional(values, "--upstream-user"),
-            UpstreamPassword = Optional(values, "--upstream-password"),
+            UpstreamUsername = upstreamUsername,
+            UpstreamPassword = upstreamPassword,
             StatusFile = Optional(values, "--status-file"),
             StartupTimeout = TimeSpan.FromSeconds(ParsePositiveInt(Optional(values, "--startup-timeout") ?? "120", "--startup-timeout")),
             ConnectTimeout = TimeSpan.FromSeconds(ParsePositiveInt(Optional(values, "--connect-timeout") ?? "20", "--connect-timeout")),

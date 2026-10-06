@@ -7,16 +7,13 @@ namespace NetLoop.Socks;
 public sealed class Socks5ConnectionHandler
 {
     private readonly IProxyConnector _connector;
-    private readonly TimeSpan _halfCloseTimeout;
     private readonly ISocks5UdpAssociationFactory? _udpAssociationFactory;
 
     public Socks5ConnectionHandler(
         IProxyConnector connector,
-        TimeSpan halfCloseTimeout,
         ISocks5UdpAssociationFactory? udpAssociationFactory = null)
     {
         _connector = connector;
-        _halfCloseTimeout = halfCloseTimeout;
         _udpAssociationFactory = udpAssociationFactory;
     }
 
@@ -100,7 +97,7 @@ public sealed class Socks5ConnectionHandler
             remote = await _connector.ConnectAsync(target, cancellationToken).ConfigureAwait(false);
             var success = Socks5Protocol.BuildReply(Socks5Protocol.ReplySucceeded);
             await client.WriteAsync(success, success.Length, cancellationToken).ConfigureAwait(false);
-            await ConnectionRelay.RunAsync(client, remote, _halfCloseTimeout, cancellationToken).ConfigureAwait(false);
+            await ConnectionRelay.RunAsync(client, remote, cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {

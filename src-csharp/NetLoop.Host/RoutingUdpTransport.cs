@@ -123,7 +123,7 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
                     cancellationToken).ConfigureAwait(false);
                 return;
 
-            case RouteKind.DirectEgress:
+            case RouteKind.LocalEgress:
                 var egressTransport = await GetEgressTransportAsync(
                     cancellationToken).ConfigureAwait(false);
                 await egressTransport.SendAsync(

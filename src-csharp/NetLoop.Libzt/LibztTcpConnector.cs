@@ -54,17 +54,12 @@ public sealed class LibztTcpConnector : IProxyConnector
                         250,
                         AttemptTimeoutMilliseconds);
 
-                    using var registration = cancellationToken.Register(
-                        static state =>
-                            LibztNative.Shutdown(
-                                (int)state!,
-                                LibztNative.ShutReadWrite),
-                        fd);
-
                     // zts_connect() retries on the same fd. After a physical
                     // network rebind that fd may already carry stale lwIP path
-                    // state, so bound each native attempt and replace the fd
-                    // before retrying.
+                    // state, so bound each native attempt to 500 ms and replace
+                    // the fd before retrying. Cancellation is observed after
+                    // the bounded native attempt; it never races shutdown()
+                    // against connect() on the same lwIP socket.
                     var result = await Task.Run(
                         () => LibztNative.ConnectEasy(
                             fd,
@@ -102,6 +97,13 @@ public sealed class LibztTcpConnector : IProxyConnector
                         "zts_connect",
                         result,
                         GetSocketError(fd));
+                }
+                catch (OperationCanceledException)
+                    when (cancellationToken.IsCancellationRequested)
+                {
+                    _ = LibztNative.Shutdown(fd, LibztNative.ShutReadWrite);
+                    _ = LibztNative.Close(fd);
+                    throw;
                 }
                 catch (Exception ex)
                 {
@@ -163,10 +165,5 @@ public sealed class LibztTcpConnector : IProxyConnector
     }
 
     private static int GetSocketError(int fd)
-    {
-        var socketError = LibztNative.GetLastSocketError(fd);
-        return socketError != 0
-            ? socketError
-            : LibztNative.GetErrno();
-    }
+        => LibztNative.GetLastSocketError(fd);
 }

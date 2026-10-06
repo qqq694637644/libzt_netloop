@@ -41,7 +41,8 @@ public sealed class LibztTcpConnection : IProxyConnection
                 LibztNative.PollIn,
                 cancellationToken,
                 _nativeGate,
-                GetCurrentFd).ConfigureAwait(false);
+                GetCurrentFd,
+                nameof(LibztTcpConnection)).ConfigureAwait(false);
 
             var handle = GCHandle.Alloc(buffer, GCHandleType.Pinned);
             try
@@ -118,7 +119,8 @@ public sealed class LibztTcpConnection : IProxyConnection
                     LibztNative.PollOut,
                     cancellationToken,
                     _nativeGate,
-                    GetCurrentFd).ConfigureAwait(false);
+                    GetCurrentFd,
+                    nameof(LibztTcpConnection)).ConfigureAwait(false);
 
                 var requested = count - offset;
                 int result;
@@ -199,12 +201,12 @@ public sealed class LibztTcpConnection : IProxyConnection
 
     public ValueTask DisposeAsync()
     {
-        var fd = Interlocked.Exchange(ref _fd, -1);
-        if (fd < 0)
-            return ValueTask.CompletedTask;
-
         lock (_nativeGate)
         {
+            var fd = Interlocked.Exchange(ref _fd, -1);
+            if (fd < 0)
+                return ValueTask.CompletedTask;
+
             _ = LibztNative.Shutdown(fd, LibztNative.ShutReadWrite);
             _ = LibztNative.Close(fd);
         }

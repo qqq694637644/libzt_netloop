@@ -306,7 +306,7 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
                     cancellationToken).ConfigureAwait(false);
                 break;
 
-            case RouteKind.DirectEgress:
+            case RouteKind.LocalEgress:
                 var egressTransport = await GetEgressTransportAsync(
                     cancellationToken).ConfigureAwait(false);
                 await egressTransport.SendAsync(

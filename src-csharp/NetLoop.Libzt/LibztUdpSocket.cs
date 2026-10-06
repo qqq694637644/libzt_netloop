@@ -13,6 +13,7 @@ public sealed class LibztUdpSocket : IAsyncDisposable
     private const int MaxDatagramSize = 65_535;
 
     private readonly SemaphoreSlim _sendLock = new(1, 1);
+    private readonly object _nativeGate = new();
     private int _fd;
 
     private LibztUdpSocket(int fd, IPAddress bindAddress, ushort bindPort)
@@ -94,15 +95,26 @@ public sealed class LibztUdpSocket : IAsyncDisposable
                     await LibztSocketPoller.WaitAsync(
                         fd,
                         LibztNative.PollOut,
-                        cancellationToken).ConfigureAwait(false);
+                        cancellationToken,
+                        _nativeGate,
+                        GetCurrentFd,
+                        nameof(LibztUdpSocket)).ConfigureAwait(false);
 
-                    var sent = LibztNative.SendTo(
-                        fd,
-                        contentHandle.AddrOfPinnedObject(),
-                        checked((uint)bytes.Length),
-                        0,
-                        address,
-                        checked((ushort)addressLength));
+                    int sent;
+                    int socketError = 0;
+                    lock (_nativeGate)
+                    {
+                        EnsureCurrentFd(fd, cancellationToken);
+                        sent = LibztNative.SendTo(
+                            fd,
+                            contentHandle.AddrOfPinnedObject(),
+                            checked((uint)bytes.Length),
+                            0,
+                            address,
+                            checked((ushort)addressLength));
+                        if (sent == LibztNative.ErrSocket)
+                            socketError = LibztNative.GetLastSocketError(fd);
+                    }
                     if (sent >= 0)
                     {
                         if (sent != bytes.Length)
@@ -110,9 +122,20 @@ public sealed class LibztUdpSocket : IAsyncDisposable
                         return;
                     }
 
-                    var errno = LibztNative.GetErrno();
-                    if (!LibztSocketPoller.IsWouldBlock(errno))
-                        throw new LibztException("zts_bsd_sendto", sent, errno);
+                    if (cancellationToken.IsCancellationRequested)
+                        throw new OperationCanceledException(cancellationToken);
+
+                    if (sent == LibztNative.ErrSocket
+                        && (socketError == 0
+                            || LibztSocketPoller.IsWouldBlock(socketError)))
+                    {
+                        continue;
+                    }
+
+                    throw new LibztException(
+                        "zts_bsd_sendto",
+                        sent,
+                        socketError);
                 }
             }
             finally
@@ -142,29 +165,46 @@ public sealed class LibztUdpSocket : IAsyncDisposable
                 await LibztSocketPoller.WaitAsync(
                     fd,
                     LibztNative.PollIn,
-                    cancellationToken).ConfigureAwait(false);
+                    cancellationToken,
+                    _nativeGate,
+                    GetCurrentFd,
+                    nameof(LibztUdpSocket)).ConfigureAwait(false);
 
                 Marshal.WriteInt32(
                     addressLengthPointer,
                     SocketAddressBufferSize);
-                var received = LibztNative.ReceiveFrom(
-                    fd,
-                    buffer,
-                    checked((uint)MaxDatagramSize),
-                    0,
-                    address,
-                    addressLengthPointer);
+                int received;
+                int socketError = 0;
+                lock (_nativeGate)
+                {
+                    EnsureCurrentFd(fd, cancellationToken);
+                    received = LibztNative.ReceiveFrom(
+                        fd,
+                        buffer,
+                        checked((uint)MaxDatagramSize),
+                        0,
+                        address,
+                        addressLengthPointer);
+                    if (received == LibztNative.ErrSocket)
+                        socketError = LibztNative.GetLastSocketError(fd);
+                }
 
                 if (received < 0)
                 {
-                    var errno = LibztNative.GetErrno();
-                    if (LibztSocketPoller.IsWouldBlock(errno))
-                        continue;
-
                     if (cancellationToken.IsCancellationRequested)
                         throw new OperationCanceledException(cancellationToken);
 
-                    throw new LibztException("zts_bsd_recvfrom", received, errno);
+                    if (received == LibztNative.ErrSocket
+                        && (socketError == 0
+                            || LibztSocketPoller.IsWouldBlock(socketError)))
+                    {
+                        continue;
+                    }
+
+                    throw new LibztException(
+                        "zts_bsd_recvfrom",
+                        received,
+                        socketError);
                 }
 
                 var addressLength = checked(
@@ -199,10 +239,13 @@ public sealed class LibztUdpSocket : IAsyncDisposable
 
     public ValueTask DisposeAsync()
     {
-        var fd = Interlocked.Exchange(ref _fd, -1);
-        if (fd >= 0)
-            _ = LibztNative.Close(fd);
-        // Reset can close this socket while an in-flight SendToAsync is
+        lock (_nativeGate)
+        {
+            var fd = Interlocked.Exchange(ref _fd, -1);
+            if (fd >= 0)
+                _ = LibztNative.Close(fd);
+        }
+        // Reset can dispose this socket while an in-flight SendToAsync is
         // unwinding. Its finally block still calls Release(), so disposing the
         // semaphore here creates a release-after-dispose race. It owns no
         // native socket resource and can be left for GC.
@@ -213,5 +256,21 @@ public sealed class LibztUdpSocket : IAsyncDisposable
     {
         var fd = Volatile.Read(ref _fd);
         return fd >= 0 ? fd : throw new ObjectDisposedException(nameof(LibztUdpSocket));
+    }
+
+    private int GetCurrentFd()
+        => Volatile.Read(ref _fd);
+
+    private void EnsureCurrentFd(
+        int expectedFd,
+        CancellationToken cancellationToken)
+    {
+        if (Volatile.Read(ref _fd) == expectedFd)
+            return;
+
+        if (cancellationToken.IsCancellationRequested)
+            throw new OperationCanceledException(cancellationToken);
+
+        throw new ObjectDisposedException(nameof(LibztUdpSocket));
     }
 }

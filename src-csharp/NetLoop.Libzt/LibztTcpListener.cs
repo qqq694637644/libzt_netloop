@@ -5,6 +5,7 @@ namespace NetLoop.Libzt;
 
 public sealed class LibztTcpListener : IAsyncDisposable
 {
+    private readonly object _nativeGate = new();
     private int _fd;
 
     private LibztTcpListener(int fd, string bindAddress, ushort port)
@@ -64,14 +65,30 @@ public sealed class LibztTcpListener : IAsyncDisposable
                 await LibztSocketPoller.WaitAsync(
                     fd,
                     LibztNative.PollIn,
-                    cancellationToken).ConfigureAwait(false);
+                    cancellationToken,
+                    _nativeGate,
+                    GetCurrentFd,
+                    nameof(LibztTcpListener)).ConfigureAwait(false);
 
                 ushort port = 0;
-                var result = LibztNative.AcceptEasy(fd, buffer, LibztNative.IpStringLength, ref port);
+                int result;
+                int socketError = 0;
+                lock (_nativeGate)
+                {
+                    EnsureCurrentFd(fd, cancellationToken);
+                    result = LibztNative.AcceptEasy(
+                        fd,
+                        buffer,
+                        LibztNative.IpStringLength,
+                        ref port);
+                    if (result == LibztNative.ErrSocket)
+                        socketError = LibztNative.GetLastSocketError(fd);
+                }
                 if (result >= 0)
                 {
                     try
                     {
+                        cancellationToken.ThrowIfCancellationRequested();
                         var nonBlocking = LibztNative.SetBlocking(result, 0);
                         if (nonBlocking != LibztNative.Ok)
                         {
@@ -94,11 +111,12 @@ public sealed class LibztTcpListener : IAsyncDisposable
                     }
                 }
 
-                var errno = LibztNative.GetErrno();
-                var socketError = LibztNative.GetLastSocketError(fd);
-                if (LibztSocketPoller.IsWouldBlock(errno)
-                    || LibztSocketPoller.IsWouldBlock(socketError))
+                if (result == LibztNative.ErrSocket
+                    && (socketError == 0
+                        || LibztSocketPoller.IsWouldBlock(socketError)))
+                {
                     continue;
+                }
 
                 if (cancellationToken.IsCancellationRequested)
                     throw new OperationCanceledException(cancellationToken);
@@ -106,7 +124,7 @@ public sealed class LibztTcpListener : IAsyncDisposable
                 throw new LibztException(
                     "zts_accept",
                     result,
-                    socketError != 0 ? socketError : errno);
+                    socketError);
             }
         }
         finally
@@ -117,11 +135,14 @@ public sealed class LibztTcpListener : IAsyncDisposable
 
     public ValueTask DisposeAsync()
     {
-        var fd = Interlocked.Exchange(ref _fd, -1);
-        if (fd >= 0)
+        lock (_nativeGate)
         {
-            _ = LibztNative.Shutdown(fd, LibztNative.ShutReadWrite);
-            _ = LibztNative.Close(fd);
+            var fd = Interlocked.Exchange(ref _fd, -1);
+            if (fd >= 0)
+            {
+                _ = LibztNative.Shutdown(fd, LibztNative.ShutReadWrite);
+                _ = LibztNative.Close(fd);
+            }
         }
 
         return ValueTask.CompletedTask;
@@ -131,5 +152,21 @@ public sealed class LibztTcpListener : IAsyncDisposable
     {
         var fd = Volatile.Read(ref _fd);
         return fd >= 0 ? fd : throw new ObjectDisposedException(nameof(LibztTcpListener));
+    }
+
+    private int GetCurrentFd()
+        => Volatile.Read(ref _fd);
+
+    private void EnsureCurrentFd(
+        int expectedFd,
+        CancellationToken cancellationToken)
+    {
+        if (Volatile.Read(ref _fd) == expectedFd)
+            return;
+
+        if (cancellationToken.IsCancellationRequested)
+            throw new OperationCanceledException(cancellationToken);
+
+        throw new ObjectDisposedException(nameof(LibztTcpListener));
     }
 }

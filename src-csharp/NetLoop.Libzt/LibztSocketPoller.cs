@@ -10,7 +10,8 @@ internal static class LibztSocketPoller
         short events,
         CancellationToken cancellationToken,
         object? nativeGate = null,
-        Func<int>? currentFdProvider = null)
+        Func<int>? currentFdProvider = null,
+        string disposedObjectName = "libzt socket")
     {
         while (true)
         {
@@ -37,7 +38,8 @@ internal static class LibztSocketPoller
                     EnsureCurrentFd(
                         fd,
                         currentFdProvider,
-                        cancellationToken);
+                        cancellationToken,
+                        disposedObjectName);
                     result = PollOnce(
                         fd,
                         ref descriptor,
@@ -112,7 +114,8 @@ internal static class LibztSocketPoller
     private static void EnsureCurrentFd(
         int expectedFd,
         Func<int>? currentFdProvider,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string disposedObjectName)
     {
         if (currentFdProvider is null
             || currentFdProvider() == expectedFd)
@@ -123,7 +126,7 @@ internal static class LibztSocketPoller
         if (cancellationToken.IsCancellationRequested)
             throw new OperationCanceledException(cancellationToken);
 
-        throw new ObjectDisposedException("libzt TCP connection");
+        throw new ObjectDisposedException(disposedObjectName);
     }
 
     private static int PollOnce(

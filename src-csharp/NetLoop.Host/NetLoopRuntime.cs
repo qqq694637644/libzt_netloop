@@ -9,7 +9,6 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
 {
     private const int MaxTcpTunnels = 128;
     private const int MaxUdpAssociations = 64;
-    private static readonly TimeSpan HalfCloseTimeout = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan PeerConnectTimeout =
         TimeSpan.FromMilliseconds(2_500);
 
@@ -50,9 +49,7 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
     {
         var overlayBind = SelectOverlayBindAddress(state.ManagedAddresses);
         ValidateConfiguredOverlayAddresses(options, state.ManagedAddresses, overlayBind);
-        var peers = options.Peers
-            .Where(address => !overlayBind.Equals(address))
-            .ToHashSet();
+        var peers = options.Peers.ToHashSet();
         if (options.DefaultExit is not null
             && !overlayBind.Equals(options.DefaultExit))
         {
@@ -103,7 +100,7 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
             overlayAgent = new OverlaySocksAgent(
                 overlayBind.ToString(),
                 options.OverlayPort,
-                new Socks5ConnectionHandler(overlayRouter, HalfCloseTimeout),
+                new Socks5ConnectionHandler(overlayRouter),
                 MaxTcpTunnels);
             overlayUdpAgent = new OverlayUdpAgent(
                 overlayBind,
@@ -117,7 +114,6 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
                 new IPEndPoint(options.SocksAddress, options.SocksPort),
                 new Socks5ConnectionHandler(
                     localRouter,
-                    HalfCloseTimeout,
                     udpAssociations),
                 MaxTcpTunnels);
             localSocks.Start();
@@ -230,6 +226,12 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
         IReadOnlyList<IPAddress> managedAddresses,
         IPAddress primaryAddress)
     {
+        if (options.Peers.Contains(primaryAddress))
+        {
+            throw new InvalidOperationException(
+                $"Configured peer {primaryAddress} is this node primary Managed IP.");
+        }
+
         var secondarySelfAddresses = managedAddresses
             .Where(address => !primaryAddress.Equals(address))
             .ToHashSet();

@@ -9,7 +9,6 @@ public static class ConnectionRelay
     public static async Task RunAsync(
         IProxyConnection left,
         IProxyConnection right,
-        TimeSpan halfCloseTimeout,
         CancellationToken cancellationToken)
     {
         using var relayCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -31,13 +30,7 @@ public static class ConnectionRelay
 
         try
         {
-            await second.WaitAsync(halfCloseTimeout, cancellationToken).ConfigureAwait(false);
-        }
-        catch (TimeoutException)
-        {
-            JsonLog.Info("relay_half_close_timeout", new { timeout_ms = halfCloseTimeout.TotalMilliseconds });
-            await relayCts.CancelAsync().ConfigureAwait(false);
-            await AwaitAfterCancelAsync(second, relayCts.Token).ConfigureAwait(false);
+            await second.WaitAsync(cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
