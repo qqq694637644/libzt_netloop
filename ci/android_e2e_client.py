@@ -19,8 +19,8 @@ from github_artifacts import wait_and_download
 ROOT = Path(__file__).resolve().parents[1]
 EVIDENCE = ROOT / "evidence" / "android-client"
 PACKAGE = "com.libzt.netloop"
-ACTIVITY = f"{PACKAGE}/com.libzt.netloop.MainActivity"
 CI_RECEIVER = f"{PACKAGE}/com.libzt.netloop.CiAutomationReceiver"
+ACTION_START = "com.libzt.netloop.ci.START"
 ACTION_RESET = "com.libzt.netloop.ci.RESET"
 ACTION_UDP_PROBE = "com.libzt.netloop.ci.UDP_PROBE"
 STATUS_PATH = (
@@ -298,13 +298,11 @@ def configure_and_start(rendezvous: dict) -> dict:
     adb(
         "shell",
         "am",
-        "start",
-        "-W",
+        "broadcast",
+        "-a",
+        ACTION_START,
         "-n",
-        ACTIVITY,
-        "--ez",
-        "netloop_ci_start",
-        "true",
+        CI_RECEIVER,
         "--es",
         "network_id",
         network_id,

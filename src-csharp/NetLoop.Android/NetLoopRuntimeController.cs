@@ -25,7 +25,6 @@ internal static class NetLoopRuntimeController
 
     private static NetLoopPublicState _state = NetLoopPublicState.Stopped;
     private static ControlledRuntimeConfig? _controlledConfig;
-    private static bool _standaloneRuntime;
     private static string? _nodeId;
     private static string? _primaryOverlayAddress;
 
@@ -43,8 +42,7 @@ internal static class NetLoopRuntimeController
         {
             if (_state is NetLoopPublicState.Starting or NetLoopPublicState.Ready)
             {
-                if (!_standaloneRuntime
-                    && _controlledConfig is not null
+                if (_controlledConfig is not null
                     && _controlledConfig.IsEquivalentTo(desired))
                 {
                     return new NetLoopControlResult(
@@ -60,7 +58,6 @@ internal static class NetLoopRuntimeController
             }
 
             _controlledConfig = desired;
-            _standaloneRuntime = false;
             _state = NetLoopPublicState.Starting;
             _nodeId = null;
             _primaryOverlayAddress = null;
@@ -96,7 +93,6 @@ internal static class NetLoopRuntimeController
         {
             _state = NetLoopPublicState.Stopped;
             _controlledConfig = null;
-            _standaloneRuntime = false;
             _nodeId = null;
             _primaryOverlayAddress = null;
         }
@@ -104,14 +100,11 @@ internal static class NetLoopRuntimeController
         context.StopService(new Intent(context, typeof(NetLoopService)));
     }
 
-    internal static void ReportRuntimeStarting(
-        ControlledRuntimeConfig? controlledConfig)
+    internal static void ReportRuntimeStarting()
     {
         lock (Gate)
         {
             _state = NetLoopPublicState.Starting;
-            _controlledConfig = controlledConfig;
-            _standaloneRuntime = controlledConfig is null;
             _nodeId = null;
             _primaryOverlayAddress = null;
         }
@@ -121,7 +114,7 @@ internal static class NetLoopRuntimeController
     {
         lock (Gate)
         {
-            if (_standaloneRuntime || _controlledConfig is null)
+            if (_controlledConfig is null)
             {
                 throw new InvalidOperationException(
                     "Controlled NetLoop runtime configuration is unavailable.");
@@ -159,7 +152,6 @@ internal static class NetLoopRuntimeController
         {
             _state = NetLoopPublicState.Stopped;
             _controlledConfig = null;
-            _standaloneRuntime = false;
             _nodeId = null;
             _primaryOverlayAddress = null;
         }

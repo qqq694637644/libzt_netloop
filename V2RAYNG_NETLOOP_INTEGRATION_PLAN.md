@@ -210,11 +210,8 @@ Configuration equality compares only the v1 controlled fields:
 `network_id`, `default_exit`, and the normalized optional `peers` set.
 No hot reload or implicit STOP/START is performed.
 
-The running runtime must also have been started from the controlled in-memory
-configuration. A standalone runtime is never considered
-equal to a controlled START, even if `network_id`, `default_exit`, and
-`peers` happen to match, because standalone egress may include upstream SOCKS.
-In that case START rejects with "stop before changing configuration".
+Production Android has no standalone runtime path. Every production runtime is
+owned by the controlled in-memory configuration supplied through START.
 
 GET_STATUS is not a configuration-consistency query. v2rayNG always follows a
 successful version check with START(desired config), including when NetLoop is
@@ -298,8 +295,8 @@ START immediately. Do not add compatibility layers for multiple historical
 schema versions.
 
 A v2rayNG-controlled START always constructs a fresh controlled runtime
-configuration. It must not merge with the standalone NetLoop app snapshot.
-Controlled mode is fixed to:
+configuration. Production Android has no persisted user-editable NetLoop
+configuration. Controlled mode is fixed to:
 
 ```text
 egress = direct
@@ -308,22 +305,10 @@ upstream_user = empty
 upstream_password = empty
 ```
 
-The standalone NetLoop UI may continue to support upstream SOCKS5, but those
-fields are never inherited by v2rayNG-controlled mode. This prevents accidental
-Xray -> NetLoop -> Xray proxy recursion and intentionally does not implement
-proxy chaining in v1.
-
-During the transition period, keep standalone persisted configuration separate
-from controlled state:
-
-```text
-netloop-config.json          standalone UI configuration (temporary)
-controlled config            memory only, supplied by START(full config)
-```
-
-Do not persist the controlled configuration and do not merge the standalone
-snapshot into it. v2rayNG is the controlled-mode source of truth and sends the
-full desired configuration after every bind/rebind.
+This prevents accidental Xray -> NetLoop -> Xray proxy recursion and
+intentionally does not implement proxy chaining in v1. Do not persist the
+controlled configuration. v2rayNG is the source of truth and sends the full
+desired configuration after every bind/rebind.
 
 ### 5.3 Status model
 
@@ -380,8 +365,6 @@ Responsibilities:
 - serialize START / STOP requests
 - answer current status queries
 - keep the active controlled runtime configuration in process memory only
-- remember whether the active runtime was started from controlled START;
-  standalone runtime state never satisfies controlled START idempotency
 - start the existing foreground `NetLoopService`
 - stop the existing foreground `NetLoopService`
 - expose STOPPED / STARTING / READY information to `NetLoopControlService`
@@ -434,8 +417,8 @@ libzt state
 The user should not need to edit NetLoop configuration separately.
 
 Controlled starts use `START_NOT_STICKY`. Android must not independently revive
-a controlled NetLoop runtime from stale desired state. The temporary standalone
-path may remain sticky while it is still used by existing Android CI/E2E.
+a controlled NetLoop runtime from stale desired state. The CI-only automation
+entry point is also non-sticky and is not present in production builds.
 
 ### 6.4 Reuse existing runtime
 
@@ -453,10 +436,11 @@ Default exit peer
 
 Do not fork a second runtime implementation for plugin mode.
 
-Standalone UI and v2rayNG control reuse the same data-plane runtime. The
-standalone Android UI/config is transitional and should be deleted after the
-controlled path passes physical-device acceptance; do not build a compatibility
-migration layer for it.
+Production Android exposes no standalone configuration UI, launcher START path,
+or `netloop-config.json`. Android emulator automation, when explicitly built
+with `NETLOOP_CI`, uses a CI-only broadcast receiver that constructs test
+`HostOptions` and starts the same `NetLoopService`. Test automation must not
+reintroduce a production fallback path.
 
 ### 6.5 Existing process-final shutdown
 
@@ -732,6 +716,13 @@ Ensure NetLoop is in the excluded/disallowed population.
 
 Ensure NetLoop is never added to the allowed population.
 
+For NetLoop allow-list mode, every configured allowed package must exist.
+`addAllowedApplication()` `NameNotFoundException` is fatal, and at least one
+allowed application must be added successfully before the VPN is established.
+Do not swallow a stale/uninstalled package and fall back to an empty allow-list,
+because Android would then capture all applications including v2rayNG and
+NetLoop themselves.
+
 Do not call both Android `addAllowedApplication` and `addDisallowedApplication` on the same VPN builder.
 
 This package exclusion is the primary recursion prevention mechanism for the two-APK design.
@@ -807,15 +798,19 @@ binder disconnect
     ↓
 stop/pause the current NetLoop-mode data path
     ↓
-surface disconnected/failed state in v2rayNG UI
-    ↓
 make one legal best-effort rebind/restart attempt
     ↓
 if Android permits the restart:
     run the canonical GET_STATUS/version/state flow from section 4
+    then surface START_SUCCESS
 else:
+    surface START_FAILURE
     remain stopped until the user presses Connect again
 ```
+
+Do not send `MSG_STATE_START_FAILURE` merely because the one recovery attempt
+has started. While recovery is in progress, use log/foreground-notification
+diagnostics only; START_FAILURE is reserved for the final failed outcome.
 
 Do not silently continue sending Xray traffic into a dead localhost SOCKS port.
 Do not add WorkManager, AlarmManager, exact alarms, watchdog services, special
@@ -823,13 +818,16 @@ permissions, or other background-restart infrastructure for this case. Android
 background foreground-service restrictions mean an automatic cross-app restart
 cannot be treated as guaranteed.
 
-Likewise, when a settings change requests the normal v2rayNG automatic service
-restart while a NetLoop runtime is active, stop the current session and leave it
-stopped. Do not use the ordinary fixed-delay `stop -> 500 ms -> start` path for
-NetLoop because NetLoop STOP includes asynchronous cross-process teardown and a
-process-final `:netloop` exit. The user presses Connect again after changing
-settings. Explicit user-triggered restart behavior outside this settings-change
-flow may remain unchanged.
+This personal fork has no automatic fixed-delay service restart. A settings
+change while any runtime is active stops the current session and leaves it
+stopped; the user presses Connect again. Selecting a legacy v2rayNG server while
+NetLoop mode is active only updates the saved selection and does not touch the
+running NetLoop session. In normal mode, changing the selected server may stop
+the current session but still does not auto-start it.
+
+The main-menu Restart command, notification Restart action, `MSG_STATE_RESTART`,
+and all `stop -> 500 ms -> start` service-control paths are removed. User-driven
+restart is simply Stop followed by a later Connect.
 
 ### v2rayNG process/service restart
 
@@ -844,6 +842,12 @@ run the canonical GET_STATUS/version/state flow from section 4
 NetLoop controlled mode itself is not sticky and has no persisted controlled
 configuration. Recovery is always initiated from v2rayNG with a fresh
 START(full desired config).
+
+When `CoreVpnService.onDestroy()` is observably called outside the normal stop
+path, it sends STOP to NetLoop rather than merely detaching the Binder. If the
+entire v2rayNG process is killed and `onDestroy()` is never delivered, a
+temporarily orphaned NetLoop process is accepted; do not add lease/heartbeat or
+watchdog infrastructure for that case.
 
 ---
 
@@ -912,10 +916,9 @@ If the personal v2rayNG fork uses another fixed application ID, change this one
 source constant together with the fork. Do not add certificate infrastructure,
 configurable ACLs, OAuth, or a general authorization framework.
 
-The personal v2rayNG fork builds only the `playstore` flavor and therefore only
-the `com.v2ray.ang` application ID. Do not add `com.v2ray.ang.fdroid` to the
-NetLoop caller allowlist. CI/release workflows must build the playstore release
-variant explicitly.
+The personal v2rayNG fork has no product flavors and uses only the fixed
+`com.v2ray.ang` application ID. Do not add alternate package IDs to the NetLoop
+caller allowlist. Android release output is arm64-v8a only.
 
 ---
 
@@ -929,7 +932,8 @@ Expected primary files:
 src-csharp/NetLoop.Android/NetLoopControlService.cs
 src-csharp/NetLoop.Android/NetLoopRuntimeController.cs
 src-csharp/NetLoop.Android/NetLoopService.cs
-src-csharp/NetLoop.Android/AndroidConfig.cs
+src-csharp/NetLoop.Android/AndroidRuntimePaths.cs
+src-csharp/NetLoop.Android/CiAutomation.cs   # NETLOOP_CI only
 src-csharp/NetLoop.Android/Properties/AndroidManifest.xml
 ```
 
@@ -1049,16 +1053,16 @@ both address families explicitly.
 
 ### Phase 5 - UI cleanup
 
-After the controlled path passes physical-device acceptance:
+Completed as a breaking cleanup:
 
-- make v2rayNG the only normal UI
-- delete the standalone NetLoop Android network/upstream configuration UI and
-  `netloop-config.json` path in one breaking cleanup
-- remove the standalone Android START path and its sticky recovery behavior
-- remove the NetLoop launcher entry unless a read-only diagnostic Activity is retained
-- retain a minimal NetLoop diagnostic screen only if useful
-- do not duplicate configuration screens
-- do not add migration/compatibility fallback for the removed standalone mode
+- v2rayNG is the only normal user UI
+- production NetLoop has no launcher Activity
+- `AndroidConfig`, `netloop-config.json`, upstream SOCKS UI, Save & Start, and
+  standalone START/sticky recovery are deleted
+- NetLoop foreground notification is informational only and does not open a
+  mutable standalone configuration screen
+- Android emulator automation uses only the `NETLOOP_CI` broadcast receiver
+- no migration/compatibility fallback exists for removed standalone mode
 
 ---
 
@@ -1077,8 +1081,10 @@ NetLoop:
 
 v2rayNG:
 
-- Android compile/package for `playstoreRelease` only; application ID must remain
+- Android compile/package for plain `release`; application ID must remain
   `com.v2ray.ang`
+- release artifacts are `arm64-v8a` only; do not build 32-bit, x86/x86_64, or
+  universal APKs for this personal NetLoop pairing
 - assert NetLoop-mode VPN builder output always has IPv4 + IPv6 interface
   addresses and both `0.0.0.0/0` + `::/0` routes, independent of the normal
   LAN-bypass and IPv6 preferences

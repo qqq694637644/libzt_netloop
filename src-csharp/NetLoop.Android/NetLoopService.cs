@@ -15,10 +15,10 @@ namespace NetLoop.Android;
     Process = ":netloop")]
 public sealed class NetLoopService : Service
 {
-    internal const string ActionStart = "com.libzt.netloop.action.START";
     internal const string ActionStartControlled =
         "com.libzt.netloop.action.START_CONTROLLED";
 #if NETLOOP_CI
+    internal const string ActionCiStart = "com.libzt.netloop.ci.START";
     internal const string ActionCiReset = "com.libzt.netloop.ci.RESET";
 #endif
 
@@ -48,9 +48,27 @@ public sealed class NetLoopService : Service
                 StringComparison.Ordinal))
         {
             _ciResets?.Writer.TryWrite("android_ci_reset");
-            return StartCommandResult.Sticky;
+            return StartCommandResult.NotSticky;
         }
 #endif
+
+        var isControlledStart = string.Equals(
+            intent?.Action,
+            ActionStartControlled,
+            StringComparison.Ordinal);
+#if NETLOOP_CI
+        var isCiStart = string.Equals(
+            intent?.Action,
+            ActionCiStart,
+            StringComparison.Ordinal);
+#else
+        const bool isCiStart = false;
+#endif
+        if (!isControlledStart && !isCiStart)
+        {
+            StopSelf(startId);
+            return StartCommandResult.NotSticky;
+        }
 
         EnsureForeground("Starting NetLoop...");
 
@@ -60,10 +78,28 @@ public sealed class NetLoopService : Service
             _stop = new CancellationTokenSource();
             var token = _stop.Token;
 
-            var action = intent?.Action;
+            HostOptions options;
+            if (isControlledStart)
+            {
+                options = NetLoopRuntimeController
+                    .GetControlledConfigForService()
+                    .BuildRuntimeOptions(this);
+            }
+#if NETLOOP_CI
+            else
+            {
+                options = CiAutomationOptions.FromIntent(this, intent!);
+            }
+#else
+            else
+            {
+                throw new InvalidOperationException(
+                    "Unsupported NetLoop service start action.");
+            }
+#endif
             _runner = Task.Factory
                 .StartNew(
-                    () => RunNetLoopAsync(action, token),
+                    () => RunNetLoopAsync(options, token),
                     token,
                     TaskCreationOptions.LongRunning,
                     TaskScheduler.Default)
@@ -71,28 +107,14 @@ public sealed class NetLoopService : Service
             _ = ObserveRunnerAsync(_runner);
         }
 
-        return string.Equals(
-                   intent?.Action,
-                   ActionStartControlled,
-                   StringComparison.Ordinal)
-               ? StartCommandResult.NotSticky
-               : StartCommandResult.Sticky;
+        return StartCommandResult.NotSticky;
     }
 
     private async Task RunNetLoopAsync(
-        string? startAction,
+        HostOptions options,
         CancellationToken cancellationToken)
     {
-        var controlledConfig = string.Equals(
-            startAction,
-            ActionStartControlled,
-            StringComparison.Ordinal)
-            ? NetLoopRuntimeController.GetControlledConfigForService()
-            : null;
-        var options = controlledConfig?.BuildRuntimeOptions(this)
-                      ?? AndroidConfig.Load(this).RuntimeOptions;
-
-        NetLoopRuntimeController.ReportRuntimeStarting(controlledConfig);
+        NetLoopRuntimeController.ReportRuntimeStarting();
 
         await using var node = new LibztNode(
             options.NetworkId,
@@ -270,15 +292,6 @@ public sealed class NetLoopService : Service
 
     private Notification BuildNotification(string text)
     {
-        var launchIntent = new Intent(this, typeof(MainActivity))
-            .AddFlags(ActivityFlags.SingleTop);
-        var pendingIntent = PendingIntent.GetActivity(
-            this,
-            0,
-            launchIntent,
-            PendingIntentFlags.UpdateCurrent
-            | PendingIntentFlags.Immutable);
-
         Notification.Builder builder;
         if (OperatingSystem.IsAndroidVersionAtLeast(26))
             builder = new Notification.Builder(this, ChannelId);
@@ -289,7 +302,6 @@ public sealed class NetLoopService : Service
             .SetContentTitle("NetLoop")
             .SetContentText(text)
             .SetSmallIcon(Resource.Drawable.ic_stat_netloop)
-            .SetContentIntent(pendingIntent)
             .SetOngoing(true)
             .SetOnlyAlertOnce(true)
             .Build();

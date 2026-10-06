@@ -79,7 +79,7 @@ internal sealed class ControlledRuntimeConfig
     internal HostOptions BuildRuntimeOptions(Context context)
         => new() {
             NetworkId = NetworkId,
-            StateDirectory = AndroidConfig.GetStateDirectory(context),
+            StateDirectory = AndroidRuntimePaths.GetStateDirectory(context),
             SocksPort = 1080,
             OverlayPort = 42042,
             OverlayUdpPort = 42043,
