@@ -174,7 +174,7 @@ internal sealed class HostOptions
           --connect-timeout <sec>     Peer/egress connect timeout (default 20)
           --udp-idle-timeout <sec>    UDP association idle timeout (default 60)
           --reset-debounce-ms <ms>    Coalesce OS network-change events (default 250)
-          --reset-command-file <path> Optional deterministic reset injection input
+          --reset-command-file <path> Optional deterministic reset trigger input
           --version
           --help
         """;

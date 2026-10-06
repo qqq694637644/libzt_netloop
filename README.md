@@ -62,7 +62,7 @@ The workflows build the C# runtime and exercise TCP, UDP, peer-local routing, ex
 | Android x86_64 | CI-only APK | x86_64 emulator + Linux peer | 3 cycles |
 | Android arm64-v8a | release APK | not available on hosted emulator | not run |
 
-The reset tests are deterministic fault injection. They prove that once a reset is triggered, the old runtime is discarded and fresh TCP/UDP traffic can recover inside the configured budget. They do **not** replace physical-device testing of Wi-Fi -> hotspot/cellular handover, where the host interface, NAT mapping, and ZeroTier physical path actually change.
+The reset tests use deterministic fault simulation. They prove that once a reset is triggered, the old runtime is discarded and fresh TCP/UDP traffic can recover inside the configured budget. They do **not** replace physical-device testing of Wi-Fi -> hotspot/cellular handover, where the host interface, NAT mapping, and ZeroTier physical path actually change.
 
 ## Releases
 

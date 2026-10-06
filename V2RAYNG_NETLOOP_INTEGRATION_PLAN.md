@@ -116,7 +116,7 @@ The first implementation must follow these rules:
 5. No dynamic route protocol between the two apps.
 6. No Xray-underlay mode in v1.
 7. NetLoop is the final Internet egress path.
-8. NetLoop physical sockets must bypass the v2rayNG VPN.
+8. NetLoop physical sockets must remain outside the v2rayNG VPN.
 9. v2rayNG is the only normal user-facing UI.
 10. NetLoop identity/state remains owned by NetLoop.
 
@@ -512,7 +512,7 @@ custom Xray core patch
 
 Use the existing SOCKS outbound implementation.
 
-### 8.3 Injection point
+### 8.3 Runtime config hook
 
 NetLoop mode should be applied at runtime config assembly time.
 
@@ -543,8 +543,8 @@ NetLoop's libzt physical sockets must not be captured by the v2rayNG VPN.
 With two APKs:
 
 ```text
-com.v2ray.ang       → bypass VPN
-com.libzt.netloop   → bypass VPN
+com.v2ray.ang       → outside VPN
+com.libzt.netloop   → outside VPN
 normal apps         → captured by VPN
 ```
 
@@ -556,9 +556,9 @@ Behavior by mode:
 
 Add NetLoop to disallowed applications.
 
-### Bypass-app mode
+### Excluded-app mode
 
-Ensure NetLoop is in the bypass/disallowed population.
+Ensure NetLoop is in the excluded/disallowed population.
 
 ### Allow-list mode
 
@@ -566,7 +566,7 @@ Ensure NetLoop is never added to the allowed population.
 
 Do not call both Android `addAllowedApplication` and `addDisallowedApplication` on the same VPN builder.
 
-This package bypass is the primary recursion prevention mechanism for the two-APK design.
+This package exclusion is the primary recursion prevention mechanism for the two-APK design.
 
 ---
 
@@ -795,7 +795,7 @@ When NetLoop mode is enabled:
 - keep TCP and UDP enabled
 - prevent Xray start until NetLoop is READY
 
-### Phase 4 - VPN bypass correctness
+### Phase 4 - VPN exclusion correctness
 
 Update per-app VPN handling so `com.libzt.netloop` is never captured by the v2rayNG VPN while NetLoop mode is active.
 

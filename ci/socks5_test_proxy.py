@@ -177,7 +177,7 @@ class Socks5TestProxy:
         password = recv_exact(client, password_length).decode("utf-8")
         if username != self.username or password != (self.password or ""):
             client.sendall(b"\x01\x01")
-            raise PermissionError("invalid RFC1929 credentials")
+            raise PermissionError("invalid RFC1929 authentication data")
 
         client.sendall(b"\x01\x00")
 
