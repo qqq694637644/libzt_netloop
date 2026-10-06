@@ -11,9 +11,22 @@ internal static class Socks5ClientHandshake
         string? password,
         CancellationToken cancellationToken)
     {
-        var requestedMethod = username is null
-            ? Socks5Protocol.NoAuthentication
-            : Socks5Protocol.UsernamePassword;
+        if ((username is null) != (password is null))
+        {
+            throw new ArgumentException(
+                "SOCKS5 RFC1929 username and password must either both be set or both be absent.");
+        }
+
+        byte[]? usernameBytes = null;
+        byte[]? passwordBytes = null;
+        var requestedMethod = Socks5Protocol.NoAuthentication;
+        if (username is not null)
+        {
+            (usernameBytes, passwordBytes) =
+                EncodeUsernamePassword(username, password!);
+            requestedMethod = Socks5Protocol.UsernamePassword;
+        }
+
         var greeting = new byte[] { Socks5Protocol.Version, 1, requestedMethod };
         await connection.WriteAsync(greeting, greeting.Length, cancellationToken).ConfigureAwait(false);
 
@@ -35,26 +48,33 @@ internal static class Socks5ClientHandshake
         {
             await AuthenticateUsernamePasswordAsync(
                 connection,
-                username,
-                password,
+                usernameBytes!,
+                passwordBytes!,
                 cancellationToken).ConfigureAwait(false);
         }
     }
 
-    private static async ValueTask AuthenticateUsernamePasswordAsync(
-        IProxyConnection connection,
-        string? usernameText,
-        string? passwordText,
-        CancellationToken cancellationToken)
+    private static (byte[] Username, byte[] Password) EncodeUsernamePassword(
+        string usernameText,
+        string passwordText)
     {
-        var username = Encoding.UTF8.GetBytes(usernameText ?? string.Empty);
-        var password = Encoding.UTF8.GetBytes(passwordText ?? string.Empty);
-        if (username.Length is 0 or > 255 || password.Length > 255)
+        var username = Encoding.UTF8.GetBytes(usernameText);
+        var password = Encoding.UTF8.GetBytes(passwordText);
+        if (username.Length is 0 or > 255 || password.Length is 0 or > 255)
         {
             throw new ArgumentException(
-                "SOCKS5 username must be 1..255 bytes and password at most 255 bytes.");
+                "SOCKS5 RFC1929 username and password must each be 1..255 UTF-8 bytes.");
         }
 
+        return (username, password);
+    }
+
+    private static async ValueTask AuthenticateUsernamePasswordAsync(
+        IProxyConnection connection,
+        byte[] username,
+        byte[] password,
+        CancellationToken cancellationToken)
+    {
         var request = new byte[3 + username.Length + password.Length];
         var offset = 0;
         request[offset++] = 1;

@@ -7,6 +7,31 @@ from pathlib import Path
 import subprocess
 
 
+def assert_rejected(
+    executable: Path,
+    runtime: Path,
+    name: str,
+    arguments: list[str],
+    expected_text: str,
+) -> None:
+    result = subprocess.run(
+        [str(executable), *arguments],
+        cwd=runtime,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=20,
+    )
+    output = result.stdout + result.stderr
+    print(f"$ {executable.name} {' '.join(arguments)}\n{output}")
+    if result.returncode == 0 or expected_text not in output:
+        raise AssertionError(
+            f"{name} was not rejected as expected: "
+            f"returncode={result.returncode}, expected={expected_text!r}"
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--runtime", default="dist-csharp")
@@ -47,23 +72,72 @@ def main() -> int:
                 f"observed={result.stdout.strip()!r}"
             )
 
-    invalid = subprocess.run(
-        [str(executable), "--definitely-unknown", "1"],
-        cwd=runtime,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=20,
+    assert_rejected(
+        executable,
+        runtime,
+        "unknown CLI option",
+        ["--definitely-unknown", "1"],
+        "Unknown option",
     )
-    print(
-        f"$ {executable_name} --definitely-unknown 1\n"
-        f"{invalid.stdout}{invalid.stderr}"
+
+    base = [
+        "--network",
+        "8056c2e21c000001",
+        "--state-dir",
+        "smoke-state",
+    ]
+    assert_rejected(
+        executable,
+        runtime,
+        "missing default exit",
+        base,
+        "Missing required argument --default-exit",
     )
-    if invalid.returncode == 0 or "Unknown option" not in (
-        invalid.stdout + invalid.stderr
-    ):
-        raise AssertionError("unknown CLI option was not rejected")
+    assert_rejected(
+        executable,
+        runtime,
+        "duplicate network",
+        [
+            *base,
+            "--network",
+            "8056c2e21c000002",
+            "--default-exit",
+            "172.26.0.254",
+        ],
+        "Duplicate option: --network",
+    )
+    assert_rejected(
+        executable,
+        runtime,
+        "username without password",
+        [
+            *base,
+            "--default-exit",
+            "172.26.0.254",
+            "--egress",
+            "upstream-socks5",
+            "--upstream-host",
+            "127.0.0.1",
+            "--upstream-user",
+            "netloop",
+        ],
+        "--upstream-user and --upstream-password must be provided together",
+    )
+    assert_rejected(
+        executable,
+        runtime,
+        "direct egress with upstream option",
+        [
+            *base,
+            "--default-exit",
+            "172.26.0.254",
+            "--egress",
+            "direct",
+            "--upstream-host",
+            "127.0.0.1",
+        ],
+        "--upstream-* options are only valid with --egress upstream-socks5",
+    )
 
     return 0
 

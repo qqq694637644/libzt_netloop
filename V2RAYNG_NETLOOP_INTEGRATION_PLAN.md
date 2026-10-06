@@ -190,6 +190,18 @@ v1 does not live-reconfigure an already READY NetLoop runtime. Changing NetLoop
 settings requires the normal disconnect/reconnect cycle, which provides a single
 unambiguous configuration transition.
 
+START itself is also frozen:
+
+- STOPPED + START -> start with the supplied configuration.
+- READY/STARTING + START with the same normalized configuration -> idempotent;
+  return the current status and do not restart anything.
+- READY/STARTING + START with a different configuration -> reject with
+  "stop before changing configuration".
+
+Configuration equality compares only the v1 controlled fields:
+`network_id`, `default_exit`, and the normalized optional `peers` set.
+No hot reload or implicit STOP/START is performed.
+
 Stop sequence:
 
 ```text
@@ -265,6 +277,22 @@ automatically when it is remote and must not be repeated in this array.
 The request `api_version` must equal `CONTROL_API_VERSION`; otherwise reject
 START immediately. Do not add compatibility layers for multiple historical
 schema versions.
+
+A v2rayNG-controlled START always constructs a fresh controlled runtime
+configuration. It must not merge with the standalone NetLoop app snapshot.
+Controlled mode is fixed to:
+
+```text
+egress = direct
+upstream_host = empty
+upstream_user = empty
+upstream_password = empty
+```
+
+The standalone NetLoop UI may continue to support upstream SOCKS5, but those
+fields are never inherited by v2rayNG-controlled mode. This prevents accidental
+Xray -> NetLoop -> Xray proxy recursion and intentionally does not implement
+proxy chaining in v1.
 
 ### 5.3 Status model
 
@@ -583,6 +611,24 @@ Do not call both Android `addAllowedApplication` and `addDisallowedApplication` 
 
 This package exclusion is the primary recursion prevention mechanism for the two-APK design.
 
+### 9.1 NetLoop mode captures private Managed IPs
+
+NetLoop mode must not inherit v2rayNG's normal "Bypass LAN in VPN mode"
+behavior. ZeroTier Managed IPs commonly live inside RFC1918 ranges such as
+`172.16.0.0/12`; bypassing LAN at the Android VPN route layer would prevent
+those destinations from ever reaching Xray or NetLoop.
+
+When NetLoop mode is enabled, the VPN builder uses:
+
+```text
+IPv4: 0.0.0.0/0
+IPv6: ::/0 when IPv6 capture is enabled
+```
+
+and relies on per-app exclusion for `com.v2ray.ang` and
+`com.libzt.netloop`. Do not dynamically derive ZeroTier CIDRs and do not
+preserve the user's normal LAN-bypass preference in NetLoop mode.
+
 ---
 
 ## 10. Startup sequencing
@@ -596,14 +642,13 @@ Required order:
 ```text
 1. User requests connect.
 2. v2rayNG binds NetLoop control service.
-3. v2rayNG verifies control API version.
-4. v2rayNG sends current configuration.
-5. v2rayNG sends START.
-6. NetLoop enters STARTING.
-7. NetLoop starts libzt and local SOCKS.
-8. NetLoop reports READY.
-9. v2rayNG builds Xray config using localhost NetLoop SOCKS outbound.
-10. v2rayNG establishes VPN/TUN and starts Xray.
+3. v2rayNG runs the canonical GET_STATUS/version/state flow from section 4.
+4. If START is required, NetLoop enters STARTING with a fresh controlled
+   direct-egress configuration.
+5. NetLoop starts libzt and local SOCKS.
+6. NetLoop reports READY.
+7. v2rayNG builds Xray config using localhost NetLoop SOCKS outbound.
+8. v2rayNG establishes full-capture VPN/TUN routes and starts Xray.
 ```
 
 If NetLoop does not become READY within a bounded startup timeout:
@@ -631,12 +676,23 @@ If v2rayNG is still supposed to be connected:
 ```text
 binder disconnect
     ↓
-rebind
+stop/pause the current NetLoop-mode data path
     ↓
-run the canonical GET_STATUS/version/state flow from section 4
+surface ERROR
+    ↓
+make one legal best-effort rebind/restart attempt
+    ↓
+if Android permits the restart:
+    run the canonical GET_STATUS/version/state flow from section 4
+else:
+    remain stopped/error until the user presses Connect again
 ```
 
 Do not silently continue sending Xray traffic into a dead localhost SOCKS port.
+Do not add WorkManager, AlarmManager, exact alarms, watchdog services, special
+permissions, or other background-restart infrastructure for this case. Android
+background foreground-service restrictions mean an automatic cross-app restart
+cannot be treated as guaranteed.
 
 ### v2rayNG process/service restart
 
@@ -811,6 +867,8 @@ When NetLoop mode is enabled:
 - preserve explicit block rules only
 - do not preserve `direct`, alternate remote proxy outbounds, balancers, or region-based egress selection in NetLoop mode
 - prevent Xray start until NetLoop is READY
+- force VPN route capture of `0.0.0.0/0` and `::/0` when IPv6 is enabled;
+  ignore the normal LAN-bypass setting so private Managed IPs reach NetLoop
 
 In v1, Xray owns capture and protocol conversion, while NetLoop exclusively owns
 peer routing and final egress selection.
@@ -848,6 +906,8 @@ NetLoop:
 v2rayNG:
 
 - Android compile/package for the target ABI/flavor used by this fork
+- assert NetLoop-mode VPN builder output uses full default routes rather than
+  the normal public-only/LAN-bypass route set
 - inspect/assert the generated NetLoop-mode Xray JSON, not only the Kotlin
   builder code: non-blocked TCP/UDP and DNS must resolve to the NetLoop SOCKS
   path, with no final `TAG_DIRECT`, alternate proxy outbound, balancer, or
@@ -876,7 +936,10 @@ Minimum acceptance cases:
 8. cellular -> Wi-Fi switch behaves the same.
 9. Stop in v2rayNG stops Xray/VPN and NetLoop.
 10. Restart v2rayNG service while NetLoop is already READY -> v2rayNG rebinds and continues correctly.
-11. Kill NetLoop process while v2rayNG is active -> v2rayNG detects disconnect and re-establishes the plugin before resuming traffic.
+11. Kill NetLoop process while v2rayNG is active -> v2rayNG detects disconnect,
+    stops/pauses NetLoop mode, surfaces ERROR, and makes at most one legal
+    best-effort restart attempt. If Android rejects the background FGS start,
+    recovery waits for the next user Connect action.
 
 ---
 

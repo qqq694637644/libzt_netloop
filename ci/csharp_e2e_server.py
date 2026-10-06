@@ -112,15 +112,51 @@ def prepare(args: argparse.Namespace) -> int:
             str(args.overlay_port),
             "--overlay-udp-port",
             str(args.overlay_udp_port),
-            "--default-exit",
-            "192.0.2.1",
-            "--status-file",
-            str(status_path),
             "--startup-timeout",
             "180",
             "--connect-timeout",
             "20",
         ]
+
+        bootstrap_status_path = EVIDENCE / "bootstrap_status.json"
+        bootstrap_status_path.unlink(missing_ok=True)
+        status_path.unlink(missing_ok=True)
+        bootstrap_pid = start_detached(
+            [
+                *netloop_command,
+                "--default-exit",
+                "192.0.2.1",
+                "--status-file",
+                str(bootstrap_status_path),
+                "--egress",
+                "direct",
+            ],
+            EVIDENCE / "netloop_bootstrap.log",
+        )
+        try:
+            bootstrap_status = wait_for_json(
+                bootstrap_status_path,
+                timeout=200,
+            )
+            server_ip = bootstrap_status.get("primary_overlay_address")
+            bootstrap_node_id = bootstrap_status.get("node_id")
+            if not server_ip:
+                raise RuntimeError(
+                    "bootstrap did not publish primary_overlay_address: "
+                    f"{bootstrap_status}"
+                )
+        finally:
+            kill_process_tree(bootstrap_pid)
+
+        netloop_command.extend(
+            [
+                "--default-exit",
+                server_ip,
+                "--status-file",
+                str(status_path),
+            ]
+        )
+
         if args.upstream_socks_port:
             upstream_pid = start_detached(
                 [
@@ -174,16 +210,26 @@ def prepare(args: argparse.Namespace) -> int:
         )
 
         status = wait_for_json(status_path, timeout=200)
-        server_ip = status.get("primary_overlay_address")
-        if not server_ip:
+        final_server_ip = status.get("primary_overlay_address")
+        if not final_server_ip:
             raise RuntimeError(
                 "server did not publish primary_overlay_address: "
                 f"{status}"
             )
+        if final_server_ip != server_ip:
+            raise RuntimeError(
+                "server primary_overlay_address changed across bootstrap restart: "
+                f"bootstrap={server_ip} final={final_server_ip}"
+            )
+        if status.get("node_id") != bootstrap_node_id:
+            raise RuntimeError(
+                "server node_id changed across bootstrap restart: "
+                f"bootstrap={bootstrap_node_id} final={status.get('node_id')}"
+            )
 
         rendezvous = {
             "network_id": network_id,
-            "server_ip": server_ip,
+            "server_ip": final_server_ip,
             "server_node_id": status.get("node_id"),
             "overlay_port": args.overlay_port,
             "overlay_udp_port": args.overlay_udp_port,

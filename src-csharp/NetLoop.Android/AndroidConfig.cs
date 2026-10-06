@@ -78,10 +78,10 @@ internal sealed record AndroidConfig(
             throw new InvalidOperationException(
                 "Upstream SOCKS5 credentials require an upstream host.");
         }
-        if (upstreamPassword is not null && upstreamUsername is null)
+        if ((upstreamUsername is null) != (upstreamPassword is null))
         {
             throw new InvalidOperationException(
-                "Upstream SOCKS5 username is required when a password is set.");
+                "Upstream SOCKS5 username and password must be provided together.");
         }
         var upstreamPortText = config.UpstreamPort.Trim();
         if (!ushort.TryParse(upstreamPortText, out var upstreamPort)

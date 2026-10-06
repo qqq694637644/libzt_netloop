@@ -99,15 +99,30 @@ internal sealed class HostOptions
             throw new ArgumentException("--egress must be 'direct' or 'upstream-socks5'.");
 
         var upstreamHost = Optional(values, "--upstream-host");
-        if (egress == "upstream-socks5" && string.IsNullOrWhiteSpace(upstreamHost))
-            throw new ArgumentException("--upstream-host is required for --egress upstream-socks5.");
         var upstreamUsername = Optional(values, "--upstream-user");
         var upstreamPassword = Optional(values, "--upstream-password");
-        if (upstreamPassword is not null
-            && string.IsNullOrWhiteSpace(upstreamUsername))
+        var hasUpstreamOptions = values.ContainsKey("--upstream-host")
+            || values.ContainsKey("--upstream-port")
+            || values.ContainsKey("--upstream-user")
+            || values.ContainsKey("--upstream-password");
+
+        if (egress == "direct" && hasUpstreamOptions)
         {
             throw new ArgumentException(
-                "--upstream-user is required when --upstream-password is set.");
+                "--upstream-* options are only valid with --egress upstream-socks5.");
+        }
+
+        if (egress == "upstream-socks5"
+            && string.IsNullOrWhiteSpace(upstreamHost))
+        {
+            throw new ArgumentException(
+                "--upstream-host is required for --egress upstream-socks5.");
+        }
+
+        if ((upstreamUsername is null) != (upstreamPassword is null))
+        {
+            throw new ArgumentException(
+                "--upstream-user and --upstream-password must be provided together.");
         }
 
         return new HostOptions {
@@ -167,9 +182,9 @@ internal sealed class HostOptions
           --default-exit <managed-ip> Required primary Managed IP of default egress peer
           --egress <mode>             direct | upstream-socks5 (default direct)
           --upstream-host <host>      Upstream SOCKS5 host
-          --upstream-port <port>      Upstream SOCKS5 port (default 1080)
-          --upstream-user <user>      Optional RFC1929 username
-          --upstream-password <pass>  Optional RFC1929 password
+          --upstream-port <port>      Upstream SOCKS5 port (default 1080; upstream mode only)
+          --upstream-user <user>      RFC1929 username; requires password
+          --upstream-password <pass>  RFC1929 password; requires username
           --status-file <path>        Atomic readiness/status JSON output
           --startup-timeout <sec>     libzt startup timeout (default 120)
           --connect-timeout <sec>     Peer/egress connect timeout (default 20)

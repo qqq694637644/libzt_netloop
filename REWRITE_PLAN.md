@@ -308,6 +308,7 @@ Android：使用 .NET for Android，长期运行 Node 使用 foreground service�
     socks.port = 1080
     overlay.tcp_port = 42042
     overlay.udp_port = 42043
+    routing.peers = 172.26.0.20,172.26.0.30
     routing.default_exit = 172.26.0.254
     egress.mode = direct | upstream_socks5
     reset.event_debounce_ms = 250
@@ -319,7 +320,7 @@ Android：使用 .NET for Android，长期运行 Node 使用 foreground service�
 - ZeroTier 网络授权是主要信任边界。
 - 不做 NetLoop 自己的用户系统。
 - Overlay Agent 只通过 libzt Managed IP 监听。
-- 本地 SOCKS 默认仅监听 127.0.0.1 / ::1。
+- 本地 SOCKS 固定监听 127.0.0.1。
 - 允许已授权 Overlay Peer 访问节点本机服务。
 - 第一版不做复杂 ACL；确有需要再加简单端口 allow-list。
 
