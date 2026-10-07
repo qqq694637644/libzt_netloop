@@ -87,7 +87,7 @@ internal static class NetLoopRuntimeController
         }
     }
 
-    internal static void Stop(Context context)
+    internal static bool Stop(Context context)
     {
         lock (Gate)
         {
@@ -97,7 +97,7 @@ internal static class NetLoopRuntimeController
             _primaryOverlayAddress = null;
         }
 
-        context.StopService(new Intent(context, typeof(NetLoopService)));
+        return context.StopService(new Intent(context, typeof(NetLoopService)));
     }
 
     internal static void ReportRuntimeStarting()

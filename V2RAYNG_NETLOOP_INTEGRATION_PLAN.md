@@ -848,9 +848,27 @@ Explicit STOP has completion semantics. The service awaits
 `coreController.stopLoop()`, completes service-specific teardown (VPN fd,
 NetLoop companion, or root routing), then reports `MSG_STATE_STOP_SUCCESS` from
 the terminating Service lifecycle. No fixed sleep is used to approximate Xray
-shutdown. The core shutdown callback is suppressed during an explicit awaited
-stop so a late callback from the old session cannot stop a newly created
-Service instance.
+shutdown. The actual AndroidLibXrayLite AAR used by this fork does not call the
+`CoreCallback.shutdown()` hook from `StopLoop()`, so that callback is a no-op and
+does not participate in Android Service lifecycle control. Keep the awaited
+`coreController.stopLoop()` + `coreStopMutex` model; do not reintroduce
+callback-suppression compatibility code for behavior the product AAR does not
+have.
+
+For NetLoop mode, STOP is complete only after the old dedicated `:netloop`
+process is gone. `NetLoopPluginManager.stopAndWaitGone()` captures the current
+control Binder, sends STOP and validates acceptance, unbinds, and waits for that
+Binder to die. NetLoop treats STOP as process-final even when no runtime service
+is currently active, so Binder death is the single completion barrier. Only
+after that barrier may `CoreVpnService` terminate and emit `STOP_SUCCESS`.
+
+UI `RUNNING` means an Android core Service/session exists, not merely that Xray's
+`coreController.isRunning` flag is true. The service-lifetime receiver therefore
+answers `MSG_REGISTER_CLIENT` with RUNNING throughout NetLoop STARTING and the
+single recovery attempt. A Service instance accepts only its first START command;
+duplicate START deliveries on that same instance are ignored. This prevents UI,
+Quick Tile, widget, shortcut, or system redelivery from creating a second
+NetLoop start/recovery flow inside one Service instance.
 
 ### v2rayNG process/service restart
 
@@ -877,6 +895,15 @@ The personal v2rayNG fork does not ship the upstream 2dust release updater.
 and the drawer entry are removed. Personal builds are updated manually from the
 fork's own artifacts instead of attempting to install an upstream APK with a
 different feature/signing lineage.
+
+`CoreProxyOnlyService` follows the same fail-fast lifecycle contract as root and
+VPN modes: if `startCoreLoop()` fails, it initiates stop and returns
+`START_NOT_STICKY` rather than leaving a sticky failed Service instance.
+
+When NetLoop mode is enabled, ordinary Xray mux and fragment preferences are
+disabled in the UI because the dedicated NetLoop runtime configuration does not
+inherit them. Changing settings that cannot affect NetLoop should not stop an
+otherwise valid NetLoop session.
 
 ---
 

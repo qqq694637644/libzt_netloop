@@ -69,7 +69,18 @@ public sealed class NetLoopControlService : Service
                             null,
                             null));
                     new Handler(Looper.MainLooper!).Post(
-                        () => NetLoopRuntimeController.Stop(this));
+                        () =>
+                        {
+                            if (NetLoopRuntimeController.Stop(this))
+                                return;
+
+                            // The dedicated :netloop process is the lifetime
+                            // boundary. If no runtime service exists, STOP still
+                            // terminates this control-only process so Binder death
+                            // remains the single completion barrier for v2rayNG.
+                            global::Android.OS.Process.KillProcess(
+                                global::Android.OS.Process.MyPid());
+                        });
                     break;
 
                 default:
