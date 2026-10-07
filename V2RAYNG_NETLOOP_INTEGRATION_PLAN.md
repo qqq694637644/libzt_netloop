@@ -812,6 +812,21 @@ Do not send `MSG_STATE_START_FAILURE` merely because the one recovery attempt
 has started. While recovery is in progress, use log/foreground-notification
 diagnostics only; START_FAILURE is reserved for the final failed outcome.
 
+The v2rayNG service-control broadcast receiver is owned by the Android Service
+lifecycle, not by the Xray core loop. `CoreVpnService`, `CoreProxyOnlyService`,
+and `CoreRootService` register it in `onCreate()` and unregister it in
+`onDestroy()`. Therefore STOP is available while NetLoop is STARTING, while
+Xray is running, and during the single NetLoop recovery attempt. A settings
+screen return that consumed a restart-required change always sends STOP without
+checking the UI process's `isRunning` flag; if no service exists the broadcast
+is simply ignored.
+
+NetLoop recovery keeps the existing `CoreVpnService` foreground identity and
+the service-control receiver alive. Recovery cleanup stops Xray, HEV/TUN, and
+the old VPN fd, but it does not call `stopForeground()` and does not unregister
+the service receiver. Only final failure, explicit user STOP, or actual Service
+destruction removes the foreground notification.
+
 Do not silently continue sending Xray traffic into a dead localhost SOCKS port.
 Do not add WorkManager, AlarmManager, exact alarms, watchdog services, special
 permissions, or other background-restart infrastructure for this case. Android
@@ -828,6 +843,14 @@ the current session but still does not auto-start it.
 The main-menu Restart command, notification Restart action, `MSG_STATE_RESTART`,
 and all `stop -> 500 ms -> start` service-control paths are removed. User-driven
 restart is simply Stop followed by a later Connect.
+
+Explicit STOP has completion semantics. The service awaits
+`coreController.stopLoop()`, completes service-specific teardown (VPN fd,
+NetLoop companion, or root routing), then reports `MSG_STATE_STOP_SUCCESS` from
+the terminating Service lifecycle. No fixed sleep is used to approximate Xray
+shutdown. The core shutdown callback is suppressed during an explicit awaited
+stop so a late callback from the old session cannot stop a newly created
+Service instance.
 
 ### v2rayNG process/service restart
 
@@ -848,6 +871,12 @@ path, it sends STOP to NetLoop rather than merely detaching the Binder. If the
 entire v2rayNG process is killed and `onDestroy()` is never delivered, a
 temporarily orphaned NetLoop process is accepted; do not add lease/heartbeat or
 watchdog infrastructure for that case.
+
+The personal v2rayNG fork does not ship the upstream 2dust release updater.
+`CheckUpdateActivity`, `UpdateCheckerManager`, the pre-release update setting,
+and the drawer entry are removed. Personal builds are updated manually from the
+fork's own artifacts instead of attempting to install an upstream APK with a
+different feature/signing lineage.
 
 ---
 
@@ -1099,6 +1128,15 @@ v2rayNG:
   fixed loopback `127.0.0.1:10808` SOCKS inbound and no Xray tun inbound
 
 Do not require Android emulator E2E as part of routine CI.
+
+The existing `NETLOOP_CI` broadcast START hook is dormant test automation, not
+a production launch surface. On Android 12+ a background broadcast receiver is
+not a generally valid origin for `startForegroundService()`, so do not treat
+that hook as a supported modern-emulator startup contract. If emulator E2E is
+revived later, replace the START hop with a `NETLOOP_CI`-only foreground
+Activity (or another platform-permitted test entry point) before relying on the
+harness. Do not add WorkManager/watchdog infrastructure just to preserve the
+old broadcast-start behavior.
 
 ### Manual physical-device acceptance
 
