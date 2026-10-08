@@ -101,7 +101,9 @@ com.libzt.netloop
 
 Advantages:
 
-- NetLoop and v2rayNG can be upgraded independently.
+- NetLoop and v2rayNG remain separate runtimes/APKs, but this personal build does
+  not require independent upgrade compatibility. Upgrade the pair together;
+  uninstall both old APKs first when necessary, then install the new pair.
 - .NET Android and Xray/Go do not need to share a runtime.
 - NetLoop keeps its dedicated `:netloop` process and existing libzt process-final lifecycle.
 - v2rayNG remains a normal Gradle/Kotlin Android application.
@@ -124,7 +126,9 @@ The first implementation must follow these rules:
 7. NetLoop is the final Internet egress path.
 8. NetLoop physical sockets must remain outside the v2rayNG VPN.
 9. v2rayNG is the only normal user-facing UI.
-10. NetLoop identity/state remains owned by NetLoop.
+10. NetLoop identity/state is stored only by NetLoop while that APK is installed.
+    A coordinated uninstall/reinstall may delete it and create a new ZeroTier
+    identity/Node ID; preserving identity across upgrades is not a requirement.
 
 ---
 
@@ -894,6 +898,15 @@ user STOP before the Service is allowed to terminate and publish
 `MSG_STATE_START_FAILURE`. This prevents an immediate retry from racing an old
 NetLoop process that is still executing its final service destruction.
 
+`CoreServiceManager.startCoreLoop()` owns only Xray startup and returns the
+resolved profile (or throws). It does not publish terminal UI state and does not
+remove the foreground notification on failure. `CoreVpnService`,
+`CoreProxyOnlyService`, and `CoreRootService` own their teardown and publish
+`START_FAILURE` only from their terminating Service lifecycle after the relevant
+cleanup has completed. If a Service is destroyed without a more specific
+`START_FAILURE` or `STOP_SUCCESS`, it publishes `NOT_RUNNING` so UI/Tile/Widget
+cannot remain stuck in the session-active state.
+
 UI `RUNNING` means an Android core Service/session exists, not merely that Xray's
 `coreController.isRunning` flag is true. The service-lifetime receiver therefore
 answers `MSG_REGISTER_CLIENT` with RUNNING throughout NetLoop STARTING and the
@@ -908,6 +921,9 @@ features that require a live Xray core (for example speed accounting), while
 shortcut controls. Internal dynamic broadcast receivers are registered
 `RECEIVER_NOT_EXPORTED`, and the AppWidget provider is not exported; no external
 app is allowed to forge the private service-control/activity-state broadcasts.
+All user/service entry points also refuse to start another Core Service while
+`isServiceSessionActive()` is already true, so one daemon process owns at most
+one Service session at a time.
 
 If a connection test is requested while the Service/session is active but Xray
 is not ready yet, it returns an explicit starting/recovering result instead of
@@ -940,9 +956,9 @@ infrastructure for that case.
 
 The personal v2rayNG fork does not ship the upstream 2dust release updater.
 `CheckUpdateActivity`, `UpdateCheckerManager`, the pre-release update setting,
-and the drawer entry are removed. Personal builds are updated manually from the
-fork's own artifacts instead of attempting to install an upstream APK with a
-different feature/signing lineage.
+and the drawer entry are removed. Pair upgrades are performed manually from this
+fork's artifacts together with the matching NetLoop APK, using coordinated
+uninstall/reinstall when needed.
 
 `CoreProxyOnlyService` follows the same fail-fast lifecycle contract as root and
 VPN modes: if `startCoreLoop()` fails, it initiates stop and returns
@@ -1005,6 +1021,12 @@ Do not add:
 - keystore-based plugin signing workflow
 - multi-tenant authorization
 - generic third-party plugin ABI
+
+Do not add a stable signing/keystore requirement for this personal pair. The two
+Android APKs are treated as disposable coordinated installs: if an artifact
+cannot replace the installed version in place, uninstall both apps and install
+the new pair. Losing NetLoop app-private state and receiving a new ZeroTier
+identity/Node ID after that coordinated reinstall is explicitly acceptable.
 
 The control service should use an explicit component name.
 
@@ -1187,6 +1209,11 @@ v2rayNG:
 
 - Android compile/package for plain `release`; application ID must remain
   `com.v2ray.ang`
+- `libv2ray.aar` has one fixed source for both build and release workflows:
+  repository `qqq694637644/AndroidLibXrayLite`, tag `v26.3.27-v2rayng`; do not
+  infer a tag from a submodule or expose workflow inputs that can select another
+  repository/tag. The AndroidLibXrayLite source submodule is not part of this
+  repository; only the HEV submodule remains.
 - release artifacts are `arm64-v8a` only; do not build 32-bit, x86/x86_64, or
   universal APKs for this personal NetLoop pairing
 - assert NetLoop-mode VPN builder output always has IPv4 + IPv6 interface
@@ -1304,4 +1331,6 @@ The integration is complete when all of the following are true:
 - `default_exit` is required on every node, including the exit node itself.
 - captured TCP, UDP, and DNS all use the NetLoop path and configured ZeroTier exit B.
 - Network switching does not require manually reopening either app.
-- Both projects can still be built and upgraded independently.
+- Both projects can still be built independently, but Android deployment is a
+  coordinated pair: no independent-upgrade compatibility or stable app-signing
+  contract is required, and a pair upgrade may use uninstall/reinstall.
