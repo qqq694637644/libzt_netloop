@@ -821,6 +821,12 @@ screen return that consumed a restart-required change always sends STOP without
 checking the UI process's `isRunning` flag; if no service exists the broadcast
 is simply ignored.
 
+Registering that Service-lifetime receiver also immediately publishes
+`MSG_STATE_RUNNING`. In the UI/control contract, RUNNING means the Android
+Service/session exists and can be stopped; it does not mean Xray is already
+ready. This lets the main FAB become Stop as soon as a long NetLoop STARTING
+session exists instead of waiting for `MSG_STATE_START_SUCCESS`.
+
 NetLoop recovery keeps the existing `CoreVpnService` foreground identity and
 the service-control receiver alive. Recovery cleanup stops Xray, HEV/TUN, and
 the old VPN fd, but it does not call `stopForeground()` and does not unregister
@@ -862,6 +868,19 @@ Binder to die. NetLoop treats STOP as process-final even when no runtime service
 is currently active, so Binder death is the single completion barrier. Only
 after that barrier may `CoreVpnService` terminate and emit `STOP_SUCCESS`.
 
+`stopAndWaitGone()` is teardown-only. It may use an already connected Binder or
+an already pending binding owned by that manager, but it must never call the
+normal `connect()` path and create a new `BIND_AUTO_CREATE` binding just to send
+STOP. If the manager owns no live/pending binding, the companion is already gone
+for teardown purposes. If a previously live Binder has disconnected, detach the
+old binding and treat that Binder death as the completion barrier rather than
+allowing STOP to resurrect the companion process.
+
+Startup and runtime failures use the same process-final teardown as explicit
+user STOP before the Service is allowed to terminate and publish
+`MSG_STATE_START_FAILURE`. This prevents an immediate retry from racing an old
+NetLoop process that is still executing its final service destruction.
+
 UI `RUNNING` means an Android core Service/session exists, not merely that Xray's
 `coreController.isRunning` flag is true. The service-lifetime receiver therefore
 answers `MSG_REGISTER_CLIENT` with RUNNING throughout NetLoop STARTING and the
@@ -869,6 +888,17 @@ single recovery attempt. A Service instance accepts only its first START command
 duplicate START deliveries on that same instance are ignored. This prevents UI,
 Quick Tile, widget, shortcut, or system redelivery from creating a second
 NetLoop start/recovery flow inside one Service instance.
+
+The code exposes these two concepts separately: `isCoreRunning()` is only for
+features that require a live Xray core (for example speed accounting), while
+`isServiceSessionActive()` is used by Quick Tile, widget, and start/stop/switch
+shortcut controls. Internal dynamic broadcast receivers are registered
+`RECEIVER_NOT_EXPORTED`, and the AppWidget provider is not exported; no external
+app is allowed to forge the private service-control/activity-state broadcasts.
+
+If a connection test is requested while the Service/session is active but Xray
+is not ready yet, it returns an explicit starting/recovering result instead of
+silently returning and leaving the UI stuck on `testing...`.
 
 ### v2rayNG process/service restart
 
@@ -885,10 +915,15 @@ configuration. Recovery is always initiated from v2rayNG with a fresh
 START(full desired config).
 
 When `CoreVpnService.onDestroy()` is observably called outside the normal stop
-path, it sends STOP to NetLoop rather than merely detaching the Binder. If the
-entire v2rayNG process is killed and `onDestroy()` is never delivered, a
-temporarily orphaned NetLoop process is accepted; do not add lease/heartbeat or
-watchdog infrastructure for that case.
+path, it sends a best-effort non-blocking STOP to NetLoop and detaches. It must
+not call `runBlocking { stopAndWaitGone() }`: Service lifecycle callbacks run on
+the Android main thread, while Messenger replies are dispatched by the main
+Looper, so waiting there can block the very ACK required to finish. Normal user
+STOP and observable startup/runtime failures complete the Binder-death barrier
+before `stopSelf()`; abnormal `onDestroy()` does not. If the entire v2rayNG
+process is killed and `onDestroy()` is never delivered, a temporarily orphaned
+NetLoop process is accepted; do not add lease/heartbeat or watchdog
+infrastructure for that case.
 
 The personal v2rayNG fork does not ship the upstream 2dust release updater.
 `CheckUpdateActivity`, `UpdateCheckerManager`, the pre-release update setting,
