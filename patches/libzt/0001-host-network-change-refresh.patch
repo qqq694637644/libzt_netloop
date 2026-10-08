@@ -1,0 +1,218 @@
+diff --git a/include/ZeroTierSockets.h b/include/ZeroTierSockets.h
+index ba9732a..0536a04 100644
+--- a/include/ZeroTierSockets.h
++++ b/include/ZeroTierSockets.h
+@@ -1724,6 +1724,17 @@ ZTS_API int ZTCALL zts_node_get_id_pair(char* key, unsigned int* key_dst_len);
+  */
+ ZTS_API int ZTCALL zts_node_get_port();
+ 
++/**
++ * @brief Notify the node that the host's physical network changed.
++ *
++ * Forces an immediate refresh of physical UDP bindings and local interface
++ * addresses without restarting the ZeroTier node or virtual networks.
++ *
++ * @return `ZTS_ERR_OK` if successful, `ZTS_ERR_SERVICE` if the node
++ *     is not running.
++ */
++ZTS_API int ZTCALL zts_node_network_changed();
++
+ /**
+  * @brief Stop the ZeroTier node and bring down all virtual network
+  *     transport services. Callable only after the node has been started.
+diff --git a/src/Controls.cpp b/src/Controls.cpp
+index 8aa0a72..765cbf3 100644
+--- a/src/Controls.cpp
++++ b/src/Controls.cpp
+@@ -619,6 +619,13 @@ int zts_node_get_port()
+     return zts_service->getPrimaryPort();
+ }
+ 
++int zts_node_network_changed()
++{
++    ACQUIRE_SERVICE(ZTS_ERR_SERVICE);
++    zts_service->networkChanged();
++    return ZTS_ERR_OK;
++}
++
+ int zts_node_stop()
+ {
+     ACQUIRE_SERVICE(ZTS_ERR_SERVICE);
+diff --git a/src/NodeService.cpp b/src/NodeService.cpp
+index 036f406..6887675 100644
+--- a/src/NodeService.cpp
++++ b/src/NodeService.cpp
+@@ -182,6 +182,7 @@ NodeService::NodeService()
+     , _lastSendToGlobalV4(0)
+     , _tcpFallbackTunnel((TcpConnection*)0)
+     , _lastRestart(0)
++    , _networkChangeRequested(false)
+     , _nextBackgroundTaskDeadline(0)
+     , _run(false)
+     , _termReason(ONE_STILL_RUNNING)
+@@ -359,10 +360,9 @@ NodeService::ReasonForTermination NodeService::run()
+         int64_t lastTapMulticastGroupCheck = 0;
+         int64_t lastBindRefresh = 0;
+         int64_t lastCleanedPeersDb = 0;
+-        int64_t lastLocalInterfaceAddressCheck =
+-            (clockShouldBe - ZT_LOCAL_INTERFACE_CHECK_INTERVAL) + 15000;   // do this in 15s to give portmapper time to
+         int64_t lastOnline = OSUtils::now();
+         for (;;) {
++            bool networkChanged = false;
+             _run_m.lock();
+             if (! _run) {
+                 _run_m.unlock();
+@@ -372,6 +372,8 @@ NodeService::ReasonForTermination NodeService::run()
+                 break;
+             }
+             else {
++                networkChanged = _networkChangeRequested;
++                _networkChangeRequested = false;
+                 _run_m.unlock();
+             }
+ 
+@@ -384,22 +386,28 @@ NodeService::ReasonForTermination NodeService::run()
+                 _lastRestart = now;
+                 restarted = true;
+             }
+-
+-            // If secondary port is not configured to a constant value and we've been offline for a while,
+-            // bind a new secondary port. This is a workaround for a "coma" issue caused by buggy NATs that stop
+-            // working on one port after a while.
+-            if (_node->online()) {
+-                lastOnline = now;
+-            }
+-            else if ((_secondaryPort == 0) && ((now - lastOnline) > ZT_PATH_HEARTBEAT_PERIOD)) {
+-                _secondaryPort = _getRandomPort(minPort, maxPort);
+-                lastBindRefresh = 0;
++            if (networkChanged) {
++                _lastRestart = now;
++                restarted = true;
+             }
+ 
+             // Refresh bindings in case device's interfaces have changed,
+             // and also sync routes to update any shadow routes (e.g. shadow
+             // default)
+             if (((now - lastBindRefresh) >= ZT_BINDER_REFRESH_PERIOD) || (restarted)) {
++                // ZeroTierOne 5542dbcc0 moved secondary-port rotation into the
++                // binder refresh cadence so a node does not keep changing
++                // ports before the new mapping has had a chance to connect.
++                if (_secondaryPort == 0) {
++                    if (_node->online()) {
++                        lastOnline = now;
++                    }
++                    else if (((now - lastOnline) > (ZT_PEER_PING_PERIOD * 2)) || restarted) {
++                        lastOnline = now;
++                        _ports[1] = _getRandomPort(minPort, maxPort);
++                    }
++                }
++
+                 lastBindRefresh = now;
+                 unsigned int p[3] = { 0 };
+                 unsigned int pc = 0;
+@@ -412,6 +420,35 @@ NodeService::ReasonForTermination NodeService::run()
+                     // Only bother binding UDP ports if we aren't forcing TCP-relay mode
+                     _binder.refresh(_phy, p, pc, explicitBind, *this);
+                 }
++
++                // Keep the core's view of local physical interfaces in sync
++                // with the freshly rebound sockets. This mirrors ZeroTierOne
++                // 1.12's faster physical-network-change recovery.
++                _node->clearLocalInterfaceAddresses();
++#ifdef ZT_USE_MINIUPNPC
++                if (_portMapper) {
++                    std::vector<InetAddress> mappedAddresses(_portMapper->get());
++                    for (std::vector<InetAddress>::const_iterator ext(mappedAddresses.begin());
++                         ext != mappedAddresses.end();
++                         ++ext)
++                        _node->addLocalInterfaceAddress(reinterpret_cast<const struct sockaddr_storage*>(&(*ext)));
++                }
++#endif
++                std::vector<InetAddress> boundAddrs(_binder.allBoundLocalInterfaceAddresses());
++                for (std::vector<InetAddress>::const_iterator i(boundAddrs.begin()); i != boundAddrs.end(); ++i)
++                    _node->addLocalInterfaceAddress(reinterpret_cast<const struct sockaddr_storage*>(&(*i)));
++
++                // Older libzt exposes a narrower syncManagedStuff() than
++                // ZeroTierOne 1.12+, but re-running it here is the equivalent
++                // available hook for refreshing the virtual network state
++                // after physical bindings change.
++                {
++                    Mutex::Lock _l(_nets_m);
++                    for (std::map<uint64_t, NetworkState>::iterator n(_nets.begin()); n != _nets.end(); ++n) {
++                        if (n->second.tap)
++                            syncManagedStuff(n->second);
++                    }
++                }
+             }
+ 
+             // Generate callback messages for user application
+@@ -467,27 +504,6 @@ NodeService::ReasonForTermination NodeService::run()
+                 }
+             }
+ 
+-            // Sync information about physical network interfaces
+-            if ((now - lastLocalInterfaceAddressCheck) >= ZT_LOCAL_INTERFACE_CHECK_INTERVAL) {
+-                lastLocalInterfaceAddressCheck = now;
+-
+-                _node->clearLocalInterfaceAddresses();
+-
+-#ifdef ZT_USE_MINIUPNPC
+-                if (_portMapper) {
+-                    std::vector<InetAddress> mappedAddresses(_portMapper->get());
+-                    for (std::vector<InetAddress>::const_iterator ext(mappedAddresses.begin());
+-                         ext != mappedAddresses.end();
+-                         ++ext)
+-                        _node->addLocalInterfaceAddress(reinterpret_cast<const struct sockaddr_storage*>(&(*ext)));
+-                }
+-#endif
+-
+-                std::vector<InetAddress> boundAddrs(_binder.allBoundLocalInterfaceAddresses());
+-                for (std::vector<InetAddress>::const_iterator i(boundAddrs.begin()); i != boundAddrs.end(); ++i)
+-                    _node->addLocalInterfaceAddress(reinterpret_cast<const struct sockaddr_storage*>(&(*i)));
+-            }
+-
+             // Clean peers.d periodically
+             if ((now - lastCleanedPeersDb) >= 3600000) {
+                 lastCleanedPeersDb = now;
+@@ -566,6 +582,19 @@ void NodeService::terminate()
+     _phy.whack();
+ }
+ 
++void NodeService::networkChanged()
++{
++    {
++        Mutex::Lock _l(_run_m);
++        if (! _run) {
++            return;
++        }
++        _networkChangeRequested = true;
++        _nextBackgroundTaskDeadline = 0;
++    }
++    _phy.whack();
++}
++
+ void NodeService::syncManagedStuff(NetworkState& n)
+ {
+     char ipbuf[64] = { 0 };
+diff --git a/src/NodeService.hpp b/src/NodeService.hpp
+index c600bbc..3fa6940 100644
+--- a/src/NodeService.hpp
++++ b/src/NodeService.hpp
+@@ -210,6 +210,7 @@ class NodeService {
+ 
+     // Last potential sleep/wake event
+     uint64_t _lastRestart;
++    bool _networkChangeRequested;
+ 
+     // Deadline for the next background task service function
+     volatile int64_t _nextBackgroundTaskDeadline;
+@@ -291,6 +292,9 @@ class NodeService {
+     /** Stop the node and service */
+     void terminate();
+ 
++    /** Notify the service that the host physical network changed. */
++    void networkChanged();
++
+     /** Apply or update managed IPs for a configured network */
+     void syncManagedStuff(NetworkState& n);
+ 

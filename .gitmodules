@@ -1,6 +1,3 @@
 [submodule "external/libzt"]
 	path = external/libzt
 	url = https://github.com/zerotier/libzt.git
-[submodule "external/asio"]
-	path = external/asio
-	url = https://github.com/chriskohlhoff/asio.git

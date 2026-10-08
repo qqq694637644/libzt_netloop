@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>netloop</AssemblyName>
+    <RootNamespace>NetLoop.Host</RootNamespace>
+    <RuntimeIdentifiers>win-x64;linux-x64;linux-arm64</RuntimeIdentifiers>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../NetLoop.Core/NetLoop.Core.csproj" />
+    <ProjectReference Include="../NetLoop.Libzt/NetLoop.Libzt.csproj" />
+    <ProjectReference Include="../NetLoop.Socks/NetLoop.Socks.csproj" />
+  </ItemGroup>
+</Project>

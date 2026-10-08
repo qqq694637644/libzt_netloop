@@ -1,0 +1,382 @@
+name: C# Windows CI
+
+on:
+  push:
+    branches:
+      - main
+      - "gpt/**"
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: csharp-windows-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  PYTHONUTF8: "1"
+  DOTNET_NOLOGO: "1"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  SCCACHE_GHA_ENABLED: "true"
+  SCCACHE_GHA_VERSION: "libzt-netloop-csharp-windows-msvc-v1"
+  SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
+  SCCACHE_BASEDIRS: ${{ github.workspace }}
+  BUILD_ARTIFACT: csharp-windows-build-${{ github.run_id }}-${{ github.run_attempt }}
+  RENDEZVOUS_ARTIFACT: csharp-zt-rendezvous-${{ github.run_id }}-${{ github.run_attempt }}
+  CLIENT_RESULT_ARTIFACT: csharp-zt-client-result-${{ github.run_id }}-${{ github.run_attempt }}
+  UPSTREAM_RENDEZVOUS_ARTIFACT: csharp-zt-upstream-rendezvous-${{ github.run_id }}-${{ github.run_attempt }}
+  UPSTREAM_CLIENT_RESULT_ARTIFACT: csharp-zt-upstream-client-result-${{ github.run_id }}-${{ github.run_attempt }}
+
+jobs:
+  build:
+    name: Build C# Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up .NET from global.json
+        uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+
+      - name: Resolve native cache key
+        id: native-key
+        shell: pwsh
+        run: |
+          $libzt = (git ls-tree HEAD external/libzt).Split()[2]
+          $cmake = git hash-object CMakeLists.txt
+          $script = git hash-object tools/build_csharp.py
+          $networkRefreshPatch = git hash-object patches/libzt/0001-host-network-change-refresh.patch
+          "key=libzt-pinvoke-win-x64-$libzt-$cmake-$script-$networkRefreshPatch" >> $env:GITHUB_OUTPUT
+
+      - name: Restore compiled libzt bundle
+        id: native-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: native-cache
+          key: ${{ steps.native-key.outputs.key }}
+
+      - name: Set up MSVC environment
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Set up sccache
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: "v0.18.0"
+
+      - name: Build native libzt on cache miss
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        run: >
+          python tools/build_csharp.py
+          --native-only
+          --use-sccache
+          --native-output native-cache/libzt.dll
+
+      - name: Verify native bundle
+        shell: pwsh
+        run: |
+          if (-not (Test-Path native-cache/libzt.dll)) {
+            throw "native-cache/libzt.dll is missing"
+          }
+          if (Test-Path native-cache/libzt.dll.manifest.json) {
+            Get-Content native-cache/libzt.dll.manifest.json
+          }
+
+      - name: Save compiled libzt bundle immediately
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: native-cache
+          key: ${{ steps.native-key.outputs.key }}
+
+      - name: Restore and publish managed host
+        run: >
+          python tools/build_csharp.py
+          --managed-only
+          --native-input native-cache/libzt.dll
+          --output dist-csharp
+          --runtime win-x64
+
+      - name: Smoke test
+        run: python ci/csharp_smoke.py --runtime dist-csharp
+
+      - name: Upload C# runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BUILD_ARTIFACT }}
+          path: dist-csharp/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Build summary
+        if: always()
+        shell: pwsh
+        run: |
+          "### C# build" >> $env:GITHUB_STEP_SUMMARY
+          "- native bundle cache hit: ${{ steps.native-cache.outputs.cache-hit }}" >> $env:GITHUB_STEP_SUMMARY
+          if (Test-Path dist-csharp/build-manifest.json) {
+            Get-Content dist-csharp/build-manifest.json >> $env:GITHUB_STEP_SUMMARY
+          }
+
+  e2e-server:
+    name: C# E2E machine A (exit/server)
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.BUILD_ARTIFACT }}
+          path: package
+
+      - name: Deploy runtime
+        shell: pwsh
+        run: |
+          if (Test-Path runtime-csharp) { Remove-Item runtime-csharp -Recurse -Force }
+          New-Item -ItemType Directory -Force runtime-csharp | Out-Null
+          Copy-Item package\* runtime-csharp -Recurse -Force
+
+      - name: Join ad-hoc network and prepare exit
+        run: python ci/csharp_e2e_server.py prepare --runtime runtime-csharp
+
+      - name: Publish rendezvous
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.RENDEZVOUS_ARTIFACT }}
+          path: evidence/csharp-server/rendezvous.json
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Hold server until client finishes
+        run: python ci/csharp_e2e_server.py hold --client-artifact "${{ env.CLIENT_RESULT_ARTIFACT }}"
+
+      - name: Preserve server evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: csharp-server-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/csharp-server/
+          if-no-files-found: warn
+          retention-days: 14
+
+  e2e-client:
+    name: C# E2E machine B (client)
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.BUILD_ARTIFACT }}
+          path: package
+
+      - name: Deploy runtime
+        shell: pwsh
+        run: |
+          if (Test-Path runtime-csharp) { Remove-Item runtime-csharp -Recurse -Force }
+          New-Item -ItemType Directory -Force runtime-csharp | Out-Null
+          Copy-Item package\* runtime-csharp -Recurse -Force
+
+      - name: Cross-machine peer-local and default-exit E2E
+        id: e2e
+        continue-on-error: true
+        run: >
+          python ci/csharp_e2e_client.py
+          --runtime runtime-csharp
+          --rendezvous-artifact "${{ env.RENDEZVOUS_ARTIFACT }}"
+          --reset-stress
+          --reset-cycles 10
+
+      - name: Publish reset timing summary
+        if: always()
+        shell: pwsh
+        run: |
+          $path = "evidence/csharp-client/reset_timing.tsv"
+          if (Test-Path $path) {
+            "### Runtime reset timing" >> $env:GITHUB_STEP_SUMMARY
+            '```text' >> $env:GITHUB_STEP_SUMMARY
+            Get-Content $path >> $env:GITHUB_STEP_SUMMARY
+            '```' >> $env:GITHUB_STEP_SUMMARY
+          }
+
+      - name: Publish client result for machine A
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.CLIENT_RESULT_ARTIFACT }}
+          path: evidence/csharp-client/result.json
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Preserve client evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: csharp-client-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/csharp-client/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Fail job when E2E failed
+        if: steps.e2e.outcome != 'success'
+        run: python -c "raise SystemExit('C# cross-machine E2E failed; inspect evidence artifacts')"
+
+  e2e-upstream-server:
+    name: C# E2E upstream machine A (exit/server)
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.BUILD_ARTIFACT }}
+          path: package
+
+      - name: Deploy runtime
+        shell: pwsh
+        run: |
+          if (Test-Path runtime-csharp) { Remove-Item runtime-csharp -Recurse -Force }
+          New-Item -ItemType Directory -Force runtime-csharp | Out-Null
+          Copy-Item package\* runtime-csharp -Recurse -Force
+
+      - name: Prepare authenticated upstream SOCKS5 exit
+        run: >
+          python ci/csharp_e2e_server.py prepare
+          --runtime runtime-csharp
+          --overlay-port 43042
+          --overlay-udp-port 43043
+          --socks-port 28080
+          --local-service-port 28181
+          --local-udp-service-port 28182
+          --upstream-socks-port 29110
+
+      - name: Publish upstream rendezvous
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.UPSTREAM_RENDEZVOUS_ARTIFACT }}
+          path: evidence/csharp-server/rendezvous.json
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Hold upstream server until client finishes
+        run: >
+          python ci/csharp_e2e_server.py hold
+          --client-artifact "${{ env.UPSTREAM_CLIENT_RESULT_ARTIFACT }}"
+
+      - name: Preserve upstream server evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: csharp-upstream-server-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/csharp-server/
+          if-no-files-found: warn
+          retention-days: 14
+
+  e2e-upstream-client:
+    name: C# E2E upstream machine B (client)
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.BUILD_ARTIFACT }}
+          path: package
+
+      - name: Deploy runtime
+        shell: pwsh
+        run: |
+          if (Test-Path runtime-csharp) { Remove-Item runtime-csharp -Recurse -Force }
+          New-Item -ItemType Directory -Force runtime-csharp | Out-Null
+          Copy-Item package\* runtime-csharp -Recurse -Force
+
+      - name: Cross-machine authenticated upstream SOCKS5 E2E
+        id: e2e
+        continue-on-error: true
+        run: >
+          python ci/csharp_e2e_client.py
+          --runtime runtime-csharp
+          --rendezvous-artifact "${{ env.UPSTREAM_RENDEZVOUS_ARTIFACT }}"
+          --listen-port 29080
+
+      - name: Publish upstream client result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.UPSTREAM_CLIENT_RESULT_ARTIFACT }}
+          path: evidence/csharp-client/result.json
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Preserve upstream client evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: csharp-upstream-client-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/csharp-client/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Fail job when upstream E2E failed
+        if: steps.e2e.outcome != 'success'
+        run: python -c "raise SystemExit('C# authenticated upstream SOCKS5 E2E failed; inspect evidence artifacts')"

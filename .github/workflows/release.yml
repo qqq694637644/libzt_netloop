@@ -1,64 +1,396 @@
-name: Release Windows EXEs
+name: C# Cross-platform Release
 
 on:
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
-    inputs:
-      branch:
-        description: Branch or ref to build
-        required: true
-        default: main
-        type: string
-      version:
-        description: Release version, for example 0.2.0 or v0.2.0
-        required: true
-        type: string
+
+concurrency:
+  group: csharp-release-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
+  actions: read
 
 env:
   PYTHONUTF8: "1"
+  DOTNET_NOLOGO: "1"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
   SCCACHE_GHA_ENABLED: "true"
-  SCCACHE_GHA_VERSION: "libzt-netloop-windows-msvc-v1"
   SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
   SCCACHE_BASEDIRS: ${{ github.workspace }}
 
 jobs:
-  release:
-    name: Build and publish Windows EXEs
-    runs-on: windows-latest
-    timeout-minutes: 40
+  metadata:
+    name: Resolve release metadata
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      android_version_code: ${{ steps.version.outputs.android_version_code }}
     steps:
-      - name: Checkout selected branch
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.branch }}
-          fetch-depth: 0
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            if [[ "$GITHUB_REF_NAME" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              major="${BASH_REMATCH[1]}"
+              minor="${BASH_REMATCH[2]}"
+              patch="${BASH_REMATCH[3]}"
+            else
+              echo "Release tags must look like vMAJOR.MINOR.PATCH" >&2
+              exit 1
+            fi
+            version="${GITHUB_REF_NAME#v}"
+            if (( 10#$minor >= 1000 || 10#$patch >= 1000 )); then
+              echo "minor and patch must be < 1000 for Android versionCode" >&2
+              exit 1
+            fi
+            android_version_code=$((10#$major * 1000000 + 10#$minor * 1000 + 10#$patch))
+            if (( android_version_code < 1 || android_version_code > 2100000000 )); then
+              echo "Android versionCode is out of range: $android_version_code" >&2
+              exit 1
+            fi
+          else
+            version="0.0.0-dev+${GITHUB_SHA:0:8}"
+            android_version_code=1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "android_version_code=$android_version_code" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $version"
+          echo "Android versionCode: $android_version_code"
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+  windows:
+    name: Release Windows x64
+    needs: metadata
+    runs-on: windows-latest
+    timeout-minutes: 35
+    env:
+      SCCACHE_GHA_VERSION: libzt-netloop-release-windows-v1
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
+      - uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+
+      - name: Resolve native cache key
+        id: native-key
+        shell: pwsh
+        run: |
+          $libzt = (git ls-tree HEAD external/libzt).Split()[2]
+          $cmake = git hash-object CMakeLists.txt
+          $script = git hash-object tools/build_csharp.py
+          $patch = git hash-object patches/libzt/0001-host-network-change-refresh.patch
+          "key=libzt-pinvoke-win-x64-$libzt-$cmake-$script-$patch" >> $env:GITHUB_OUTPUT
+
+      - name: Restore compiled libzt bundle
+        id: native-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: native-cache
+          key: ${{ steps.native-key.outputs.key }}
+
       - name: Set up MSVC environment
+        if: steps.native-cache.outputs.cache-hit != 'true'
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
       - name: Set up sccache
+        if: steps.native-cache.outputs.cache-hit != 'true'
         uses: mozilla-actions/sccache-action@v0.0.11
         with:
           version: "v0.18.0"
 
-      - name: Build selected version
-        run: python tools/build.py --config Release --generator ninja --use-sccache --version "${{ inputs.version }}"
+      - name: Build native libzt on cache miss
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        run: >
+          python tools/build_csharp.py
+          --native-only
+          --use-sccache
+          --native-output native-cache/libzt.dll
 
-      - name: Smoke test binaries
-        run: python ci/smoke.py --runtime dist
+      - name: Save compiled libzt bundle
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: native-cache
+          key: ${{ steps.native-key.outputs.key }}
 
-      - name: Publish GitHub Release
+      - name: Publish runtime
+        run: >
+          python tools/build_csharp.py
+          --managed-only
+          --native-input native-cache/libzt.dll
+          --output dist-csharp
+          --runtime win-x64
+          --self-contained
+          --version "${{ needs.metadata.outputs.version }}"
+
+      - name: Smoke test
+        run: >
+          python ci/csharp_smoke.py
+          --runtime dist-csharp
+          --expected-version "${{ needs.metadata.outputs.version }}"
+
+      - name: Verify self-contained runtime
+        shell: pwsh
+        run: |
+          foreach ($name in @('coreclr.dll', 'hostfxr.dll', 'hostpolicy.dll')) {
+            if (-not (Test-Path "dist-csharp/$name")) {
+              throw "Self-contained runtime file missing: $name"
+            }
+          }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release | Out-Null
+          Compress-Archive -Path dist-csharp\* -DestinationPath release\netloop-win-x64.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-win-x64
+          path: release/netloop-win-x64.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  linux:
+    name: Release ${{ matrix.runtime }}
+    needs: metadata
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runtime: linux-x64
+            arch: x64
+            runner: ubuntu-24.04
+          - runtime: linux-arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    env:
+      SCCACHE_GHA_VERSION: libzt-netloop-release-linux-v1
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+          architecture: ${{ matrix.arch }}
+
+      - name: Resolve native cache key
+        id: native-key
+        shell: bash
+        run: |
+          set -euo pipefail
+          libzt="$(git ls-tree HEAD external/libzt | awk '{print $3}')"
+          cmake="$(git hash-object CMakeLists.txt)"
+          script="$(git hash-object tools/build_csharp.py)"
+          patch="$(git hash-object patches/libzt/0001-host-network-change-refresh.patch)"
+          echo "key=libzt-pinvoke-linux-${{ matrix.arch }}-${libzt}-${cmake}-${script}-${patch}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore compiled libzt bundle
+        id: native-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: native-cache
+          key: ${{ steps.native-key.outputs.key }}
+
+      - name: Set up sccache
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: "v0.18.0"
+
+      - name: Build native libzt on cache miss
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        run: >
+          python tools/build_csharp.py
+          --native-only
+          --use-sccache
+          --native-output native-cache/libzt.so
+
+      - name: Save compiled libzt bundle
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: native-cache
+          key: ${{ steps.native-key.outputs.key }}
+
+      - name: Publish runtime
+        run: >
+          python tools/build_csharp.py
+          --managed-only
+          --native-input native-cache/libzt.so
+          --output dist-csharp
+          --runtime ${{ matrix.runtime }}
+          --self-contained
+          --version "${{ needs.metadata.outputs.version }}"
+
+      - name: Smoke test
+        run: >
+          python ci/csharp_smoke.py
+          --runtime dist-csharp
+          --expected-version "${{ needs.metadata.outputs.version }}"
+
+      - name: Verify self-contained runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f dist-csharp/libcoreclr.so
+          test -f dist-csharp/libhostfxr.so
+          test -f dist-csharp/libhostpolicy.so
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x dist-csharp/netloop
+          mkdir -p release
+          tar -C dist-csharp -czf "$PWD/release/netloop-${{ matrix.runtime }}.tar.gz" .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.runtime }}
+          path: release/netloop-${{ matrix.runtime }}.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  android:
+    name: Release Android arm64-v8a
+    needs: metadata
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SCCACHE_GHA_VERSION: libzt-netloop-release-android-v1
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+          workloads: android
+
+      - name: Resolve Android native cache key
+        id: native-key
+        shell: bash
+        run: |
+          set -euo pipefail
+          libzt="$(git ls-tree HEAD external/libzt | awk '{print $3}')"
+          cmake="$(git hash-object CMakeLists.txt)"
+          script="$(git hash-object tools/build_android_native.py)"
+          patch1="$(git hash-object patches/libzt/0001-host-network-change-refresh.patch)"
+          patch2="$(git hash-object patches/libzt/0002-android-pinvoke.patch)"
+          ndk_revision="$(awk -F= '/Pkg.Revision/ {gsub(/ /, "", $2); print $2}' "$ANDROID_NDK_HOME/source.properties")"
+          echo "key=libzt-pinvoke-android-arm64-${ndk_revision}-${libzt}-${cmake}-${script}-${patch1}-${patch2}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore compiled Android libzt bundle
+        id: native-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: native-cache/android-arm64
+          key: ${{ steps.native-key.outputs.key }}
+
+      - name: Set up sccache
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: "v0.18.0"
+
+      - name: Build Android arm64-v8a libzt on cache miss
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        run: >
+          python tools/build_android_native.py
+          --ndk "$ANDROID_NDK_HOME"
+          --api 24
+          --abi arm64-v8a
+          --use-sccache
+          --output native-cache/android-arm64/libzt.so
+
+      - name: Save compiled Android libzt bundle
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: native-cache/android-arm64
+          key: ${{ steps.native-key.outputs.key }}
+
+      - name: Publish Android application
+        run: >
+          dotnet publish src-csharp/NetLoop.Android/NetLoop.Android.csproj
+          --configuration Release
+          --framework net10.0-android36.0
+          --runtime android-arm64
+          -p:LibztNativePath="$PWD/native-cache/android-arm64/libzt.so"
+          -p:AndroidPackageFormat=apk
+          -p:ApplicationDisplayVersion="${{ needs.metadata.outputs.version }}"
+          -p:ApplicationVersion="${{ needs.metadata.outputs.android_version_code }}"
+
+      - name: Collect and verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          apk="$(find src-csharp/NetLoop.Android/bin/Release/net10.0-android36.0/android-arm64 -type f -name '*-Signed.apk' -print -quit)"
+          if [[ -z "$apk" ]]; then
+            apk="$(find src-csharp/NetLoop.Android/bin/Release/net10.0-android36.0/android-arm64 -type f -name '*.apk' -print -quit)"
+          fi
+          test -n "$apk"
+          cp "$apk" release/netloop-android-arm64.apk
+          unzip -Z1 "$apk" | tee release/apk-contents.txt
+          grep -q '^lib/arm64-v8a/libzt.so$' release/apk-contents.txt
+          abis="$(awk -F/ '$1 == "lib" {print $2}' release/apk-contents.txt | sort -u | paste -sd, -)"
+          test "$abis" = "arm64-v8a"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-android-arm64
+          path: release/netloop-android-arm64.apk
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - windows
+      - linux
+      - android
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+
+      - name: Create or update release
         env:
           GH_TOKEN: ${{ github.token }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          RELEASE_BRANCH: ${{ inputs.branch }}
-        run: python tools/release.py --version "${{ inputs.version }}" --dist-dir dist
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -l release
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" release/* --generate-notes --title "$GITHUB_REF_NAME"
+          fi

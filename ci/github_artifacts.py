@@ -73,9 +73,9 @@ def download_artifact(artifact: dict, destination: Path) -> Path:
     url = artifact["archive_download_url"]
     opener = urllib.request.build_opener(_SafeRedirectHandler())
     with opener.open(_request(url), timeout=60) as response:
-        payload = response.read()
+        content = response.read()
     destination_resolved = destination.resolve()
-    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+    with zipfile.ZipFile(io.BytesIO(content)) as archive:
         for member in archive.infolist():
             target = (destination / member.filename).resolve()
             if (

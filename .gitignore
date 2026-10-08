@@ -1,9 +1,15 @@
 .gpt-data/
 build/
+build-csharp-native/
 dist/
+dist-csharp/
+native-cache/
 runtime/
+runtime-csharp/
 evidence/
 state/
+**/bin/
+**/obj/
 __pycache__/
 *.pyc
 *.log
