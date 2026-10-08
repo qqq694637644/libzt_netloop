@@ -654,6 +654,12 @@ HEV must be configured with IPv6 enabled regardless of the normal
 internal HEV-facing SOCKS inbound is fixed, loopback-only, unauthenticated, and
 exists only for the HEV path; Xray TUN mode does not expose it.
 
+HEV startup is fail-fast. `TProxyStartService(...)` exceptions must propagate to
+the existing NetLoop startup failure path; do not log-and-swallow them and do
+not report `START_SUCCESS` when the TUN bridge failed to start. The old
+`isRunningProvider` / `restartCallback` constructor hooks are not used and are
+removed rather than retained as an automatic-recovery compatibility surface.
+
 ### 8.5 Preserve the original destination before NetLoop
 
 NetLoop peer routing is keyed by the destination address presented by SOCKS.
@@ -863,10 +869,17 @@ have.
 
 For NetLoop mode, STOP is complete only after the old dedicated `:netloop`
 process is gone. `NetLoopPluginManager.stopAndWaitGone()` captures the current
-control Binder, sends STOP and validates acceptance, unbinds, and waits for that
-Binder to die. NetLoop treats STOP as process-final even when no runtime service
-is currently active, so Binder death is the single completion barrier. Only
-after that barrier may `CoreVpnService` terminate and emit `STOP_SUCCESS`.
+control Binder, sends STOP and validates acceptance, waits for that Binder to
+die, and only then detaches the binding. NetLoop treats STOP as process-final
+even when no runtime service is currently active, so Binder death is the single
+completion barrier. Only after that barrier may `CoreVpnService` terminate and
+emit `STOP_SUCCESS`.
+
+If the Binder-death wait times out while the old Binder is still alive, retain
+that binding/Binder instead of detaching it. A later user STOP must retry the
+same old process; it must not report success merely because the previous attempt
+dropped its only handle to the process. No STOPPING state, retry framework, or
+fixed sleep is added.
 
 `stopAndWaitGone()` is teardown-only. It may use an already connected Binder or
 an already pending binding owned by that manager, but it must never call the

@@ -185,7 +185,7 @@ internal sealed class HostOptions
           --upstream-password <pass>  RFC1929 password; requires username
           --status-file <path>        Atomic readiness/status JSON output
           --startup-timeout <sec>     libzt startup timeout (default 120)
-          --connect-timeout <sec>     Peer/egress connect timeout (default 20)
+          --connect-timeout <sec>     Local/egress connect timeout (default 20)
           --udp-idle-timeout <sec>    UDP association idle timeout (default 60)
           --reset-debounce-ms <ms>    Coalesce OS network-change events (default 250)
           --reset-command-file <path> Optional deterministic reset trigger input
