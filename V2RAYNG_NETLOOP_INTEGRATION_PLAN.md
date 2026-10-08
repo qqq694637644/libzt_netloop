@@ -664,6 +664,14 @@ not report `START_SUCCESS` when the TUN bridge failed to start. The old
 `isRunningProvider` / `restartCallback` constructor hooks are not used and are
 removed rather than retained as an automatic-recovery compatibility surface.
 
+The pinned HEV JNI is patched at build time with a one-shot startup handshake.
+The worker reports success only after config/logger/task/tunnel initialization
+has completed and before entering the long-running tunnel loop. Native startup
+errors (including `pthread_create` failure and HEV init results `-1` through
+`-5`) are converted into a JNI exception before `TProxyStartService(...)`
+returns, so Xray cannot publish `START_SUCCESS` over a dead HEV data path. This
+is startup-only synchronization, not a watchdog or runtime health monitor.
+
 ### 8.5 Preserve the original destination before NetLoop
 
 NetLoop peer routing is keyed by the destination address presented by SOCKS.
@@ -897,6 +905,12 @@ Startup and runtime failures use the same process-final teardown as explicit
 user STOP before the Service is allowed to terminate and publish
 `MSG_STATE_START_FAILURE`. This prevents an immediate retry from racing an old
 NetLoop process that is still executing its final service destruction.
+
+The terminal failure reason is sticky across teardown retries. If the first
+process-final STOP attempt times out, keep the original failure message while
+returning the Service to a stoppable state. A later user Stop only retries
+cleanup; it must not turn the already-known `START_FAILURE` into
+`STOP_SUCCESS`.
 
 `CoreServiceManager.startCoreLoop()` owns only Xray startup and returns the
 resolved profile (or throws). It does not publish terminal UI state and does not
