@@ -55,7 +55,8 @@ jobs:
           $cmake = git hash-object CMakeLists.txt
           $script = git hash-object tools/build_csharp.py
           $networkRefreshPatch = git hash-object patches/libzt/0001-host-network-change-refresh.patch
-          "key=libzt-pinvoke-win-x64-$libzt-$cmake-$script-$networkRefreshPatch" >> $env:GITHUB_OUTPUT
+          $peerEventPatch = git hash-object patches/libzt/0003-peer-event-details.patch
+          "key=libzt-pinvoke-win-x64-$libzt-$cmake-$script-$networkRefreshPatch-$peerEventPatch" >> $env:GITHUB_OUTPUT
 
       - name: Restore compiled libzt bundle
         id: native-cache

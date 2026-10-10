@@ -27,6 +27,37 @@ Each runtime chooses one **primary overlay address** for its peer TCP/UDP listen
 
 `--default-exit` is required on every node and automatically becomes an effective peer when it is remote, so it must not be duplicated in `--peer`. Use repeatable `--peer` only for additional NetLoop nodes whose `primary_overlay_address` must be reachable directly. The exit node may use its own primary address as `--default-exit`; in that case NetLoop uses local egress instead of connecting to itself. Desktop SOCKS always binds to loopback; `--socks-host` is intentionally unsupported. A node may have additional Managed IPs, but NetLoop v1 ignores them for routing and only exposes services on the primary address; configuring a secondary local Managed IP as a peer or default exit is rejected at startup.
 
+## Peer P2P / relay diagnostics
+
+NetLoop writes a `libzt_peer_status` JSON log entry whenever libzt reports a
+peer transport/path event (codes 240–244). The entry includes:
+
+- `peer_id`: the remote **ZeroTier node ID** (not its Managed IP)
+- `transport`: `DIRECT`, `RELAY`, `UNREACHABLE`, or `UNKNOWN`
+- `path_count`: number of known physical paths at the event
+- `physical_paths`: IP:port endpoints, preferred/expired flags and latency
+- `change`: the underlying libzt event, e.g. `PEER_PATH_DEAD`
+
+To identify the A→B link, compare `peer_id` in A's log with `node_id` in
+B's `server-status.json` (or B's `libzt_network_ready` log). **Do not** infer
+the physical P2P state from `route: "OverlayPeer"`: that is the logical
+NetLoop route, not ZeroTier's direct/relay underlay.
+
+Example filter on Windows PowerShell:
+
+```powershell
+Select-String -Path .\client.log -Pattern '"event":"libzt_peer_status"' |
+  ForEach-Object { ($_.Line | ConvertFrom-Json).data } |
+  Select-Object peer_id,transport,path_count,physical_paths
+```
+
+These are **event-time snapshots**, not continuous probes of all peers; an old
+`DIRECT` event does not prove a connection is *still* direct after a network
+change. ZeroTier root/controller peers can also appear in the log, so always
+match the node ID. The peer diagnostics require the updated `libzt.dll` (or
+`libzt.so`) built with the NetLoop peer-event ABI patch, not just an updated
+managed DLL.
+
 ## Build
 
 Desktop builds are orchestrated by:

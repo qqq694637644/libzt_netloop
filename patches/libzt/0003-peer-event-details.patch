@@ -1,0 +1,38 @@
+diff --git a/src/NodeService.cpp b/src/NodeService.cpp
+index 036f406..3cc9578 100644
+--- a/src/NodeService.cpp
++++ b/src/NodeService.cpp
+@@ -1054,11 +1054,30 @@ void NodeService::sendEventToUser(unsigned int zt_event_code, const void* obj, u
+         case ZTS_EVENT_PEER_UNREACHABLE:
+         case ZTS_EVENT_PEER_PATH_DISCOVERED:
+         case ZTS_EVENT_PEER_PATH_DEAD: {
+-            pr = new zts_peer_info_t();
++            // ZT_Peer and zts_peer_info_t are different ABI layouts. Copy
++            // individual fields rather than memcpy-ing the vendor structure:
++            // ZeroTierOne's bonding fields precede pathCount and its physical
++            // path structure is larger than the public libzt path structure.
++            pr = new zts_peer_info_t{};
+             ZT_Peer* peer = (ZT_Peer*)obj;
+-            memcpy(pr, peer, sizeof(zts_peer_info_t));
+-            for (unsigned int j = 0; j < peer->pathCount; j++) {
++            pr->peer_id = peer->address;
++            pr->ver_major = peer->versionMajor;
++            pr->ver_minor = peer->versionMinor;
++            pr->ver_rev = peer->versionRev;
++            pr->latency = peer->latency;
++            pr->role = static_cast<zts_peer_role_t>(peer->role);
++            pr->path_count = peer->pathCount < ZTS_MAX_PEER_NETWORK_PATHS
++                ? peer->pathCount : ZTS_MAX_PEER_NETWORK_PATHS;
++            for (unsigned int j = 0; j < pr->path_count; j++) {
+                 native_ss_to_zts_ss(&(pr->paths[j].address), &(peer->paths[j].address));
++                pr->paths[j].last_tx = peer->paths[j].lastSend;
++                pr->paths[j].last_rx = peer->paths[j].lastReceive;
++                pr->paths[j].trusted_path_id = peer->paths[j].trustedPathId;
++                pr->paths[j].latency = peer->paths[j].latencyMean;
++                pr->paths[j].expired = peer->paths[j].expired;
++                pr->paths[j].preferred = peer->paths[j].preferred;
++                // The source interface name belongs to the transient
++                // ZT_PeerList. Do not expose a dangling char* in this event.
+             }
+             objptr = (void*)pr;
+             break;

@@ -33,6 +33,13 @@ internal static class LibztNative
     internal const int NetworkStatusClientTooOld = 5;
     internal const short EventNodeUp = 200;
     internal const short EventNodeFatalError = 204;
+    internal const short EventPeerDirect = 240;
+    internal const short EventPeerRelay = 241;
+    internal const short EventPeerUnreachable = 242;
+    internal const short EventPeerPathDiscovered = 243;
+    internal const short EventPeerPathDead = 244;
+    internal const int MaxPeerPaths = 64;
+    internal const int PeerSocketAddressBytes = 28;
     internal const int EAgain = 11;
     internal const int ETimedOut = 110;
     // The pinned Windows libzt/lwIP build uses UCRT errno values for
@@ -222,6 +229,44 @@ internal static class LibztNative
         internal nint Address;
         internal nint Cache;
         internal int Length;
+    }
+
+    // Fixed-layout prefixes of zts_peer_info_t and zts_path_t from the
+    // pinned libzt header. Do not marshal pointers from ZT_Peer directly:
+    // that vendor structure has a different ABI and must first be converted
+    // by patches/libzt/0003-peer-event-details.patch.
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct PeerInfoHeader
+    {
+        internal ulong PeerId;
+        internal int VersionMajor;
+        internal int VersionMinor;
+        internal int VersionRevision;
+        internal int Latency;
+        internal int Role;
+        internal uint PathCount;
+        internal int Reserved;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal unsafe struct PeerPathInfo
+    {
+        internal fixed byte Address[PeerSocketAddressBytes];
+        internal ulong LastTx;
+        internal ulong LastRx;
+        internal ulong TrustedPathId;
+        internal float Latency;
+        internal float Reserved0;
+        internal float Reserved1;
+        internal float Reserved2;
+        internal float Reserved3;
+        internal float Reserved4;
+        internal ulong Reserved5;
+        internal ulong Reserved6;
+        internal float Reserved7;
+        internal nint InterfaceName;
+        internal int Expired;
+        internal int Preferred;
     }
 
     [StructLayout(LayoutKind.Sequential)]

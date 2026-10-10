@@ -55,9 +55,10 @@ jobs:
           script="$(git hash-object tools/build_android_native.py)"
           patch1="$(git hash-object patches/libzt/0001-host-network-change-refresh.patch)"
           patch2="$(git hash-object patches/libzt/0002-android-pinvoke.patch)"
+          patch3="$(git hash-object patches/libzt/0003-peer-event-details.patch)"
           ndk_revision="$(awk -F= '/Pkg.Revision/ {gsub(/ /, "", $2); print $2}' "$ANDROID_NDK_HOME/source.properties")"
           echo "ndk_revision=$ndk_revision" >> "$GITHUB_OUTPUT"
-          echo "key=libzt-pinvoke-android-arm64-${ndk_revision}-${libzt}-${cmake}-${script}-${patch1}-${patch2}" >> "$GITHUB_OUTPUT"
+          echo "key=libzt-pinvoke-android-arm64-${ndk_revision}-${libzt}-${cmake}-${script}-${patch1}-${patch2}-${patch3}" >> "$GITHUB_OUTPUT"
 
       - name: Restore compiled Android libzt bundle
         id: native-cache
@@ -176,9 +177,10 @@ jobs:
           script="$(git hash-object tools/build_android_native.py)"
           patch1="$(git hash-object patches/libzt/0001-host-network-change-refresh.patch)"
           patch2="$(git hash-object patches/libzt/0002-android-pinvoke.patch)"
+          patch3="$(git hash-object patches/libzt/0003-peer-event-details.patch)"
           ndk_revision="$(awk -F= '/Pkg.Revision/ {gsub(/ /, "", $2); print $2}' "$ANDROID_NDK_HOME/source.properties")"
           echo "ndk_revision=$ndk_revision" >> "$GITHUB_OUTPUT"
-          echo "key=libzt-pinvoke-android-x86_64-${ndk_revision}-${libzt}-${cmake}-${script}-${patch1}-${patch2}" >> "$GITHUB_OUTPUT"
+          echo "key=libzt-pinvoke-android-x86_64-${ndk_revision}-${libzt}-${cmake}-${script}-${patch1}-${patch2}-${patch3}" >> "$GITHUB_OUTPUT"
 
       - name: Restore compiled Android x86_64 libzt bundle
         id: native-cache
@@ -295,7 +297,8 @@ jobs:
           cmake="$(git hash-object CMakeLists.txt)"
           script="$(git hash-object tools/build_csharp.py)"
           patch="$(git hash-object patches/libzt/0001-host-network-change-refresh.patch)"
-          echo "key=libzt-pinvoke-linux-x64-${libzt}-${cmake}-${script}-${patch}" >> "$GITHUB_OUTPUT"
+          peer_event_patch="$(git hash-object patches/libzt/0003-peer-event-details.patch)"
+          echo "key=libzt-pinvoke-linux-x64-${libzt}-${cmake}-${script}-${patch}-${peer_event_patch}" >> "$GITHUB_OUTPUT"
 
       - name: Restore Linux peer native bundle
         id: linux-native-cache

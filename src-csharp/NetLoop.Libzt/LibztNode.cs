@@ -223,7 +223,28 @@ public sealed class LibztNode : IAsyncDisposable
         try
         {
             var native = Marshal.PtrToStructure<LibztNative.EventMessage>(message);
-            JsonLog.Info("libzt_event", new { event_code = native.EventCode });
+            if (LibztPeerEvent.IsPeerEvent(native.EventCode))
+            {
+                try
+                {
+                    JsonLog.Info(
+                        "libzt_peer_status",
+                        LibztPeerEvent.Decode(
+                            native.EventCode, _networkId, native.Peer, native.Length));
+                }
+                catch (Exception ex)
+                {
+                    JsonLog.Error("libzt_peer_event_decode_failed", new {
+                        event_code = native.EventCode,
+                        error = ex.Message
+                    });
+                    JsonLog.Info("libzt_event", new { event_code = native.EventCode });
+                }
+            }
+            else
+            {
+                JsonLog.Info("libzt_event", new { event_code = native.EventCode });
+            }
             if (native.EventCode == LibztNative.EventNodeUp)
                 _nodeUp.TrySetResult();
             else if (native.EventCode == LibztNative.EventNodeFatalError)

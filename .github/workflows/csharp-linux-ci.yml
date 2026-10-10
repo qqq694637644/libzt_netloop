@@ -62,7 +62,8 @@ jobs:
           cmake="$(git hash-object CMakeLists.txt)"
           script="$(git hash-object tools/build_csharp.py)"
           network_refresh_patch="$(git hash-object patches/libzt/0001-host-network-change-refresh.patch)"
-          echo "key=libzt-pinvoke-linux-${{ matrix.arch }}-${libzt}-${cmake}-${script}-${network_refresh_patch}" >> "$GITHUB_OUTPUT"
+          peer_event_patch="$(git hash-object patches/libzt/0003-peer-event-details.patch)"
+          echo "key=libzt-pinvoke-linux-${{ matrix.arch }}-${libzt}-${cmake}-${script}-${network_refresh_patch}-${peer_event_patch}" >> "$GITHUB_OUTPUT"
 
       - name: Restore compiled libzt bundle
         id: native-cache

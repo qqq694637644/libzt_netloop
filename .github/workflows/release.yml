@@ -113,7 +113,8 @@ jobs:
           $cmake = git hash-object CMakeLists.txt
           $script = git hash-object tools/build_csharp.py
           $patch = git hash-object patches/libzt/0001-host-network-change-refresh.patch
-          "key=libzt-pinvoke-win-x64-$libzt-$cmake-$script-$patch" >> $env:GITHUB_OUTPUT
+          $peerEventPatch = git hash-object patches/libzt/0003-peer-event-details.patch
+          "key=libzt-pinvoke-win-x64-$libzt-$cmake-$script-$patch-$peerEventPatch" >> $env:GITHUB_OUTPUT
 
       - name: Restore compiled libzt bundle
         id: native-cache
@@ -290,8 +291,9 @@ jobs:
           script="$(git hash-object tools/build_android_native.py)"
           patch1="$(git hash-object patches/libzt/0001-host-network-change-refresh.patch)"
           patch2="$(git hash-object patches/libzt/0002-android-pinvoke.patch)"
+          patch3="$(git hash-object patches/libzt/0003-peer-event-details.patch)"
           ndk_revision="$(awk -F= '/Pkg.Revision/ {gsub(/ /, "", $2); print $2}' "$ANDROID_NDK_HOME/source.properties")"
-          echo "key=libzt-pinvoke-android-arm64-${ndk_revision}-${libzt}-${cmake}-${script}-${patch1}-${patch2}" >> "$GITHUB_OUTPUT"
+          echo "key=libzt-pinvoke-android-arm64-${ndk_revision}-${libzt}-${cmake}-${script}-${patch1}-${patch2}-${patch3}" >> "$GITHUB_OUTPUT"
 
       - name: Restore compiled Android libzt bundle
         id: native-cache

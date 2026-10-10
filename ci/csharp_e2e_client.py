@@ -1036,6 +1036,51 @@ def retry(label: str, action, attempts: int = 8, delay: float = 3.0):
     raise RuntimeError(f"{label} failed after {attempts} attempts: {last_error}")
 
 
+def verify_peer_status_telemetry(server_node_id: str) -> dict:
+    """Check that libzt identified the actual remote ZeroTier node, not a root."""
+    log_path = EVIDENCE / "netloop_process.log"
+    if not log_path.exists():
+        raise FileNotFoundError(log_path)
+
+    for line in reversed(log_path.read_text(encoding="utf-8").splitlines()):
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if entry.get("event") != "libzt_peer_status":
+            continue
+
+        data = entry.get("data")
+        if not isinstance(data, dict):
+            continue
+        if data.get("peer_id") != server_node_id.lower():
+            continue
+
+        transport = data.get("transport")
+        count = data.get("path_count")
+        paths = data.get("physical_paths")
+        if (
+            transport not in {"DIRECT", "RELAY", "UNREACHABLE"}
+            or type(count) is not int
+            or not 0 <= count <= 64
+            or not isinstance(paths, list)
+            or len(paths) != count
+            or (transport == "DIRECT" and count == 0)
+            or (transport == "RELAY" and count != 0)
+        ):
+            raise AssertionError(f"invalid libzt peer status: {data}")
+
+        if transport == "DIRECT" and not any(
+            isinstance(path, dict) and path.get("endpoint") for path in paths
+        ):
+            raise AssertionError(f"direct peer has no physical endpoint: {data}")
+        return data
+
+    raise AssertionError(
+        f"no libzt_peer_status event for server node {server_node_id}"
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--runtime", default="runtime-csharp")
@@ -1099,6 +1144,13 @@ def main() -> int:
             ),
         )
         result["peer_local_service"] = True
+
+        result["peer_transport"] = retry(
+            "peer_status_telemetry",
+            lambda: verify_peer_status_telemetry(rendezvous["server_node_id"]),
+            attempts=10,
+            delay=2.0,
+        )
 
         retry(
             "peer_local_udp",
