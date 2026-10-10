@@ -381,7 +381,7 @@ Windows 错误同时记录数值错误码；文本日志统一 UTF-8。
 ### Phase 4 - 跨平台交付
 
 - Windows x64 主程序发布包：`netloop-win-x64.zip`（仅 exe/dll）。
-- Windows x64 独立运行时包：`netloop-dotnet-runtime-win-x64.zip`（便携 .NET 10 x64 Runtime）；解压后通过 `DOTNET_ROOT_X64` 指定运行时目录。
+- Windows x64 独立运行时包：`netloop-dotnet-runtime-win-x64.zip`（同一次 self-contained 发布生成的运行时文件及必要 JSON）；与主程序 ZIP 解压到同一目录即可运行，无需另装 .NET 或设置环境变量。
 - Android arm64 应用：`netloop-android-arm64.apk`。
 - Linux x64/arm64 保留 CI 编译与测试，不参与手动 Release。
 - 手动输入的 `vMAJOR.MINOR.PATCH` 版本号是正式发布的唯一版本源；Windows assembly version /

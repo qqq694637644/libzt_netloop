@@ -76,22 +76,23 @@ selected assets:
 - `netloop-dotnet-runtime-win-x64.zip`
 - `netloop-android-arm64.apk`
 
-The Windows application zip only contains `.exe` and `.dll` files.
-It uses .NET framework-dependent single-file publishing to embed managed
-application files and runtime configuration into `netloop.exe`, alongside
-the native `libzt.dll`. The **separate runtime zip** contains a portable
-.NET 10 x64 runtime, including its required directory structure, metadata,
-and license notices. It contains no SDK.
+The Windows release uses **one self-contained .NET publish**, split into two zips:
 
-To run without installing .NET system-wide, extract the two zips into
-separate directories and point `DOTNET_ROOT_X64` to the extracted runtime:
+- `netloop-win-x64.zip`: NetLoop's own EXE and DLL files only
+- `netloop-dotnet-runtime-win-x64.zip`: .NET runtime files and the required
+  `netloop.deps.json` / `netloop.runtimeconfig.json` files
+
+Extract **both archives into the same directory**. No separate .NET installation,
+runtime folder, or environment variable is required:
 
 ```powershell
-Expand-Archive .\netloop-win-x64.zip .\netloop
-Expand-Archive .\netloop-dotnet-runtime-win-x64.zip .\dotnet
-$env:DOTNET_ROOT_X64 = (Resolve-Path .\dotnet).Path
+Expand-Archive .\netloop-dotnet-runtime-win-x64.zip .\netloop
+Expand-Archive .\netloop-win-x64.zip .\netloop -Force
 .\netloop\netloop.exe --version
 ```
+
+For code-only updates, overwrite the EXE/DLL files from the app zip. Update the
+runtime zip too when the .NET runtime or application dependencies change.
 
 A release version such as `1.2.3` is shown by Windows `netloop --version`
 and as the Android display version. Android `versionCode` is derived from the
