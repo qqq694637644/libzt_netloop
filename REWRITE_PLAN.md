@@ -380,17 +380,15 @@ Windows 错误同时记录数值错误码；文本日志统一 UTF-8。
 
 ### Phase 4 - 跨平台交付
 
-- Windows x64 发布包：`netloop-win-x64.zip`。
-- Linux x64 发布包：`netloop-linux-x64.tar.gz`。
-- Linux arm64 发布包：`netloop-linux-arm64.tar.gz`。
+- Windows x64 发布包：`netloop-win-x64.zip`，不包含 .NET 运行时，目标机器需安装 .NET 10 x64 Runtime。
 - Android arm64 应用：`netloop-android-arm64.apk`。
-- Desktop 正式 release 为 self-contained，目标机器无需预装 .NET runtime。
-- `vMAJOR.MINOR.PATCH` tag 是正式发布的唯一版本源；Desktop assembly version /
+- Linux x64/arm64 保留 CI 编译与测试，不参与手动 Release。
+- 手动输入的 `vMAJOR.MINOR.PATCH` 版本号是正式发布的唯一版本源；Windows assembly version /
   `--version` 与 Android display version 由 workflow 注入，Android versionCode
   使用 `major * 1_000_000 + minor * 1_000 + patch`。
 - native libzt 自动构建、缓存和打包。
-- CI smoke/E2E；`vMAJOR.MINOR.PATCH` tag 由 release workflow 自动创建/更新 GitHub Release，
-  workflow_dispatch 只构建 artifacts。
+- CI smoke/E2E；release workflow 通过 workflow_dispatch 输入版本号与 Windows/Android 平台选择，
+  构建所选产物并创建/更新 `vMAJOR.MINOR.PATCH` GitHub Release。
 
 ## 19. 最低测试矩阵
 

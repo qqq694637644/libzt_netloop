@@ -50,9 +50,9 @@ Active GitHub Actions workflows:
 - `.github/workflows/csharp-windows-ci.yml`
 - `.github/workflows/csharp-linux-ci.yml`
 - `.github/workflows/csharp-android-ci.yml`
-- `.github/workflows/release.yml` (tag/manual release builds)
+- `.github/workflows/release.yml` (manual Windows/Android release publishing)
 
-The workflows build the C# runtime and exercise TCP, UDP, peer-local routing, exit-node behavior, and runtime-reset recovery:
+The platform CI workflows build the C# runtime and exercise TCP, UDP, peer-local routing, exit-node behavior, and runtime-reset recovery:
 
 | Platform | Build | Runtime E2E | Reset stress |
 | --- | --- | --- | --- |
@@ -66,20 +66,21 @@ The reset tests use deterministic fault simulation. They prove that once a reset
 
 ## Releases
 
-`.github/workflows/release.yml` builds these release artifacts:
+Run `.github/workflows/release.yml` from **Actions -> C# Windows and Android Release -> Run workflow**.
+Provide a `version` (for example, `1.2.3` or `v1.2.3`) and choose `publish_windows`
+and/or `publish_android`. At least one platform must be selected. The workflow
+creates or updates the `vMAJOR.MINOR.PATCH` GitHub Release and uploads only the
+selected assets:
 
 - `netloop-win-x64.zip`
-- `netloop-linux-x64.tar.gz`
-- `netloop-linux-arm64.tar.gz`
 - `netloop-android-arm64.apk`
 
-Tags matching `vMAJOR.MINOR.PATCH` create/update the corresponding GitHub Release. Manual workflow dispatch builds the same artifacts without publishing a release.
-
-Desktop release archives are self-contained and do not require a separately
-installed .NET runtime. A release tag such as `v0.3.1` is the single version
-source: Desktop `netloop --version` and the Android display version both report
-`0.3.1`. Manual release builds use a development version derived from the
-commit SHA.
+The Windows zip is **framework-dependent**: it includes `netloop.exe`, the
+application files, and `libzt.dll`, but **does not bundle the .NET runtime**.
+Install the .NET 10 x64 Runtime on the target Windows machine separately.
+A release version such as `1.2.3` is shown by Windows `netloop --version`
+and as the Android display version. Android `versionCode` is derived from the
+numeric version and must fit Android's supported range.
 
 ## Native dependency
 
