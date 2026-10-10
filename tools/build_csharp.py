@@ -175,6 +175,10 @@ def build_managed(args: argparse.Namespace) -> None:
     ]
     if args.self_contained:
         restore.append("-p:SelfContained=true")
+    if args.single_file:
+        restore.append("-p:PublishSingleFile=true")
+        if not args.self_contained:
+            restore.append("-p:SelfContained=false")
     run(restore)
     publish = [
         "dotnet",
@@ -196,6 +200,8 @@ def build_managed(args: argparse.Namespace) -> None:
             f"-p:InformationalVersion={args.version}",
             "-p:IncludeSourceRevisionInInformationalVersion=false",
         ])
+    if args.single_file:
+        publish.append("-p:PublishSingleFile=true")
     run(publish)
 
     native_name = "libzt.dll" if args.runtime.startswith("win-") else "libzt.so"
@@ -206,6 +212,7 @@ def build_managed(args: argparse.Namespace) -> None:
         "runtime": args.runtime,
         "native_file": native_name,
         "self_contained": bool(args.self_contained),
+        "single_file": bool(args.single_file),
         "version": args.version,
         "duration_seconds": round(time.monotonic() - started, 3),
     }
@@ -227,6 +234,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", default=str(DEFAULT_DIST))
     parser.add_argument("--runtime", default="win-x64")
     parser.add_argument("--self-contained", action="store_true")
+    parser.add_argument("--single-file", action="store_true")
     parser.add_argument("--version")
     parser.add_argument("--parallel", type=int)
     parser.add_argument("--use-sccache", action="store_true")

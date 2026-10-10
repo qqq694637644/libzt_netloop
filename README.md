@@ -73,11 +73,26 @@ creates or updates the `vMAJOR.MINOR.PATCH` GitHub Release and uploads only the
 selected assets:
 
 - `netloop-win-x64.zip`
+- `netloop-dotnet-runtime-win-x64.zip`
 - `netloop-android-arm64.apk`
 
-The Windows zip is **framework-dependent**: it includes `netloop.exe`, the
-application files, and `libzt.dll`, but **does not bundle the .NET runtime**.
-Install the .NET 10 x64 Runtime on the target Windows machine separately.
+The Windows application zip only contains `.exe` and `.dll` files.
+It uses .NET framework-dependent single-file publishing to embed managed
+application files and runtime configuration into `netloop.exe`, alongside
+the native `libzt.dll`. The **separate runtime zip** contains a portable
+.NET 10 x64 runtime, including its required directory structure, metadata,
+and license notices. It contains no SDK.
+
+To run without installing .NET system-wide, extract the two zips into
+separate directories and point `DOTNET_ROOT_X64` to the extracted runtime:
+
+```powershell
+Expand-Archive .\netloop-win-x64.zip .\netloop
+Expand-Archive .\netloop-dotnet-runtime-win-x64.zip .\dotnet
+$env:DOTNET_ROOT_X64 = (Resolve-Path .\dotnet).Path
+.\netloop\netloop.exe --version
+```
+
 A release version such as `1.2.3` is shown by Windows `netloop --version`
 and as the Android display version. Android `versionCode` is derived from the
 numeric version and must fit Android's supported range.
