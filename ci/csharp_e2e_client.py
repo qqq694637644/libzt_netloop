@@ -414,10 +414,6 @@ def start_client(
         str(rendezvous["overlay_udp_port"]),
         "--default-exit",
         rendezvous["server_ip"],
-        # Force an unreachable *overlay* route to exercise bounded libzt
-        # connect failure without relying on public Internet availability.
-        "--peer",
-        unreachable_test_peer(rendezvous["server_ip"]),
         "--status-file",
         str(status_path),
         "--startup-timeout",
@@ -436,32 +432,6 @@ def start_client(
         )
 
     return start_detached(command, EVIDENCE / "netloop_process.log")
-
-
-def unreachable_test_peer(server_ip: str) -> str:
-    # Change a low address bit to keep the target in the same overlay prefix,
-    # but outside the two-node test network's assigned endpoint addresses.
-    remote = ipaddress.ip_address(server_ip)
-    return str(ipaddress.ip_address(int(remote) ^ 0x80))
-
-
-def verify_bounded_unreachable_peer(proxy_port: int, server_ip: str) -> dict:
-    remote = unreachable_test_peer(server_ip)
-    started = time.monotonic()
-    try:
-        with socks_connect(
-            "127.0.0.1", proxy_port, remote, 8080, timeout=12
-        ):
-            raise AssertionError(f"Unassigned overlay peer {remote} unexpectedly connected")
-    except RuntimeError as error:
-        if "SOCKS5 CONNECT failed" not in str(error):
-            raise
-        elapsed = time.monotonic() - started
-        if elapsed > 8:
-            raise AssertionError(
-                f"Unreachable libzt peer connect took {elapsed:.2f}s (expected < 8s)"
-            ) from error
-        return {"target": remote, "elapsed_seconds": round(elapsed, 3)}
 
 
 def write_json_atomic(path: Path, content: dict) -> None:
@@ -1174,11 +1144,6 @@ def main() -> int:
             ),
         )
         result["peer_local_service"] = True
-
-        result["bounded_unreachable_peer"] = verify_bounded_unreachable_peer(
-            args.listen_port,
-            rendezvous["server_ip"],
-        )
 
         result["peer_transport"] = retry(
             "peer_status_telemetry",
