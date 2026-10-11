@@ -33,6 +33,7 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
 
     private async Task AcceptLoopAsync(CancellationToken cancellationToken)
     {
+        var consecutiveFailures = 0;
         while (!cancellationToken.IsCancellationRequested)
         {
             LibztTcpConnection connection;
@@ -49,11 +50,18 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
                 if (cancellationToken.IsCancellationRequested)
                     break;
 
+                consecutiveFailures++;
                 JsonLog.Error("overlay_accept_failed", new { error = ex.Message });
+                // A listener repeatedly failing accept() is not healthy,
+                // even if the retry task itself is still technically alive.
+                if (consecutiveFailures >= 30)
+                    throw new IOException(
+                        "Overlay TCP accept failed 30 consecutive times.", ex);
                 await Task.Delay(100, cancellationToken).ConfigureAwait(false);
                 continue;
             }
 
+            consecutiveFailures = 0;
             if (!await _capacity.WaitAsync(0, cancellationToken).ConfigureAwait(false))
             {
                 JsonLog.Info("tcp_accept_rejected", new {

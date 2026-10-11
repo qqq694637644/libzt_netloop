@@ -32,6 +32,8 @@ Windows/Linux Host 以及 Android Service 同时观察：
 
 任一关键任务异常完成或意外正常退出，会记录
 `runtime_critical_service_failed`，然后重新创建**业务 Runtime**。
+Overlay TCP accept 连续失败 30 次（每次间隔约 100ms）也视作
+监听器不可用，不会一直悄悄重试而继续呈现 Ready。
 这个过程可能会中断已有 TCP/UDP；但**只有 Controller 路由配置变化**
 仍只更新快照，不会触发 Runtime 重置。
 
