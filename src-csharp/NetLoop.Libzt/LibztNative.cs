@@ -40,6 +40,8 @@ internal static class LibztNative
     internal const short EventPeerPathDead = 244;
     internal const int MaxPeerPaths = 64;
     internal const int PeerSocketAddressBytes = 28;
+    // sizeof(zts_sockaddr_storage) in the pinned libzt ABI.
+    internal const int SocketAddressStorageBytes = 28;
     internal const int EAgain = 11;
     internal const int ETimedOut = 110;
     // The pinned Windows libzt/lwIP build uses UCRT errno values for
@@ -112,10 +114,9 @@ internal static class LibztNative
 
     [DllImport(
         LibraryName,
-        CharSet = CharSet.Ansi,
-        EntryPoint = "zts_connect",
+        EntryPoint = "zts_bsd_connect",
         CallingConvention = CallingConvention.Cdecl)]
-    internal static extern int ConnectEasy(int fd, string remoteAddress, ushort remotePort, int timeoutMs);
+    internal static extern int ConnectSocket(int fd, nint address, uint addressLength);
 
     [DllImport(
         LibraryName,

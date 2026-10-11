@@ -58,6 +58,16 @@ match the node ID. The peer diagnostics require the updated `libzt.dll` (or
 `libzt.so`) built with the NetLoop peer-event ABI patch, not just an updated
 managed DLL.
 
+Peer TCP connects are initiated with nonblocking `zts_bsd_connect` and
+completed through `poll(POLLOUT)` plus socket `SO_ERROR`. NetLoop cancels and
+retries each pending socket within its bounded recovery window, rather than
+waiting in libzt's blocking `zts_connect` helper. To diagnose failures,
+inspect `libzt_connect_retry` (including `elapsed_ms`),
+`libzt_connect_cancelled`, and `socks_peer_negotiation_retry` in the A-node
+log. When troubleshooting identity mismatches, compare both nodes'
+`status-file` `node_id` values to the actual authorized members in the
+ZeroTier controller; Managed IP alone does not identify a peer.
+
 ## Build
 
 Desktop builds are orchestrated by:
