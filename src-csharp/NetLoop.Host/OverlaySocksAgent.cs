@@ -54,6 +54,11 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
 
             if (!await _capacity.WaitAsync(0, cancellationToken).ConfigureAwait(false))
             {
+                JsonLog.Info("tcp_accept_rejected", new {
+                    connection_id = connection.ConnectionId,
+                    client = connection.Description,
+                    reason = "max_connections"
+                });
                 await connection.DisposeAsync().ConfigureAwait(false);
                 continue;
             }
@@ -103,7 +108,12 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            JsonLog.Error("overlay_socks_client_failed", new { error = ex.Message });
+            JsonLog.Error("overlay_socks_client_failed", new {
+                connection_id = connection.ConnectionId,
+                client = connection.Description,
+                error_type = ex.GetType().Name,
+                error = ex.Message
+            });
         }
         finally
         {

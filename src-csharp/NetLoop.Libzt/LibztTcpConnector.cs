@@ -29,7 +29,11 @@ public sealed class LibztTcpConnector : IProxyConnector
             : LibztNative.AfInet6;
 
         var started = Stopwatch.GetTimestamp();
+        var connectId = ConnectionTrace.NewId();
+        var inboundId = ConnectionTrace.InboundConnectionId;
+        var peerAttemptId = ConnectionTrace.PeerAttemptId;
         var attempt = 0;
+        string? lastAttemptId = null;
         Exception? lastError = null;
 
         while (Stopwatch.GetElapsedTime(started) < _connectTimeout)
@@ -37,19 +41,54 @@ public sealed class LibztTcpConnector : IProxyConnector
             cancellationToken.ThrowIfCancellationRequested();
             attempt++;
 
+            var attemptId = ConnectionTrace.NewId();
+            lastAttemptId = attemptId;
+            var attemptStarted = Stopwatch.GetTimestamp();
+            var pollState = new ConnectPollState();
             var fd = LibztNative.Socket(family, LibztNative.SockStream, 0);
+            // The native errno is process-global. Capture it immediately on
+            // socket failure, before any JSON logging or other native calls.
+            var creationErrno = fd < 0 ? LibztNative.GetErrno() : 0;
+            JsonLog.Info("tcp_connect_start", new {
+                connect_id = connectId,
+                attempt_id = attemptId,
+                peer_attempt_id = peerAttemptId,
+                connection_id = inboundId,
+                target = target.ToString(),
+                attempts = attempt,
+                fd,
+                connect_timeout_ms = _connectTimeout.TotalMilliseconds,
+                poll_window_ms = AttemptWindow.TotalMilliseconds
+            });
             if (fd < 0)
             {
                 lastError = new LibztException(
                     "zts_bsd_socket",
                     fd,
-                    LibztNative.GetErrno());
+                    creationErrno);
+                JsonLog.Error("tcp_connect_failed", new {
+                    connect_id = connectId,
+                    attempt_id = attemptId,
+                    peer_attempt_id = peerAttemptId,
+                    connection_id = inboundId,
+                    target = target.ToString(),
+                    attempts = attempt,
+                    fd,
+                    stage = "socket_create",
+                    socket_error = ((LibztException)lastError).SocketError,
+                    socket_error_source = "global_errno_after_socket_failure",
+                    error_type = lastError.GetType().Name,
+                    error = lastError.Message,
+                    elapsed_ms = Stopwatch.GetElapsedTime(attemptStarted).TotalMilliseconds
+                });
             }
             else
             {
+                var stage = "configure_stream";
                 try
                 {
                     ConfigureStream(fd);
+                    stage = "nonblocking";
                     var nonBlocking = LibztNative.SetBlocking(fd, 0);
                     if (nonBlocking != LibztNative.Ok)
                     {
@@ -63,8 +102,10 @@ public sealed class LibztTcpConnector : IProxyConnector
                     // lwIP connect, and its timeout is not a deadline (even
                     // when timeout_ms < 1000). Start a nonblocking connect
                     // explicitly; never hand a pending fd to the SOCKS layer.
+                    stage = "connect_begin";
                     if (!BeginNonBlockingConnect(fd, target))
                     {
+                        stage = "connect_poll";
                         var remaining = _connectTimeout - Stopwatch.GetElapsedTime(started);
                         if (remaining <= TimeSpan.Zero)
                             throw new TimeoutException("libzt connect deadline expired.");
@@ -72,15 +113,36 @@ public sealed class LibztTcpConnector : IProxyConnector
                         await WaitForConnectAsync(
                             fd,
                             remaining < AttemptWindow ? remaining : AttemptWindow,
-                            cancellationToken).ConfigureAwait(false);
+                            cancellationToken,
+                            pollState).ConfigureAwait(false);
                     }
 
+                    stage = "connected";
                     cancellationToken.ThrowIfCancellationRequested();
+                    var local = LibztSocketDiagnostics.TryGetLocalEndPoint(fd);
+                    JsonLog.Info("tcp_connect_completed", new {
+                        connect_id = connectId,
+                        attempt_id = attemptId,
+                        peer_attempt_id = peerAttemptId,
+                        connection_id = inboundId,
+                        target = target.ToString(),
+                        attempts = attempt,
+                        fd,
+                        local,
+                        socket_error = pollState.SocketError,
+                        poll_revents = pollState.LastRevents,
+                        poll_count = pollState.PollCount,
+                        elapsed_ms = Stopwatch.GetElapsedTime(attemptStarted).TotalMilliseconds
+                    });
                     if (attempt > 1)
                     {
                         JsonLog.Info("libzt_connect_recovered", new {
                             target = target.ToString(),
                             attempts = attempt,
+                            connect_id = connectId,
+                            attempt_id = attemptId,
+                            peer_attempt_id = peerAttemptId,
+                            connection_id = inboundId,
                             elapsed_ms = Stopwatch.GetElapsedTime(started).TotalMilliseconds
                         });
                     }
@@ -89,21 +151,93 @@ public sealed class LibztTcpConnector : IProxyConnector
                     // LibztTcpConnection. Transfer ownership exactly once.
                     var connectedFd = fd;
                     fd = -1;
-                    return new LibztTcpConnection(connectedFd, $"libzt:{target}");
+                    return new LibztTcpConnection(connectedFd, $"libzt:{target}", attemptId);
                 }
                 catch (OperationCanceledException)
                     when (cancellationToken.IsCancellationRequested)
                 {
+                    // SO_ERROR can be consumed by getsockopt. Read it only
+                    // after we have decided to abandon/close this socket.
+                    var socketError = pollState.SocketError
+                        ?? LibztNative.GetLastSocketError(fd);
+                    JsonLog.Info("tcp_connect_timeout", new {
+                        connect_id = connectId,
+                        attempt_id = attemptId,
+                        peer_attempt_id = peerAttemptId,
+                        connection_id = inboundId,
+                        target = target.ToString(),
+                        attempts = attempt,
+                        fd,
+                        local = LibztSocketDiagnostics.TryGetLocalEndPoint(fd),
+                        stage,
+                        reason = "caller_cancelled",
+                        socket_error = socketError,
+                        socket_error_source = pollState.SocketError.HasValue
+                            ? "connect_poll" : "abandoned_socket_snapshot",
+                        poll_revents = pollState.LastRevents,
+                        poll_count = pollState.PollCount,
+                        elapsed_ms = Stopwatch.GetElapsedTime(attemptStarted).TotalMilliseconds
+                    });
                     JsonLog.Info("libzt_connect_cancelled", new {
                         target = target.ToString(),
                         attempts = attempt,
+                        connect_id = connectId,
+                        attempt_id = attemptId,
+                        peer_attempt_id = peerAttemptId,
+                        connection_id = inboundId,
                         elapsed_ms = Stopwatch.GetElapsedTime(started).TotalMilliseconds
                     });
                     throw;
                 }
+                catch (TimeoutException ex)
+                {
+                    lastError = ex;
+                    JsonLog.Info("tcp_connect_timeout", new {
+                        connect_id = connectId,
+                        attempt_id = attemptId,
+                        peer_attempt_id = peerAttemptId,
+                        connection_id = inboundId,
+                        target = target.ToString(),
+                        attempts = attempt,
+                        fd,
+                        local = LibztSocketDiagnostics.TryGetLocalEndPoint(fd),
+                        stage,
+                        reason = "native_connect_deadline",
+                        socket_error = pollState.SocketError
+                            ?? LibztNative.GetLastSocketError(fd),
+                        socket_error_source = pollState.SocketError.HasValue
+                            ? "connect_poll" : "abandoned_socket_snapshot",
+                        poll_revents = pollState.LastRevents,
+                        poll_count = pollState.PollCount,
+                        error = ex.Message,
+                        elapsed_ms = Stopwatch.GetElapsedTime(attemptStarted).TotalMilliseconds
+                    });
+                }
                 catch (Exception ex)
                 {
                     lastError = ex;
+                    JsonLog.Error("tcp_connect_failed", new {
+                        connect_id = connectId,
+                        attempt_id = attemptId,
+                        peer_attempt_id = peerAttemptId,
+                        connection_id = inboundId,
+                        target = target.ToString(),
+                        attempts = attempt,
+                        fd,
+                        local = LibztSocketDiagnostics.TryGetLocalEndPoint(fd),
+                        stage,
+                        socket_error = pollState.SocketError
+                            ?? (ex is LibztException libzt
+                                ? libzt.SocketError : LibztNative.GetLastSocketError(fd)),
+                        socket_error_source = pollState.SocketError.HasValue
+                            ? "connect_poll"
+                            : ex is LibztException ? "native_exception" : "abandoned_socket_snapshot",
+                        poll_revents = pollState.LastRevents,
+                        poll_count = pollState.PollCount,
+                        error_type = ex.GetType().Name,
+                        error = ex.Message,
+                        elapsed_ms = Stopwatch.GetElapsedTime(attemptStarted).TotalMilliseconds
+                    });
                 }
                 finally
                 {
@@ -117,6 +251,10 @@ public sealed class LibztTcpConnector : IProxyConnector
             JsonLog.Info("libzt_connect_retry", new {
                 target = target.ToString(),
                 attempts = attempt,
+                connect_id = connectId,
+                attempt_id = attemptId,
+                peer_attempt_id = peerAttemptId,
+                connection_id = inboundId,
                 elapsed_ms = Stopwatch.GetElapsedTime(started).TotalMilliseconds,
                 error = lastError?.Message
             });
@@ -130,6 +268,18 @@ public sealed class LibztTcpConnector : IProxyConnector
                 cancellationToken).ConfigureAwait(false);
         }
 
+        JsonLog.Info("tcp_connect_timeout", new {
+            scope = "connect_call",
+            reason = "connect_budget_exhausted",
+            connect_id = connectId,
+            attempt_id = lastAttemptId,
+            peer_attempt_id = peerAttemptId,
+            connection_id = inboundId,
+            target = target.ToString(),
+            attempts = attempt,
+            elapsed_ms = Stopwatch.GetElapsedTime(started).TotalMilliseconds,
+            last_error = lastError?.Message
+        });
         throw new TimeoutException(
             $"libzt connect timed out for {target}",
             lastError);
@@ -168,7 +318,8 @@ public sealed class LibztTcpConnector : IProxyConnector
     private static async Task WaitForConnectAsync(
         int fd,
         TimeSpan timeout,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        ConnectPollState state)
     {
         var started = Stopwatch.GetTimestamp();
         while (true)
@@ -183,6 +334,8 @@ public sealed class LibztTcpConnector : IProxyConnector
             // poll(0) never blocks the caller. POLLOUT alone is not enough:
             // a refused TCP connect can also become writable, so use SO_ERROR.
             var result = LibztNative.Poll(ref descriptor, 1, 0);
+            state.PollCount++;
+            state.LastRevents = descriptor.Revents;
             if (result < 0)
             {
                 throw new LibztException(
@@ -196,6 +349,7 @@ public sealed class LibztTcpConnector : IProxyConnector
                     & (LibztNative.PollOut | LibztNative.PollError | LibztNative.PollInvalid)) != 0)
             {
                 var error = LibztNative.GetLastSocketError(fd);
+                state.SocketError = error;
                 if (error != LibztNative.Ok)
                     throw new LibztException("zts_bsd_connect(SO_ERROR)", LibztNative.ErrSocket, error);
 
@@ -214,6 +368,13 @@ public sealed class LibztTcpConnector : IProxyConnector
                 remaining < PollDelay ? remaining : PollDelay,
                 cancellationToken).ConfigureAwait(false);
         }
+    }
+
+    private sealed class ConnectPollState
+    {
+        internal int PollCount { get; set; }
+        internal short? LastRevents { get; set; }
+        internal int? SocketError { get; set; }
     }
 
     internal static void ConfigureStream(int fd)

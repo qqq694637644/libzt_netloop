@@ -3,20 +3,23 @@ using NetLoop.Core;
 
 namespace NetLoop.Libzt;
 
-public sealed class LibztTcpConnection : IProxyConnection
+public sealed class LibztTcpConnection : IProxyConnection, IConnectionTrace
 {
     // The pinned lwIP build has LWIP_NETCONN_FULLDUPLEX=0, so native socket
     // operations on one fd must not overlap across the two relay pumps.
     private readonly object _nativeGate = new();
     private int _fd;
 
-    internal LibztTcpConnection(int fd, string description)
+    internal LibztTcpConnection(int fd, string description, string connectionId)
     {
         _fd = fd;
         Description = description;
+        ConnectionId = connectionId;
     }
 
     public string Description { get; }
+
+    public string ConnectionId { get; }
 
     public System.Net.EndPoint? LocalEndPoint => null;
 

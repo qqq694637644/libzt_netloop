@@ -192,6 +192,12 @@ internal static class LibztNative
         CallingConvention = CallingConvention.Cdecl)]
     internal static extern int GetLastSocketError(int fd);
 
+    [DllImport(
+        LibraryName,
+        EntryPoint = "zts_getsockname",
+        CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int GetSocketName(int fd, nint address, int length, ref ushort port);
+
     [DllImport(LibraryName, EntryPoint = "CSharp_zts_errno_get")]
     internal static extern int GetErrno();
 

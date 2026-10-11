@@ -69,6 +69,37 @@ log. When troubleshooting identity mismatches, compare both nodes'
 `status-file` `node_id` values to the actual authorized members in the
 ZeroTier controller; Managed IP alone does not identify a peer.
 
+### TCP connect / accept correlation
+
+The host logs one `tcp_connect_start` per native outgoing socket attempt,
+followed by `tcp_connect_completed`, `tcp_connect_timeout`, or
+`tcp_connect_failed`. Each has a **unique** `attempt_id`, plus:
+
+- `connect_id`: one invocation of the libzt TCP connector, possibly with
+  multiple native socket attempts
+- `peer_attempt_id`: the enclosing SOCKS5 peer-negotiation retry iteration
+- `connection_id`: the local incoming SOCKS5 client's request; this also
+  appears on `socks_connect_request`, `socks_connect_failed`, and
+  `socks_peer_negotiation_retry`
+- `fd`: the temporary native socket descriptor, **not** a unique identifier
+- `local`: the outgoing ZeroTier IP:port when libzt can report it
+- `socket_error` and `socket_error_source`: SO_ERROR observed during polling
+  or sampled only **after** an attempt is abandoned; zero at cancellation
+  does not prove a TCP handshake completed
+
+On the exit agent, `tcp_accept_completed` is emitted immediately after
+`zts_accept` returns. Its `connection_id` is reused in the later
+`socks_connect_request` once the SOCKS5 request is fully parsed; failures
+before parsing appear as `overlay_socks_client_failed`, and connection
+capacity rejection as `tcp_accept_rejected`.
+
+IDs are process-local and **not sent on the wire**. To compare the two nodes,
+match A's `local` endpoint with B's `tcp_accept_completed.data.remote`
+(and A's `target` with B's listening address) in the same UTC interval;
+account for clock skew and port reuse. A timeout with no matching B accept
+does not by itself prove whether ZeroTier TCP SYN packets arrived.
+See [correlation examples](docs/connection-probe.md#tcp-%E5%BB%BA%E8%BF%9E%E4%B8%8E-agent-accept-%E6%97%A5%E5%BF%97%E5%85%B3%E8%81%94).
+
 ## Continuous A/C-to-B connection probe (Windows)
 
 Run the independent PowerShell probe **on A and/or C**, with NetLoop left

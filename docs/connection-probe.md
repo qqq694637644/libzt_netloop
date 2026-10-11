@@ -83,3 +83,76 @@ Get-Content .\evidence\connection-probe-A-*.jsonl |
 20 秒的探测间隔适合长期观察，但无法严格证明秒级恢复。
 需要测量秒级恢复时可临时用 `-IntervalSeconds 1` 或 `2`，
 结束后恢复较低频率，避免探测本身制造高并发。
+
+## TCP 建连与 Agent accept 日志关联
+
+PR #2 增加了**诊断日志**，不改变现有 750ms/3s 超时、ZeroTier 路径
+管理和断网重置机制。A、B 两端都更新后，针对每个新建连接，可区分：
+
+| 事件 | 节点 | 表示什么 |
+| --- | --- | --- |
+| `tcp_connect_start` | A/C | 发起一次新的 libzt TCP socket 尝试 |
+| `tcp_connect_completed` | A/C | libzt 报告 TCP 建连完成；**尚不代表 SOCKS5 握手成功** |
+| `tcp_connect_timeout` | A/C | socket 被外部取消，或 libzt 建连期限耗尽；以 `reason` 区分 |
+| `tcp_connect_failed` | A/C | socket 创建/配置或连接时出现明确异常 |
+| `socks_peer_handshake_completed` | A/C | 已连接 B Agent 且 SOCKS5 greeting 成功 |
+| `socks_peer_handshake_failed` | A/C | TCP 已连接，但 SOCKS5 greeting 失败 |
+| `tcp_accept_completed` | B | libzt `accept()` 成功返回，**早于 SOCKS5 greeting 和 CONNECT 解析** |
+| `tcp_accept_setup_failed` / `tcp_accept_rejected` | B | 已 accept，但初始化失败或连接数达到上限 |
+| `socks_connect_request` | B | 读到了完整的 SOCKS5 CONNECT 目标 |
+| `overlay_socks_client_failed` | B | accept 后 SOCKS5 greeting/请求处理异常 |
+
+**关联标识规则：** `connection_id` 是当前进程内收到的本地 SOCKS5
+连接 ID，A 的同一个 ID 贯穿 `socks_connect_request`、
+`socks_peer_negotiation_retry`、`tcp_connect_*` 和 `socks_connect_failed`。
+`peer_attempt_id` 标识一次 750ms SOCKS5 peer negotiation；
+`connect_id` 是 libzt connector 的一次调用；
+`attempt_id` 唯一标识这次调用里实际创建的原生 socket，
+避免因 fd 被复用而误判。B 的 `tcp_accept_completed` 和随后
+`socks_connect_request` 具有**相同的 B 本地 `connection_id`**。
+
+**A 的 ID 与 B 的 ID 并不相同**，因为我们没有修改 SOCKS5 网络协议，
+这些 ID 不经网络传输。可以用 A 的 `tcp_connect_completed` /
+`tcp_connect_timeout` 中的 `local`
+（例如 `172.26.0.2:53152`）去对应 B
+`tcp_accept_completed` 中的 `remote`；还需确认目标
+`172.26.0.254:42042`、UTC 时间窗与端口是否可能被复用。不能仅凭
+源端口跳号声称 B 收到了 TCP SYN。
+
+假设再次观察到 3 秒失败，先在 A 上提取这次失败的连接 ID：
+
+```powershell
+$events = Get-Content .\A_client.log | ForEach-Object { $_ | ConvertFrom-Json }
+$failure = $events | Where-Object {
+  $_.event -eq 'socks_connect_failed' -and
+  $_.data.target -eq '172.26.0.254:8080'
+} | Select-Object -Last 1
+
+$events | Where-Object {
+  $_.data.connection_id -eq $failure.data.connection_id
+} | Select-Object ts, event, data
+```
+
+然后在 B 上观察该时间窗的接入、解析和握手失败情况：
+
+```powershell
+Get-Content .\server.log |
+  ForEach-Object { $_ | ConvertFrom-Json } |
+  Where-Object {
+    $_.ts -ge '2026-10-11T01:53:15' -and
+    $_.ts -lt '2026-10-11T01:53:45' -and
+    $_.event -in @(
+      'tcp_accept_completed', 'tcp_accept_setup_failed',
+      'tcp_accept_rejected', 'socks_connect_request',
+      'overlay_socks_client_failed')
+  } | Select-Object ts, event, data
+```
+
+上面时间窗只是历史示例，请改成**实际故障的 UTC 时间**。
+`socket_error_source=abandoned_socket_snapshot` 表示读取 SO_ERROR 时已经
+决定放弃该 fd；返回 `socket_error=0` 不代表握手成功。
+如果 B 有 `tcp_accept_completed` 但没有相同 `connection_id` 的
+`socks_connect_request`，则应重点查看
+`overlay_socks_client_failed` 或 `tcp_accept_rejected`。
+若 B 没有 accept 日志，只能证明该 TCP 连接未进入 B 的 Agent 处理，
+不能推断底层 UDP 包有没有到达 B。

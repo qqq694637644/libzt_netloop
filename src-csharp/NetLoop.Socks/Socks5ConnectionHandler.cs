@@ -19,6 +19,11 @@ public sealed class Socks5ConnectionHandler
 
     public async Task HandleAsync(IProxyConnection client, CancellationToken cancellationToken)
     {
+        var connectionId = client is IConnectionTrace traced
+            ? traced.ConnectionId
+            : ConnectionTrace.NewId();
+        using var traceScope = ConnectionTrace.EnterInbound(connectionId);
+
         var greeting = new byte[2];
         await Socks5Protocol.ReadExactlyAsync(client, greeting, 2, cancellationToken).ConfigureAwait(false);
         if (greeting[0] != Socks5Protocol.Version || greeting[1] == 0)
@@ -89,7 +94,13 @@ public sealed class Socks5ConnectionHandler
             return;
         }
 
-        JsonLog.Info("socks_connect_request", new { target = target.ToString(), client = client.Description });
+        // A parsed SOCKS5 request is distinct from the earlier TCP accept
+        // event; both carry the same ID on an overlay Agent.
+        JsonLog.Info("socks_connect_request", new {
+            connection_id = connectionId,
+            target = target.ToString(),
+            client = client.Description
+        });
 
         IProxyConnection? remote = null;
         try
@@ -118,6 +129,8 @@ public sealed class Socks5ConnectionHandler
             }
 
             JsonLog.Error("socks_connect_failed", new {
+                connection_id = connectionId,
+                client = client.Description,
                 target = target.ToString(),
                 error_type = ex.GetType().Name,
                 error = ex.Message
