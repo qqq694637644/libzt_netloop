@@ -19,7 +19,8 @@ The repository no longer contains the original NetLoop C++ client/server impleme
 - Linux arm64
 - Android arm64-v8a
 
-Android CI also builds an x86_64-only test APK for the GitHub-hosted Android emulator. This x86_64 artifact is for CI only and is not a release target.
+Android CI builds the arm64-v8a application. Automated Android emulator E2E
+jobs are currently disabled.
 
 ## Overlay addresses
 
@@ -68,6 +69,30 @@ log. When troubleshooting identity mismatches, compare both nodes'
 `status-file` `node_id` values to the actual authorized members in the
 ZeroTier controller; Managed IP alone does not identify a peer.
 
+## Continuous A/C-to-B connection probe (Windows)
+
+Run the independent PowerShell probe **on A and/or C**, with NetLoop left
+running, to record actual SOCKS5 -> B:8080 connectivity in UTC. It does not
+modify the ZeroTier node, reset the runtime, or depend on ZeroTier's
+`NODE_ONLINE`/`NODE_OFFLINE` status:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\connection_probe.ps1 -Node A
+# Run on C, in its own PowerShell window:
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\connection_probe.ps1 -Node C
+```
+
+By default the tool uses `127.0.0.1:1080`, tests
+`http://172.26.0.254:8080/`, limits each curl request to 12 seconds, waits
+20 seconds between requests, and writes a *new* UTC-stamped
+`evidence/connection-probe-<node>-<timestamp>.jsonl` in the current
+directory. Use `-IntervalSeconds 2` for finer-grained handover observation,
+`-Count 3` for a short run, or `-LogPath` for an explicit output file.
+Ctrl+C stops the probe. Any HTTP response (including 404/500) means the
+SOCKS5 transport reached an HTTP server; exit code 97 or HTTP 000 indicates
+failure. Keep the NetLoop logs for correlation and **do not delete identity
+or state directories**. See [the Chinese probe guide](docs/connection-probe.md).
+
 ## Build
 
 Desktop builds are orchestrated by:
@@ -93,17 +118,19 @@ Active GitHub Actions workflows:
 - `.github/workflows/csharp-android-ci.yml`
 - `.github/workflows/release.yml` (manual Windows/Android release publishing)
 
-The platform CI workflows build the C# runtime and exercise TCP, UDP, peer-local routing, exit-node behavior, and runtime-reset recovery:
+The platform CI workflows currently **build only**. They do not run smoke
+tests, network E2E, or reset-stress jobs:
 
-| Platform | Build | Runtime E2E | Reset stress |
-| --- | --- | --- | --- |
-| Windows x64 | yes | two GitHub-hosted runners | 10 cycles |
-| Linux x64 | yes | two GitHub-hosted runners | 10 cycles |
-| Linux arm64 | yes | two native arm64 GitHub-hosted runners | 10 cycles |
-| Android x86_64 | CI-only APK | x86_64 emulator + Linux peer | 3 cycles |
-| Android arm64-v8a | release APK | not available on hosted emulator | not run |
+| Platform | Build | Runtime E2E |
+| --- | --- | --- |
+| Windows x64 | yes | not run |
+| Linux x64 | yes | not run |
+| Linux arm64 | yes | not run |
+| Android arm64-v8a | yes | not run |
 
-The reset tests use deterministic fault simulation. They prove that once a reset is triggered, the old runtime is discarded and fresh TCP/UDP traffic can recover inside the configured budget. They do **not** replace physical-device testing of Wi-Fi -> hotspot/cellular handover, where the host interface, NAT mapping, and ZeroTier physical path actually change.
+Connection recovery on physical-device Wi-Fi/hotspot/cellular handovers is
+currently observed with the independent
+[connection probe](docs/connection-probe.md), not asserted by CI.
 
 ## Releases
 
