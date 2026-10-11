@@ -26,7 +26,11 @@ jobs are currently disabled.
 
 Each runtime chooses one **primary overlay address** for its peer TCP/UDP listeners: the numerically lowest Managed IPv4 address is preferred; if no IPv4 address exists, the numerically lowest Managed IPv6 address is used. The selected value is published as `primary_overlay_address` in the readiness status.
 
-`--default-exit` is required on every node and automatically becomes an effective peer when it is remote, so it must not be duplicated in `--peer`. Use repeatable `--peer` only for additional NetLoop nodes whose `primary_overlay_address` must be reachable directly. The exit node may use its own primary address as `--default-exit`; in that case NetLoop uses local egress instead of connecting to itself. Desktop SOCKS always binds to loopback; `--socks-host` is intentionally unsupported. A node may have additional Managed IPs, but NetLoop v1 ignores them for routing and only exposes services on the primary address; configuring a secondary local Managed IP as a peer or default exit is rejected at startup.
+`--default-exit` is required on every node and automatically becomes an effective peer when it is remote. **Other direct ZeroTier peers are discovered by matching the real Controller-assigned address prefixes and Managed Routes**, not by hardcoding a network such as `172.26.0.0/24` or requiring every address in `--peer`. Repeatable `--peer` remains as a compatibility override for explicitly known peer Agent primary addresses; do not duplicate the default exit. The exit node may use its own primary address as `--default-exit`; in that case NetLoop uses local egress instead of connecting to itself.
+
+Controller **direct** routes (no `via` gateway) allow direct peer Agent forwarding. More-specific routes with a `via` gateway are **rejected explicitly**: the NetLoop Agent SOCKS5 protocol does not implement ZeroTier gateway/multihop routing. ZeroTier `/0` default routes are not treated as Overlay Peer networks; ordinary internet traffic still uses the configured NetLoop default exit. Missing Controller prefixes are never guessed. This behavior includes IPv6. Desktop SOCKS always binds to loopback; `--socks-host` is intentionally unsupported.
+
+Only the primary Managed IP is bound for the NetLoop TCP/UDP Agent listeners. A configuration update that revokes that listener IP is logged as `overlay_bind_address_no_longer_assigned`; it cannot transparently move an existing listening socket to a different IP without rebinding. Existing TCP sessions are not aborted by **route-only** configuration updates. See [dynamic ZeroTier routing](docs/zerotier-network-routes.md).
 
 ## Peer P2P / relay diagnostics
 
@@ -57,7 +61,11 @@ These are **event-time snapshots**, not continuous probes of all peers; an old
 change. ZeroTier root/controller peers can also appear in the log, so always
 match the node ID. The peer diagnostics require the updated `libzt.dll` (or
 `libzt.so`) built with the NetLoop peer-event ABI patch, not just an updated
-managed DLL.
+ managed DLL.
+
+Dynamic ZeroTier routing additionally requires the matching native
+`0004-network-cidr-queries.patch`: **deploy both** the new NetLoop .NET
+assemblies and the rebuilt native libzt library on every node.
 
 Peer TCP connects are initiated with nonblocking `zts_bsd_connect` and
 completed through `poll(POLLOUT)` plus socket `SO_ERROR`. NetLoop cancels and

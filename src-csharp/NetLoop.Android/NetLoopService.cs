@@ -150,6 +150,9 @@ public sealed class NetLoopService : Service
             OnNetworkChanged);
 
         NetLoopRuntime? runtime = null;
+        NetLoopRuntime? activeRuntime = null;
+        node.NetworkStateChanged += updated =>
+            Volatile.Read(ref activeRuntime)?.UpdateNetworkState(updated);
         var resetCount = 0;
 
         try
@@ -157,9 +160,12 @@ public sealed class NetLoopService : Service
             networkMonitor.Start();
             var state = await node.StartAsync(cancellationToken)
                 .ConfigureAwait(false);
+            state = node.State ?? state;
             Volatile.Write(ref resetRuntimeOnNetworkChange, 1);
             runtime = await NetLoopRuntime.CreateAsync(options, state)
                 .ConfigureAwait(false);
+            Volatile.Write(ref activeRuntime, runtime);
+            runtime.UpdateNetworkState(node.State ?? state);
             NetLoopRuntimeController.ReportReady(
                 runtime.State.NodeId,
                 runtime.OverlayBindAddress.ToString());
@@ -198,6 +204,7 @@ public sealed class NetLoopService : Service
 
                 NetLoopRuntimeController.ReportRuntimeRestarting();
                 Volatile.Write(ref resetRuntimeOnNetworkChange, 0);
+                Volatile.Write(ref activeRuntime, null);
                 var discarded = runtime;
                 runtime = null;
                 discarded.Abort();
@@ -210,6 +217,8 @@ public sealed class NetLoopService : Service
 
                 runtime = await NetLoopRuntime.CreateAsync(options, state)
                     .ConfigureAwait(false);
+                Volatile.Write(ref activeRuntime, runtime);
+                runtime.UpdateNetworkState(node.State ?? state);
                 NetLoopRuntimeController.ReportReady(
                     runtime.State.NodeId,
                     runtime.OverlayBindAddress.ToString());
@@ -234,6 +243,7 @@ public sealed class NetLoopService : Service
         }
         finally
         {
+            Volatile.Write(ref activeRuntime, null);
 #if NETLOOP_CI
             _ciResets = null;
 #endif

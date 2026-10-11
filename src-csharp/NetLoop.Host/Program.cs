@@ -70,6 +70,14 @@ internal static class Program
             options.StateDirectory,
             options.StartupTimeout);
 
+        NetLoopRuntime? activeRuntime = null;
+        node.NetworkStateChanged += updated =>
+        {
+            // This is a config-only update, not a physical network reset.
+            // Existing sessions remain attached to the same runtime.
+            Volatile.Read(ref activeRuntime)?.UpdateNetworkState(updated);
+        };
+
         var resetCount = 0;
         long? resetStarted = null;
         string? lastResetReason = null;
@@ -108,12 +116,17 @@ internal static class Program
 
         while (!shutdownToken.IsCancellationRequested)
         {
+            // Pick up configuration events that arrived during the previous
+            // reset or runtime teardown.
+            state = node.State ?? state;
             var runtime = await NetLoopRuntime.CreateAsync(
                 options,
                 state).ConfigureAwait(false);
 
             try
             {
+                Volatile.Write(ref activeRuntime, runtime);
+                runtime.UpdateNetworkState(node.State ?? state);
                 double? resetElapsedMs = resetStarted is null
                     ? null
                     : Stopwatch.GetElapsedTime(resetStarted.Value).TotalMilliseconds;
@@ -134,6 +147,7 @@ internal static class Program
                     socks = $"{options.SocksAddress}:{options.SocksPort}",
                     reset_count = resetCount,
                     reset_elapsed_ms = resetElapsedMs,
+                    route_generation = runtime.State.Generation,
                     process_id = Environment.ProcessId
                 });
 
@@ -155,6 +169,7 @@ internal static class Program
                 var nextResetCount = checked(resetCount + 1);
                 resetStarted = Stopwatch.GetTimestamp();
                 Volatile.Write(ref resetRuntimeOnNetworkChange, 0);
+                Volatile.Write(ref activeRuntime, null);
 
                 await StatusWriter.WriteAsync(
                     options.StatusFile,
@@ -198,6 +213,7 @@ internal static class Program
             }
             finally
             {
+                Volatile.Write(ref activeRuntime, null);
                 await runtime.DisposeAsync().ConfigureAwait(false);
             }
         }
@@ -228,6 +244,16 @@ internal static class Program
                     .Select(static address => address.ToString())
                     .Order()
                     .ToArray(),
+                assigned_prefixes = runtime.State.AssignedPrefixes
+                    .Select(static prefix => prefix.ToString()).ToArray(),
+                managed_routes = runtime.State.ManagedRoutes
+                    .Select(static route => new {
+                        target = route.Target.ToString(),
+                        via = route.Via?.ToString(),
+                        flags = route.Flags,
+                        metric = route.Metric
+                    }).ToArray(),
+                route_generation = runtime.State.Generation,
                 default_exit = options.DefaultExit?.ToString(),
                 egress = options.Egress,
                 reset_count = resetCount,

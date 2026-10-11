@@ -16,6 +16,9 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
     private readonly OverlaySocksAgent _overlayAgent;
     private readonly OverlayUdpAgent _overlayUdpAgent;
     private readonly LocalSocksServer _localSocks;
+    private readonly RouteSelector _selector;
+    private readonly object _routeUpdateSync = new();
+    private LibztNetworkState _state;
     private int _aborted;
     private int _disposed;
 
@@ -23,21 +26,23 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
         LibztNetworkState state,
         HashSet<IPAddress> peers,
         IPAddress overlayBindAddress,
+        RouteSelector selector,
         Socks5UdpAssociationFactory udpAssociationFactory,
         OverlaySocksAgent overlayAgent,
         OverlayUdpAgent overlayUdpAgent,
         LocalSocksServer localSocks)
     {
-        State = state;
+        _state = state;
         Peers = peers;
         OverlayBindAddress = overlayBindAddress;
+        _selector = selector;
         _udpAssociationFactory = udpAssociationFactory;
         _overlayAgent = overlayAgent;
         _overlayUdpAgent = overlayUdpAgent;
         _localSocks = localSocks;
     }
 
-    internal LibztNetworkState State { get; }
+    internal LibztNetworkState State => Volatile.Read(ref _state);
 
     internal IReadOnlyCollection<IPAddress> Peers { get; }
 
@@ -57,9 +62,7 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
             peers.Add(defaultExit);
         }
 
-        var snapshot = new OverlayNetworkSnapshot(
-            overlayBind,
-            peers);
+        var snapshot = BuildNetworkSnapshot(state, overlayBind, peers);
         var selector = new RouteSelector(snapshot, defaultExit);
 
         var libztConnector = new LibztTcpConnector(PeerConnectTimeout);
@@ -123,6 +126,7 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
                 state,
                 peers,
                 overlayBind,
+                selector,
                 udpAssociations,
                 overlayAgent,
                 overlayUdpAgent,
@@ -141,6 +145,64 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
             throw;
         }
     }
+
+    /// <summary>
+    /// Replaces only the routing table. Existing TCP handlers retain their
+    /// connected streams and no native listener or ZeroTier Node is restarted.
+    /// </summary>
+    internal void UpdateNetworkState(LibztNetworkState updated)
+    {
+        lock (_routeUpdateSync)
+        {
+            var previous = State;
+            if (Volatile.Read(ref _disposed) != 0
+                || updated.Generation <= previous.Generation)
+                return;
+
+            if (updated.NetworkId != previous.NetworkId || updated.NodeId != previous.NodeId)
+                throw new InvalidOperationException("ZeroTier config update belongs to a different node/network.");
+
+            // Agent listeners are bound to the startup primary address. Do not
+            // tear them down (which would abort established connections) on a
+            // controller-driven address change; surface the limitation.
+            if (!updated.ManagedAddresses.Contains(OverlayBindAddress))
+            {
+                JsonLog.Error("overlay_bind_address_no_longer_assigned", new {
+                    bound_address = OverlayBindAddress.ToString(),
+                    assigned_addresses = updated.ManagedAddresses.Select(
+                        static x => x.ToString()).ToArray(),
+                    generation = updated.Generation
+                });
+            }
+
+            _selector.UpdateNetwork(
+                BuildNetworkSnapshot(updated, OverlayBindAddress, Peers));
+            Volatile.Write(ref _state, updated);
+
+            JsonLog.Info("overlay_routes_updated", new {
+                generation = updated.Generation,
+                assigned_prefixes = updated.AssignedPrefixes.Select(
+                    static x => x.ToString()).ToArray(),
+                managed_routes = updated.ManagedRoutes.Select(static x => new {
+                    target = x.Target.ToString(),
+                    via = x.Via?.ToString(),
+                    flags = x.Flags,
+                    metric = x.Metric
+                }).ToArray()
+            });
+        }
+    }
+
+    private static OverlayNetworkSnapshot BuildNetworkSnapshot(
+        LibztNetworkState state,
+        IPAddress overlayBind,
+        IEnumerable<IPAddress> explicitPeers)
+        => new(
+            overlayBind,
+            state.ManagedAddresses,
+            state.AssignedPrefixes,
+            state.ManagedRoutes,
+            explicitPeers);
 
     internal void Abort()
     {
