@@ -166,8 +166,11 @@ destination-port ACLs, and resource-budget/UDP queue-drop counters.
 poller; the original `per-socket` mode remains the default until real-device
 connection-lifetime testing is available.
 
-For **manual**, offline Windows application upgrades/rollback
-and JSONL probe statistics, see the
+For new versions, download the relevant build directly from
+[GitHub Releases](https://github.com/qqq694637644/libzt_netloop/releases)
+and replace the application manually. No custom updater, previous-version
+snapshot, compatibility fallback, or rollback tool is provided.
+For offline JSONL probe statistics, see the
 [operations guide](docs/long-term-operations.md). This project intentionally
 does **not** install a watchdog, Windows service, process auto-restart or
 scheduled background task.

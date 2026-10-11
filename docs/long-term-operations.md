@@ -3,7 +3,7 @@
 此指南对应 PR #3 第二至第四阶段，基于 PR #2 的 Controller 动态路由。
 **不创建 Windows 服务、不安装进程守护、不创建计划任务、不自动
 重启 NetLoop 或 ZeroTier。** 原有 Android 前台应用生命周期不变。
-全部发布/恢复动作由用户在程序关闭后**手动执行**。
+应用更新直接从 GitHub Releases 下载对应版本，手动替换程序文件。
 
 ## 二：Controller 路由与 Agent 安全
 
@@ -90,42 +90,15 @@ Overlay UDP 接收后会交由**每个远端单独的处理队列**异步转发�
 UDP association 容量和缓存会增加内存占用，尤其不可将几个
 上限同时调到最大。
 
-## 四：不用服务/守护的手动升级与回滚
+## 四：直接从 GitHub Releases 下载
 
-先人工停止 NetLoop，确保进程不存在；工具检测到仍有
-`netloop.exe` 进程会拒绝修改。**不要删除或复制覆盖 state、
-identity.secret、日志目录或 status 文件。** 下载受信任的官方
-Release ZIP，核验其发布来源及 SHA256；可同时准备应用 ZIP 与
-.NET runtime ZIP。该工具只接受 Release 根目录的平铺应用文件，
-其他文件名、目录或路径穿越会被拒绝。
+新版本直接从 [GitHub Releases](https://github.com/qqq694637644/libzt_netloop/releases)
+下载对应平台的软件包。退出正在运行的 NetLoop，手动替换程序，
+然后按原有参数启动即可。ZeroTier `state` 目录不属于程序更新文件，
+不要随意覆盖或删除。
 
-```powershell
-& .\tools\manage_release.ps1 -Action Apply `
-  -InstallDirectory C:\NetLoop `
-  -BackupRoot D:\NetLoop-Release-Backups `
-  -Packages 'C:\Downloads\netloop-win-x64.zip','C:\Downloads\netloop-dotnet-runtime-win-x64.zip'
-```
-
-完成后工具输出唯一的 `Rollback snapshot` 文件夹。你需要**手动**
-重新运行原有的 `netloop.exe` 启动命令并验证 A/B/C 通路；
-这个工具不会启动 NetLoop，也不会改变运行中的程序。
-
-如果新版本不满足要求，人工停止程序，在确认安装目录中原升级
-文件未被另一个发布更新修改后，回滚至指定的快照：
-
-```powershell
-& .\tools\manage_release.ps1 -Action Rollback `
-  -InstallDirectory C:\NetLoop `
-  -BackupRoot D:\NetLoop-Release-Backups `
-  -Snapshot D:\NetLoop-Release-Backups\20261011T080000Z-EXAMPLE
-```
-
-`Rollback` 会校验已安装文件与快照中的哈希，若检测到其他更改
-就拒绝覆盖。只处理升级时实际替换/新增的**应用文件**；
-不会触碰 ZeroTier 节点身份和 state，也不会删除其他用户文件。
-多版本升级的回滚应该从**最新一层快照**按顺序逆序执行。
-若升级过程异常，工具尝试从预备快照回退；磁盘损坏等错误无法
-保证自动恢复，需人工查看日志和快照。
+本项目不提供自制升级器、旧版本快照、回滚工具、兼容兜底、
+自动更新、Windows 服务或进程守护。
 
 ## 离线 JSONL 长期探测统计
 
