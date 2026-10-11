@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using NetLoop.Core;
@@ -6,15 +7,21 @@ namespace NetLoop.Socks;
 
 public sealed class Socks5ConnectionHandler
 {
+    private static readonly TimeSpan DefaultHandshakeTimeout = TimeSpan.FromSeconds(15);
     private readonly IProxyConnector _connector;
     private readonly ISocks5UdpAssociationFactory? _udpAssociationFactory;
+    private readonly TimeSpan _handshakeTimeout;
 
     public Socks5ConnectionHandler(
         IProxyConnector connector,
-        ISocks5UdpAssociationFactory? udpAssociationFactory = null)
+        ISocks5UdpAssociationFactory? udpAssociationFactory = null,
+        TimeSpan? handshakeTimeout = null)
     {
         _connector = connector;
         _udpAssociationFactory = udpAssociationFactory;
+        _handshakeTimeout = handshakeTimeout ?? DefaultHandshakeTimeout;
+        if (_handshakeTimeout <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(handshakeTimeout));
     }
 
     public async Task HandleAsync(IProxyConnection client, CancellationToken cancellationToken)
@@ -24,76 +31,42 @@ public sealed class Socks5ConnectionHandler
             : ConnectionTrace.NewId();
         using var traceScope = ConnectionTrace.EnterInbound(connectionId);
 
-        var greeting = new byte[2];
-        await Socks5Protocol.ReadExactlyAsync(client, greeting, 2, cancellationToken).ConfigureAwait(false);
-        if (greeting[0] != Socks5Protocol.Version || greeting[1] == 0)
-            throw new ProtocolViolationException("Invalid SOCKS5 greeting.");
-
-        var methods = new byte[greeting[1]];
-        await Socks5Protocol.ReadExactlyAsync(client, methods, methods.Length, cancellationToken).ConfigureAwait(false);
-        if (!methods.Contains(Socks5Protocol.NoAuthentication))
-        {
-            var rejected = new byte[] { Socks5Protocol.Version, Socks5Protocol.NoAcceptableMethods };
-            await client.WriteAsync(rejected, rejected.Length, cancellationToken).ConfigureAwait(false);
-            return;
-        }
-
-        var selected = new byte[] { Socks5Protocol.Version, Socks5Protocol.NoAuthentication };
-        await client.WriteAsync(selected, selected.Length, cancellationToken).ConfigureAwait(false);
-
-        var header = new byte[4];
-        await Socks5Protocol.ReadExactlyAsync(client, header, 4, cancellationToken).ConfigureAwait(false);
-        if (header[0] != Socks5Protocol.Version || header[2] != 0)
-            throw new ProtocolViolationException("Invalid SOCKS5 request header.");
-
-        if (header[1] == Socks5Protocol.UdpAssociate)
-        {
-            if (_udpAssociationFactory is null)
-            {
-                var unsupported = Socks5Protocol.BuildReply(Socks5Protocol.ReplyCommandNotSupported);
-                await client.WriteAsync(unsupported, unsupported.Length, cancellationToken).ConfigureAwait(false);
-                return;
-            }
-
-            ProxyTarget declaredEndpoint;
-            try
-            {
-                declaredEndpoint = await Socks5Protocol.ReadTargetAsync(
-                    client,
-                    header[3],
-                    cancellationToken,
-                    allowZeroPort: true).ConfigureAwait(false);
-            }
-            catch (NotSupportedException)
-            {
-                var unsupported = Socks5Protocol.BuildReply(Socks5Protocol.ReplyAddressTypeNotSupported);
-                await client.WriteAsync(unsupported, unsupported.Length, cancellationToken).ConfigureAwait(false);
-                return;
-            }
-
-            await HandleUdpAssociationAsync(client, declaredEndpoint, cancellationToken).ConfigureAwait(false);
-            return;
-        }
-
-        if (header[1] != Socks5Protocol.Connect)
-        {
-            var unsupported = Socks5Protocol.BuildReply(Socks5Protocol.ReplyCommandNotSupported);
-            await client.WriteAsync(unsupported, unsupported.Length, cancellationToken).ConfigureAwait(false);
-            return;
-        }
-
-        ProxyTarget target;
+        using var handshakeCts =
+            CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        handshakeCts.CancelAfter(_handshakeTimeout);
+        var handshakeStarted = Stopwatch.GetTimestamp();
+        ParsedRequest? parsed;
         try
         {
-            target = await Socks5Protocol.ReadTargetAsync(client, header[3], cancellationToken).ConfigureAwait(false);
+            parsed = await ReadClientRequestAsync(
+                client, handshakeCts.Token).ConfigureAwait(false);
         }
-        catch (NotSupportedException)
+        catch (OperationCanceledException)
+            when (!cancellationToken.IsCancellationRequested
+                  && handshakeCts.IsCancellationRequested)
         {
-            var unsupported = Socks5Protocol.BuildReply(Socks5Protocol.ReplyAddressTypeNotSupported);
-            await client.WriteAsync(unsupported, unsupported.Length, cancellationToken).ConfigureAwait(false);
+            JsonLog.Error("socks_handshake_timeout", new {
+                connection_id = connectionId,
+                client = client.Description,
+                timeout_ms = _handshakeTimeout.TotalMilliseconds,
+                elapsed_ms = Stopwatch.GetElapsedTime(handshakeStarted).TotalMilliseconds
+            });
+            throw new TimeoutException("SOCKS5 client handshake deadline expired.");
+        }
+        // Subsequent relay and UDP control traffic must not inherit the
+        // handshake timer.
+        handshakeCts.CancelAfter(Timeout.InfiniteTimeSpan);
+
+        if (parsed is null)
+            return;
+        if (parsed.Value.Command == Socks5Protocol.UdpAssociate)
+        {
+            await HandleUdpAssociationAsync(
+                client, parsed.Value.Target, cancellationToken).ConfigureAwait(false);
             return;
         }
 
+        var target = parsed.Value.Target;
         // A parsed SOCKS5 request is distinct from the earlier TCP accept
         // event; both carry the same ID on an overlay Agent.
         JsonLog.Info("socks_connect_request", new {
@@ -142,6 +115,84 @@ public sealed class Socks5ConnectionHandler
                 await remote.DisposeAsync().ConfigureAwait(false);
         }
     }
+
+    private async Task<ParsedRequest?> ReadClientRequestAsync(
+        IProxyConnection client,
+        CancellationToken handshakeToken)
+    {
+        var greeting = new byte[2];
+        await Socks5Protocol.ReadExactlyAsync(client, greeting, 2, handshakeToken).ConfigureAwait(false);
+        if (greeting[0] != Socks5Protocol.Version || greeting[1] == 0)
+            throw new ProtocolViolationException("Invalid SOCKS5 greeting.");
+
+        var methods = new byte[greeting[1]];
+        await Socks5Protocol.ReadExactlyAsync(client, methods, methods.Length, handshakeToken).ConfigureAwait(false);
+        if (!methods.Contains(Socks5Protocol.NoAuthentication))
+        {
+            var rejected = new byte[] { Socks5Protocol.Version, Socks5Protocol.NoAcceptableMethods };
+            await client.WriteAsync(rejected, rejected.Length, handshakeToken).ConfigureAwait(false);
+            return null;
+        }
+
+        var selected = new byte[] { Socks5Protocol.Version, Socks5Protocol.NoAuthentication };
+        await client.WriteAsync(selected, selected.Length, handshakeToken).ConfigureAwait(false);
+
+        var header = new byte[4];
+        await Socks5Protocol.ReadExactlyAsync(client, header, 4, handshakeToken).ConfigureAwait(false);
+        if (header[0] != Socks5Protocol.Version || header[2] != 0)
+            throw new ProtocolViolationException("Invalid SOCKS5 request header.");
+
+        if (header[1] == Socks5Protocol.UdpAssociate)
+        {
+            if (_udpAssociationFactory is null)
+            {
+                var unsupported = Socks5Protocol.BuildReply(Socks5Protocol.ReplyCommandNotSupported);
+                await client.WriteAsync(unsupported, unsupported.Length, handshakeToken).ConfigureAwait(false);
+                return null;
+            }
+
+            ProxyTarget declaredEndpoint;
+            try
+            {
+                declaredEndpoint = await Socks5Protocol.ReadTargetAsync(
+                    client,
+                    header[3],
+                    handshakeToken,
+                    allowZeroPort: true).ConfigureAwait(false);
+            }
+            catch (NotSupportedException)
+            {
+                var unsupported = Socks5Protocol.BuildReply(Socks5Protocol.ReplyAddressTypeNotSupported);
+                await client.WriteAsync(unsupported, unsupported.Length, handshakeToken).ConfigureAwait(false);
+                return null;
+            }
+
+            return new ParsedRequest(header[1], declaredEndpoint);
+        }
+
+        if (header[1] != Socks5Protocol.Connect)
+        {
+            var unsupported = Socks5Protocol.BuildReply(Socks5Protocol.ReplyCommandNotSupported);
+            await client.WriteAsync(unsupported, unsupported.Length, handshakeToken).ConfigureAwait(false);
+            return null;
+        }
+
+        ProxyTarget target;
+        try
+        {
+            target = await Socks5Protocol.ReadTargetAsync(client, header[3], handshakeToken).ConfigureAwait(false);
+        }
+        catch (NotSupportedException)
+        {
+            var unsupported = Socks5Protocol.BuildReply(Socks5Protocol.ReplyAddressTypeNotSupported);
+            await client.WriteAsync(unsupported, unsupported.Length, handshakeToken).ConfigureAwait(false);
+            return null;
+        }
+
+        return new ParsedRequest(header[1], target);
+    }
+
+    private readonly record struct ParsedRequest(byte Command, ProxyTarget Target);
 
     private async Task HandleUdpAssociationAsync(
         IProxyConnection client,

@@ -16,6 +16,7 @@ internal sealed class RoutingConnector : IProxyConnector
     private readonly IProxyConnector _libztConnector;
     private readonly IProxyConnector _loopbackConnector;
     private readonly IProxyConnector _egressConnector;
+    private readonly TimeSpan _connectReplyTimeout;
 
     internal RoutingConnector(
         RouteSelector selector,
@@ -23,7 +24,8 @@ internal sealed class RoutingConnector : IProxyConnector
         ushort overlayPort,
         IProxyConnector libztConnector,
         IProxyConnector loopbackConnector,
-        IProxyConnector egressConnector)
+        IProxyConnector egressConnector,
+        TimeSpan connectReplyTimeout)
     {
         _selector = selector;
         _overlayIngress = overlayIngress;
@@ -31,6 +33,7 @@ internal sealed class RoutingConnector : IProxyConnector
         _libztConnector = libztConnector;
         _loopbackConnector = loopbackConnector;
         _egressConnector = egressConnector;
+        _connectReplyTimeout = connectReplyTimeout;
     }
 
     public async ValueTask<IProxyConnection> ConnectAsync(
@@ -68,7 +71,8 @@ internal sealed class RoutingConnector : IProxyConnector
             _libztConnector,
             new ProxyTarget(peer.ToString(), _overlayPort),
             negotiationRetryWindow: PeerNegotiationRecoveryWindow,
-            negotiationAttemptTimeout: PeerNegotiationAttemptTimeout);
+            negotiationAttemptTimeout: PeerNegotiationAttemptTimeout,
+            connectReplyTimeout: _connectReplyTimeout);
         return proxy.ConnectAsync(target, cancellationToken);
     }
 }

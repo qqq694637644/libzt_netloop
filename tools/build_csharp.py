@@ -162,6 +162,25 @@ def build_managed(args: argparse.Namespace) -> None:
     if not native_input.exists():
         raise FileNotFoundError(native_input)
 
+    manifest_path = native_input.with_suffix(native_input.suffix + ".manifest.json")
+    if not manifest_path.is_file():
+        raise RuntimeError(
+            f"native libzt manifest is missing: {manifest_path}. "
+            "Build native and managed binaries from the same revision."
+        )
+    built_identity = json.loads(manifest_path.read_text(encoding="utf-8"))
+    expected_identity = native_cache_identity()
+    mismatched = {
+        key: {"expected": value, "native": built_identity.get(key)}
+        for key, value in expected_identity.items()
+        if built_identity.get(key) != value
+    }
+    if mismatched:
+        raise RuntimeError(
+            "native libzt ABI/source manifest mismatch: "
+            + json.dumps(mismatched, sort_keys=True)
+        )
+
     project = ROOT / "src-csharp" / "NetLoop.Host" / "NetLoop.Host.csproj"
     dist = Path(args.output).resolve()
     if dist.exists():

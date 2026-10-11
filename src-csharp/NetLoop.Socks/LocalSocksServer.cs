@@ -32,6 +32,9 @@ public sealed class LocalSocksServer : IAsyncDisposable
 
     public IPEndPoint EndPoint => (IPEndPoint)_listener.LocalEndpoint;
 
+    public Task Completion => _loop
+        ?? throw new InvalidOperationException("SOCKS5 server has not started.");
+
     public void Start()
     {
         if (_loop is not null)

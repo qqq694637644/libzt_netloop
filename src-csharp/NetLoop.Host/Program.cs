@@ -25,6 +25,12 @@ internal static class Program
                 return 0;
             }
 
+            if (options.LogFile is not null)
+                JsonLog.ConfigureFile(
+                    options.LogFile,
+                    options.LogMaxMegabytes,
+                    options.LogRetainedFiles);
+
             using var shutdown = new CancellationTokenSource();
             ConsoleCancelEventHandler cancelHandler = (_, eventArgs) => {
                 eventArgs.Cancel = true;
@@ -37,6 +43,10 @@ internal static class Program
                 return await RunAsync(
                     options,
                     shutdown.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (shutdown.IsCancellationRequested)
+            {
+                return 0;
             }
             finally
             {
@@ -51,6 +61,22 @@ internal static class Program
                 stack = ex.StackTrace
             });
             return 1;
+        }
+        finally
+        {
+            using var flushTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+            try
+            {
+                await JsonLog.FlushAsync(flushTimeout.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // A blocked output destination must not hang process shutdown.
+            }
+            catch (Exception)
+            {
+                // Logging failures must not mask the process exit code.
+            }
         }
     }
 
@@ -111,22 +137,18 @@ internal static class Program
             RequestReset);
         resetMonitor.Start();
 
-        var state = await node.StartAsync(shutdownToken).ConfigureAwait(false);
+        await node.StartAsync(shutdownToken).ConfigureAwait(false);
         Volatile.Write(ref resetRuntimeOnNetworkChange, 1);
 
         while (!shutdownToken.IsCancellationRequested)
         {
-            // Pick up configuration events that arrived during the previous
-            // reset or runtime teardown.
-            state = node.State ?? state;
-            var runtime = await NetLoopRuntime.CreateAsync(
-                options,
-                state).ConfigureAwait(false);
+            var runtime = await RuntimeRecovery.CreateAsync(
+                node, options, resetCount, shutdownToken).ConfigureAwait(false);
 
             try
             {
                 Volatile.Write(ref activeRuntime, runtime);
-                runtime.UpdateNetworkState(node.State ?? state);
+                runtime.UpdateNetworkState(node.State ?? runtime.State);
                 double? resetElapsedMs = resetStarted is null
                     ? null
                     : Stopwatch.GetElapsedTime(resetStarted.Value).TotalMilliseconds;
@@ -154,16 +176,53 @@ internal static class Program
                 resetStarted = null;
                 lastResetReason = null;
 
-                try
+                using (var supervision = CancellationTokenSource.CreateLinkedTokenSource(shutdownToken))
                 {
-                    lastResetReason = await resetRequests.Reader
-                        .ReadAsync(shutdownToken)
-                        .ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                    when (shutdownToken.IsCancellationRequested)
-                {
-                    return 0;
+                    var resetRequested = resetRequests.Reader.ReadAsync(supervision.Token).AsTask();
+                    var criticalFailure = runtime.WaitForCriticalServiceFailureAsync(supervision.Token);
+                    try
+                    {
+                        var completed = await Task.WhenAny(resetRequested, criticalFailure)
+                            .ConfigureAwait(false);
+                        if (ReferenceEquals(completed, criticalFailure))
+                        {
+                            try
+                            {
+                                await criticalFailure.ConfigureAwait(false);
+                            }
+                            catch (IOException ex) when (!shutdownToken.IsCancellationRequested)
+                            {
+                                JsonLog.Error("runtime_critical_service_failed", new {
+                                    error_type = ex.GetType().Name,
+                                    error = ex.Message,
+                                    inner_error = ex.InnerException?.Message
+                                });
+                            }
+                            lastResetReason = "critical_service_failure";
+                        }
+                        else
+                        {
+                            lastResetReason = await resetRequested.ConfigureAwait(false);
+                        }
+                    }
+                    catch (OperationCanceledException)
+                        when (shutdownToken.IsCancellationRequested)
+                    {
+                        return 0;
+                    }
+                    finally
+                    {
+                        await supervision.CancelAsync().ConfigureAwait(false);
+                        try
+                        {
+                            await Task.WhenAll(resetRequested, criticalFailure).ConfigureAwait(false);
+                        }
+                        catch (Exception) when (supervision.IsCancellationRequested)
+                        {
+                            // Both tasks are observed; a failing listener
+                            // was already recorded before triggering reset.
+                        }
+                    }
                 }
 
                 var nextResetCount = checked(resetCount + 1);
@@ -200,15 +259,17 @@ internal static class Program
                 // Keep the ZeroTier node/identity/network alive. Tell the
                 // service that the host physical network changed so it
                 // immediately refreshes UDP binds and local-interface state.
-                node.NotifyPhysicalNetworkChanged();
-                state = node.RefreshNetworkState();
+                if (lastResetReason != "critical_service_failure")
+                    node.TryNotifyPhysicalNetworkChanged();
+                // The latest ZeroTier state is re-queried on each runtime
+                // creation attempt, including after a transient empty config.
                 Volatile.Write(ref resetRuntimeOnNetworkChange, 1);
                 resetCount = nextResetCount;
 
                 JsonLog.Info("runtime_reset_transport_refresh", new {
                     reason = lastResetReason,
                     reset_count = resetCount,
-                    node = state.NodeId.ToString("x10")
+                    node = runtime.State.NodeId.ToString("x10")
                 });
             }
             finally

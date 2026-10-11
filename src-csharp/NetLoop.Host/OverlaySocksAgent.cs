@@ -17,6 +17,8 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
     private int _aborted;
     private int _disposed;
 
+    internal Task Completion => _loop;
+
     internal OverlaySocksAgent(
         string bindAddress,
         ushort port,

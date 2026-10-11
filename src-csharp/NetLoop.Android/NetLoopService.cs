@@ -158,14 +158,13 @@ public sealed class NetLoopService : Service
         try
         {
             networkMonitor.Start();
-            var state = await node.StartAsync(cancellationToken)
-                .ConfigureAwait(false);
-            state = node.State ?? state;
+            await node.StartAsync(cancellationToken).ConfigureAwait(false);
             Volatile.Write(ref resetRuntimeOnNetworkChange, 1);
-            runtime = await NetLoopRuntime.CreateAsync(options, state)
+            runtime = await RuntimeRecovery.CreateAsync(
+                    node, options, resetCount, cancellationToken)
                 .ConfigureAwait(false);
             Volatile.Write(ref activeRuntime, runtime);
-            runtime.UpdateNetworkState(node.State ?? state);
+            runtime.UpdateNetworkState(node.State ?? runtime.State);
             NetLoopRuntimeController.ReportReady(
                 runtime.State.NodeId,
                 runtime.OverlayBindAddress.ToString());
@@ -186,9 +185,51 @@ public sealed class NetLoopService : Service
                 string reason;
                 try
                 {
-                    reason = await resets.Reader
-                        .ReadAsync(cancellationToken)
-                        .ConfigureAwait(false);
+                    using (var supervision =
+                           CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
+                    {
+                        var resetRequested = resets.Reader.ReadAsync(supervision.Token).AsTask();
+                        var criticalFailure = runtime.WaitForCriticalServiceFailureAsync(
+                            supervision.Token);
+                        try
+                        {
+                            var completed = await Task.WhenAny(resetRequested, criticalFailure)
+                                .ConfigureAwait(false);
+                            if (ReferenceEquals(completed, criticalFailure))
+                            {
+                                try
+                                {
+                                    await criticalFailure.ConfigureAwait(false);
+                                }
+                                catch (IOException ex) when (!cancellationToken.IsCancellationRequested)
+                                {
+                                    JsonLog.Error("runtime_critical_service_failed", new {
+                                        platform = "android",
+                                        error_type = ex.GetType().Name,
+                                        error = ex.Message,
+                                        inner_error = ex.InnerException?.Message
+                                    });
+                                }
+                                reason = "critical_service_failure";
+                            }
+                            else
+                            {
+                                reason = await resetRequested.ConfigureAwait(false);
+                            }
+                        }
+                        finally
+                        {
+                            await supervision.CancelAsync().ConfigureAwait(false);
+                            try
+                            {
+                                await Task.WhenAll(resetRequested, criticalFailure)
+                                    .ConfigureAwait(false);
+                            }
+                            catch (Exception) when (supervision.IsCancellationRequested)
+                            {
+                            }
+                        }
+                    }
                 }
                 catch (System.OperationCanceledException)
                     when (cancellationToken.IsCancellationRequested)
@@ -210,15 +251,16 @@ public sealed class NetLoopService : Service
                 discarded.Abort();
                 await discarded.DisposeAsync().ConfigureAwait(false);
 
-                node.NotifyPhysicalNetworkChanged();
-                state = node.RefreshNetworkState();
+                if (reason != "critical_service_failure")
+                    node.TryNotifyPhysicalNetworkChanged();
                 Volatile.Write(ref resetRuntimeOnNetworkChange, 1);
                 resetCount++;
 
-                runtime = await NetLoopRuntime.CreateAsync(options, state)
+                runtime = await RuntimeRecovery.CreateAsync(
+                        node, options, resetCount, cancellationToken)
                     .ConfigureAwait(false);
                 Volatile.Write(ref activeRuntime, runtime);
-                runtime.UpdateNetworkState(node.State ?? state);
+                runtime.UpdateNetworkState(node.State ?? runtime.State);
                 NetLoopRuntimeController.ReportReady(
                     runtime.State.NodeId,
                     runtime.OverlayBindAddress.ToString());

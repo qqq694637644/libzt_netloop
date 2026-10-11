@@ -134,6 +134,30 @@ or state directories**. See [the Chinese probe guide](docs/connection-probe.md).
 
 ## Build
 
+### Long-running reliability (PR #3, based on PR #2)
+
+The runtime now limits the incoming SOCKS5 handshake (default 15 seconds)
+and the upstream CONNECT reply / UDP ASSOCIATE setup (default 25 seconds).
+Unexpected termination of local SOCKS, Overlay TCP, or Overlay UDP listener
+tasks triggers business-runtime recovery. Transient runtime initialization
+failures are retried at most 12 times with capped backoff; the ZeroTier Node
+and identity remain intact.
+
+Windows/Linux hosts can optionally rotate JSONL logs instead of relying on
+unbounded shell redirection. For example:
+
+```powershell
+netloop.exe --network <network-id> --state-dir .\state `
+  --default-exit <zt-managed-ip> `
+  --status-file .\netloop-status.json `
+  --log-file .\logs\netloop.jsonl --log-max-mb 16 --log-retain 5
+```
+
+Logging uses a bounded asynchronous queue. If overloaded, look for
+`json_log_records_dropped`. See the
+[long-running reliability guide](docs/reliability-hardening.md) for
+recovery limitations, event names, and parameter details.
+
 Desktop builds are orchestrated by:
 
 ```console

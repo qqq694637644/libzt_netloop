@@ -63,7 +63,8 @@ jobs:
           script="$(git hash-object tools/build_csharp.py)"
           network_refresh_patch="$(git hash-object patches/libzt/0001-host-network-change-refresh.patch)"
           peer_event_patch="$(git hash-object patches/libzt/0003-peer-event-details.patch)"
-          echo "key=libzt-pinvoke-linux-${{ matrix.arch }}-${libzt}-${cmake}-${script}-${network_refresh_patch}-${peer_event_patch}" >> "$GITHUB_OUTPUT"
+          cidr_patch="$(git hash-object patches/libzt/0004-network-cidr-queries.patch)"
+          echo "key=libzt-pinvoke-linux-${{ matrix.arch }}-${libzt}-${cmake}-${script}-${network_refresh_patch}-${peer_event_patch}-${cidr_patch}" >> "$GITHUB_OUTPUT"
 
       - name: Restore compiled libzt bundle
         id: native-cache
@@ -92,9 +93,8 @@ jobs:
           set -euo pipefail
           test -f native-cache/libzt.so
           file native-cache/libzt.so
-          if [[ -f native-cache/libzt.so.manifest.json ]]; then
-            cat native-cache/libzt.so.manifest.json
-          fi
+          test -f native-cache/libzt.so.manifest.json
+          cat native-cache/libzt.so.manifest.json
 
       - name: Save compiled libzt bundle immediately
         if: steps.native-cache.outputs.cache-hit != 'true'

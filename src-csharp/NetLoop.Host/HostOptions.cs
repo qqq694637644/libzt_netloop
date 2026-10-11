@@ -19,8 +19,13 @@ internal sealed class HostOptions
             "--upstream-user",
             "--upstream-password",
             "--status-file",
+            "--log-file",
+            "--log-max-mb",
+            "--log-retain",
             "--startup-timeout",
             "--connect-timeout",
+            "--socks-handshake-timeout",
+            "--socks-connect-reply-timeout",
             "--udp-idle-timeout",
             "--reset-debounce-ms",
             "--reset-command-file"
@@ -40,8 +45,13 @@ internal sealed class HostOptions
     internal string? UpstreamUsername { get; init; }
     internal string? UpstreamPassword { get; init; }
     internal string? StatusFile { get; init; }
+    internal string? LogFile { get; init; }
+    internal int LogMaxMegabytes { get; init; } = 16;
+    internal int LogRetainedFiles { get; init; } = 5;
     internal TimeSpan StartupTimeout { get; init; } = TimeSpan.FromSeconds(120);
     internal TimeSpan ConnectTimeout { get; init; } = TimeSpan.FromSeconds(20);
+    internal TimeSpan SocksHandshakeTimeout { get; init; } = TimeSpan.FromSeconds(15);
+    internal TimeSpan SocksConnectReplyTimeout { get; init; } = TimeSpan.FromSeconds(25);
     internal TimeSpan UdpIdleTimeout { get; init; } = TimeSpan.FromSeconds(60);
     internal TimeSpan ResetEventDebounce { get; init; } = TimeSpan.FromMilliseconds(250);
     internal string? ResetCommandFile { get; init; }
@@ -119,6 +129,14 @@ internal sealed class HostOptions
         if (egress == "upstream-socks5")
             Socks5Credentials.Validate(upstreamUsername, upstreamPassword);
 
+        var logFile = Optional(values, "--log-file");
+        var logMaxMb = ParsePositiveInt(Optional(values, "--log-max-mb") ?? "16", "--log-max-mb");
+        var logRetain = ParsePositiveInt(Optional(values, "--log-retain") ?? "5", "--log-retain");
+        if (logFile is null && (values.ContainsKey("--log-max-mb") || values.ContainsKey("--log-retain")))
+            throw new ArgumentException("--log-max-mb and --log-retain require --log-file.");
+        if (logMaxMb > 1024 || logRetain > 50)
+            throw new ArgumentException("Log retention exceeds limits (1024 MiB, 50 files).");
+
         return new HostOptions {
             NetworkId = networkId,
             StateDirectory = stateDirectory,
@@ -132,8 +150,13 @@ internal sealed class HostOptions
             UpstreamUsername = upstreamUsername,
             UpstreamPassword = upstreamPassword,
             StatusFile = Optional(values, "--status-file"),
+            LogFile = logFile,
+            LogMaxMegabytes = logMaxMb,
+            LogRetainedFiles = logRetain,
             StartupTimeout = TimeSpan.FromSeconds(ParsePositiveInt(Optional(values, "--startup-timeout") ?? "120", "--startup-timeout")),
             ConnectTimeout = TimeSpan.FromSeconds(ParsePositiveInt(Optional(values, "--connect-timeout") ?? "20", "--connect-timeout")),
+            SocksHandshakeTimeout = TimeSpan.FromSeconds(ParseBoundedTimeout(values, "--socks-handshake-timeout", 15)),
+            SocksConnectReplyTimeout = TimeSpan.FromSeconds(ParseBoundedTimeout(values, "--socks-connect-reply-timeout", 25)),
             UdpIdleTimeout = TimeSpan.FromSeconds(ParsePositiveInt(Optional(values, "--udp-idle-timeout") ?? "60", "--udp-idle-timeout")),
             ResetEventDebounce = TimeSpan.FromMilliseconds(ParsePositiveInt(Optional(values, "--reset-debounce-ms") ?? "250", "--reset-debounce-ms")),
             ResetCommandFile = Optional(values, "--reset-command-file")
@@ -160,6 +183,16 @@ internal sealed class HostOptions
         return parsed;
     }
 
+    private static int ParseBoundedTimeout(
+        Dictionary<string, List<string>> values, string name, int defaultSeconds)
+    {
+        var seconds = ParsePositiveInt(
+            Optional(values, name) ?? defaultSeconds.ToString(), name);
+        if (seconds > 120)
+            throw new ArgumentException($"{name} must be 1..120 seconds.");
+        return seconds;
+    }
+
     internal static string Usage =>
         """
         netloop --network <hex> --state-dir <dir> --default-exit <managed-ip> [options]
@@ -175,8 +208,13 @@ internal sealed class HostOptions
           --upstream-user <user>      RFC1929 username; requires password
           --upstream-password <pass>  RFC1929 password; requires username
           --status-file <path>        Atomic readiness/status JSON output
+          --log-file <path>           Optional rotating JSONL file (stdout by default)
+          --log-max-mb <MiB>          Maximum file size (default 16, range 1..1024)
+          --log-retain <count>        Retained rotated files (default 5, range 1..50)
           --startup-timeout <sec>     libzt startup timeout (default 120)
           --connect-timeout <sec>     Local/egress connect timeout (default 20)
+          --socks-handshake-timeout <sec> Client SOCKS5 handshake deadline (default 15)
+          --socks-connect-reply-timeout <sec> Upstream CONNECT reply deadline (default 25)
           --udp-idle-timeout <sec>    UDP association idle timeout (default 60)
           --reset-debounce-ms <ms>    Coalesce OS network-change events (default 250)
           --reset-command-file <path> Optional deterministic reset trigger input

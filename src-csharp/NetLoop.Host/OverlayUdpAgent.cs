@@ -20,6 +20,8 @@ internal sealed class OverlayUdpAgent : IAsyncDisposable
     private int _aborted;
     private int _disposed;
 
+    internal Task Completion => _receiveLoop;
+
     internal OverlayUdpAgent(
         IPAddress bindAddress,
         ushort port,

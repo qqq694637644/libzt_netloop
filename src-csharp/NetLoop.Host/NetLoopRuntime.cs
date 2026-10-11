@@ -44,6 +44,35 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
 
     internal IPAddress OverlayBindAddress { get; }
 
+    /// <summary>
+    /// A critical listener task must remain alive until the runtime is
+    /// deliberately stopped. Its unexpected completion marks this runtime
+    /// unhealthy even if the process and status file still say READY.
+    /// </summary>
+    internal async Task WaitForCriticalServiceFailureAsync(CancellationToken cancellationToken)
+    {
+        var listeners = new[] {
+            _localSocks.Completion,
+            _overlayAgent.Completion,
+            _overlayUdpAgent.Completion
+        };
+        var stopped = await Task.WhenAny(listeners).WaitAsync(cancellationToken)
+            .ConfigureAwait(false);
+        var listenerName = ReferenceEquals(stopped, listeners[0])
+            ? "local_socks" : ReferenceEquals(stopped, listeners[1])
+                ? "overlay_tcp" : "overlay_udp";
+        try
+        {
+            await stopped.ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            throw new IOException($"Critical {listenerName} listener failed.", ex);
+        }
+
+        throw new IOException($"Critical {listenerName} listener stopped unexpectedly.");
+    }
+
     internal static async Task<NetLoopRuntime> CreateAsync(
         HostOptions options,
         LibztNetworkState state)
@@ -83,19 +112,23 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
                 options.OverlayPort,
                 libztConnector,
                 loopbackConnector,
-                egressConnector);
+                egressConnector,
+                options.SocksConnectReplyTimeout);
             var overlayRouter = new RoutingConnector(
                 selector,
                 overlayIngress: true,
                 options.OverlayPort,
                 libztConnector,
                 loopbackConnector,
-                egressConnector);
+                egressConnector,
+                options.SocksConnectReplyTimeout);
 
             overlayAgent = new OverlaySocksAgent(
                 overlayBind.ToString(),
                 options.OverlayPort,
-                new Socks5ConnectionHandler(overlayRouter),
+                new Socks5ConnectionHandler(
+                    overlayRouter,
+                    handshakeTimeout: options.SocksHandshakeTimeout),
                 MaxTcpTunnels);
             overlayUdpAgent = new OverlayUdpAgent(
                 overlayBind,
@@ -109,7 +142,8 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
                 new IPEndPoint(options.SocksAddress, options.SocksPort),
                 new Socks5ConnectionHandler(
                     localRouter,
-                    udpAssociations),
+                    udpAssociations,
+                    options.SocksHandshakeTimeout),
                 MaxTcpTunnels);
             localSocks.Start();
 
@@ -232,7 +266,8 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
                 ?? throw new InvalidOperationException("Missing upstream SOCKS5 host."),
                 options.UpstreamPort),
             options.UpstreamUsername,
-            options.UpstreamPassword);
+            options.UpstreamPassword,
+            connectReplyTimeout: options.SocksConnectReplyTimeout);
     }
 
     private static IProxyUdpTransportFactory BuildUdpEgressFactory(HostOptions options)
@@ -248,7 +283,8 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
                 ?? throw new InvalidOperationException("Missing upstream SOCKS5 host."),
                 options.UpstreamPort),
             options.UpstreamUsername,
-            options.UpstreamPassword);
+            options.UpstreamPassword,
+            setupTimeout: options.SocksConnectReplyTimeout);
     }
 
     private static IPAddress SelectOverlayBindAddress(
