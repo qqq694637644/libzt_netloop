@@ -127,41 +127,6 @@ Release ZIP，核验其发布来源及 SHA256；可同时准备应用 ZIP 与
 若升级过程异常，工具尝试从预备快照回退；磁盘损坏等错误无法
 保证自动恢复，需人工查看日志和快照。
 
-## Windows 同机同用户加密备份与文件权限
-
-`identity.secret` 是 ZeroTier Node 的敏感私钥，**不可上传
-GitHub、PR 或公开日志**。只在 NetLoop 已手动停止时执行：
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass `
-  -File .\tools\secure_identity_backup.ps1 -Action Backup `
-  -StateDirectory C:\NetLoop\state `
-  -BackupFile D:\PrivateBackups\zt-identity-20261011.dpapi
-```
-
-此脚本只备份 `identity.secret` 和 `identity.public`，
-不备份或修改整个 ZeroTier native state。密文使用 Windows
-`DPAPI CurrentUser`；文件 ACL 限当前 Windows 用户、SYSTEM
-及本机管理员。不输出原始私钥，也不联网。**只有同台电脑
-同一个 Windows 用户/配置文件通常才能解密**。因此它不是通用的
-跨设备灾难恢复方式，换电脑/换 Windows 用户需要另外设计
-可迁移加密凭证的离线备份，不要误以为 .dpapi 文件可直接迁移。
-
-恢复到空 state 目录（应用先手动关闭）：
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass `
-  -File .\tools\secure_identity_backup.ps1 -Action Restore `
-  -StateDirectory C:\NetLoop\state `
-  -BackupFile D:\PrivateBackups\zt-identity-20261011.dpapi
-```
-
-如果已有身份文件，默认**拒绝覆盖**；只有先单独备份旧身份并
-确认替换目的后，才能加 `-AllowOverwrite`。
-恢复后应手动确认 Node ID 与 Controller 授权记录一致，
-避免把 A 的身份错误地复制到 B/C 机器造成重复身份。
-该脚本不会创建 Windows 服务或自动重启程序。
-
 ## 离线 JSONL 长期探测统计
 
 已有 `tools/connection_probe.ps1` 是独立的、只有用户自己运行时

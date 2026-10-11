@@ -166,8 +166,8 @@ destination-port ACLs, and resource-budget/UDP queue-drop counters.
 poller; the original `per-socket` mode remains the default until real-device
 connection-lifetime testing is available.
 
-For **manual**, offline Windows application upgrades/rollback,
-DPAPI-encrypted identity backups and JSONL probe statistics, see the
+For **manual**, offline Windows application upgrades/rollback
+and JSONL probe statistics, see the
 [operations guide](docs/long-term-operations.md). This project intentionally
 does **not** install a watchdog, Windows service, process auto-restart or
 scheduled background task.
