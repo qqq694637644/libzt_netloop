@@ -4,6 +4,8 @@ namespace NetLoop.Host;
 
 internal static class StatusWriter
 {
+    private static readonly SemaphoreSlim Gate = new(1, 1);
+
     internal static async Task WriteAsync(
         string? path,
         object status,
@@ -17,9 +19,27 @@ internal static class StatusWriter
         if (!string.IsNullOrEmpty(directory))
             Directory.CreateDirectory(directory);
 
-        var temp = fullPath + ".tmp";
-        var json = JsonSerializer.Serialize(status, new JsonSerializerOptions { WriteIndented = true });
-        await File.WriteAllTextAsync(temp, json + Environment.NewLine, cancellationToken).ConfigureAwait(false);
-        File.Move(temp, fullPath, overwrite: true);
+        await Gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        var temp = fullPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try
+        {
+            var json = JsonSerializer.Serialize(
+                status, new JsonSerializerOptions { WriteIndented = true });
+            await File.WriteAllTextAsync(
+                temp, json + Environment.NewLine, cancellationToken)
+                .ConfigureAwait(false);
+            File.Move(temp, fullPath, overwrite: true);
+        }
+        finally
+        {
+            try
+            {
+                File.Delete(temp);
+            }
+            catch (IOException)
+            {
+            }
+            Gate.Release();
+        }
     }
 }

@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Net;
 using NetLoop.Core;
 
 namespace NetLoop.Libzt;
@@ -10,11 +11,13 @@ public sealed class LibztTcpConnection : IProxyConnection, IConnectionTrace
     private readonly object _nativeGate = new();
     private int _fd;
 
-    internal LibztTcpConnection(int fd, string description, string connectionId)
+    internal LibztTcpConnection(
+        int fd, string description, string connectionId, IPEndPoint? remoteEndPoint = null)
     {
         _fd = fd;
         Description = description;
         ConnectionId = connectionId;
+        RemoteEndPoint = remoteEndPoint;
     }
 
     public string Description { get; }
@@ -23,7 +26,7 @@ public sealed class LibztTcpConnection : IProxyConnection, IConnectionTrace
 
     public System.Net.EndPoint? LocalEndPoint => null;
 
-    public System.Net.EndPoint? RemoteEndPoint => null;
+    public System.Net.EndPoint? RemoteEndPoint { get; }
 
     public async ValueTask<int> ReadAsync(
         byte[] buffer,

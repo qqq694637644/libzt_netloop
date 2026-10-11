@@ -146,6 +146,26 @@ internal static class NetLoopRuntimeController
         }
     }
 
+    /// <summary>
+    /// Keep the existing control API's STARTING/READY/STOPPED vocabulary.
+    /// Report transient route or Agent bind degradation as STARTING rather
+    /// than falsely declaring READY, without changing the Binder protocol.
+    /// The current Node/Managed IP remain available for diagnostics.
+    /// </summary>
+    internal static void ReportConfigurationDegraded(
+        ulong nodeId,
+        string primaryOverlayAddress)
+    {
+        lock (Gate)
+        {
+            if (_state == NetLoopPublicState.Stopped)
+                return;
+            _state = NetLoopPublicState.Starting;
+            _nodeId = nodeId.ToString("x10");
+            _primaryOverlayAddress = primaryOverlayAddress;
+        }
+    }
+
     internal static void ReportStopped()
     {
         lock (Gate)

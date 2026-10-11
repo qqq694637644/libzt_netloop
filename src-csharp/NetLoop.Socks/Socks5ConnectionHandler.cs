@@ -11,15 +11,23 @@ public sealed class Socks5ConnectionHandler
     private readonly IProxyConnector _connector;
     private readonly ISocks5UdpAssociationFactory? _udpAssociationFactory;
     private readonly TimeSpan _handshakeTimeout;
+    private readonly Func<ProxyTarget, bool>? _targetAllowed;
+    private readonly int _relayBufferBytes;
 
     public Socks5ConnectionHandler(
         IProxyConnector connector,
         ISocks5UdpAssociationFactory? udpAssociationFactory = null,
-        TimeSpan? handshakeTimeout = null)
+        TimeSpan? handshakeTimeout = null,
+        Func<ProxyTarget, bool>? targetAllowed = null,
+        int relayBufferBytes = ConnectionRelay.BufferSize)
     {
         _connector = connector;
         _udpAssociationFactory = udpAssociationFactory;
         _handshakeTimeout = handshakeTimeout ?? DefaultHandshakeTimeout;
+        _targetAllowed = targetAllowed;
+        _relayBufferBytes = relayBufferBytes;
+        if (_relayBufferBytes < 4096 || _relayBufferBytes > 256 * 1024)
+            throw new ArgumentOutOfRangeException(nameof(relayBufferBytes));
         if (_handshakeTimeout <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(handshakeTimeout));
     }
@@ -67,6 +75,17 @@ public sealed class Socks5ConnectionHandler
         }
 
         var target = parsed.Value.Target;
+        if (_targetAllowed is not null && !_targetAllowed(target))
+        {
+            JsonLog.Info("agent_target_denied", new {
+                connection_id = connectionId,
+                target = target.ToString(),
+                client = client.Description
+            });
+            var denied = Socks5Protocol.BuildReply(Socks5Protocol.ReplyConnectionNotAllowed);
+            await client.WriteAsync(denied, denied.Length, cancellationToken).ConfigureAwait(false);
+            return;
+        }
         // A parsed SOCKS5 request is distinct from the earlier TCP accept
         // event; both carry the same ID on an overlay Agent.
         JsonLog.Info("socks_connect_request", new {
@@ -81,7 +100,8 @@ public sealed class Socks5ConnectionHandler
             remote = await _connector.ConnectAsync(target, cancellationToken).ConfigureAwait(false);
             var success = Socks5Protocol.BuildReply(Socks5Protocol.ReplySucceeded);
             await client.WriteAsync(success, success.Length, cancellationToken).ConfigureAwait(false);
-            await ConnectionRelay.RunAsync(client, remote, cancellationToken).ConfigureAwait(false);
+            await ConnectionRelay.RunAsync(client, remote, cancellationToken, _relayBufferBytes)
+                .ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {

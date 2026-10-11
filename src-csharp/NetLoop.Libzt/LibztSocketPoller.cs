@@ -2,6 +2,11 @@ namespace NetLoop.Libzt;
 
 internal static class LibztSocketPoller
 {
+    private static int _sharedMode;
+    internal static bool SharedMode => Volatile.Read(ref _sharedMode) != 0;
+    internal static void ConfigureShared(bool enabled)
+        => Volatile.Write(ref _sharedMode, enabled ? 1 : 0);
+
     private static readonly TimeSpan RetryDelay =
         TimeSpan.FromMilliseconds(10);
 
@@ -13,6 +18,14 @@ internal static class LibztSocketPoller
         Func<int> currentFdProvider,
         string disposedObjectName)
     {
+        if (SharedMode)
+        {
+            await SharedLibztSocketPoller.WaitAsync(
+                fd, events, cancellationToken, nativeGate,
+                currentFdProvider, disposedObjectName).ConfigureAwait(false);
+            return;
+        }
+
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();

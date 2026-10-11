@@ -115,6 +115,7 @@ public sealed class NetLoopService : Service
         CancellationToken cancellationToken)
     {
         NetLoopRuntimeController.ReportRuntimeStarting();
+        LibztPolling.ConfigureShared(options.LibztPollMode == "shared");
 
         await using var node = new LibztNode(
             options.NetworkId,
@@ -152,7 +153,31 @@ public sealed class NetLoopService : Service
         NetLoopRuntime? runtime = null;
         NetLoopRuntime? activeRuntime = null;
         node.NetworkStateChanged += updated =>
-            Volatile.Read(ref activeRuntime)?.UpdateNetworkState(updated);
+        {
+            var current = Volatile.Read(ref activeRuntime);
+            if (current is null)
+                return;
+
+            current.UpdateNetworkState(updated);
+            if (current.IsHealthy)
+                NetLoopRuntimeController.ReportReady(
+                    current.State.NodeId,
+                    current.OverlayBindAddress.ToString());
+            else
+                NetLoopRuntimeController.ReportConfigurationDegraded(
+                    current.State.NodeId,
+                    current.OverlayBindAddress.ToString());
+        };
+        node.NetworkConfigurationUnavailable += reason =>
+        {
+            var current = Volatile.Read(ref activeRuntime);
+            if (current is null)
+                return;
+            current.MarkNetworkConfigurationUnavailable(reason);
+            NetLoopRuntimeController.ReportConfigurationDegraded(
+                current.State.NodeId,
+                current.OverlayBindAddress.ToString());
+        };
         var resetCount = 0;
 
         try

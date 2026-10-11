@@ -31,6 +31,8 @@ internal static class Program
                     options.LogMaxMegabytes,
                     options.LogRetainedFiles);
 
+            LibztPolling.ConfigureShared(options.LibztPollMode == "shared");
+
             using var shutdown = new CancellationTokenSource();
             ConsoleCancelEventHandler cancelHandler = (_, eventArgs) => {
                 eventArgs.Cancel = true;
@@ -103,6 +105,8 @@ internal static class Program
             // Existing sessions remain attached to the same runtime.
             Volatile.Read(ref activeRuntime)?.UpdateNetworkState(updated);
         };
+        node.NetworkConfigurationUnavailable += reason =>
+            Volatile.Read(ref activeRuntime)?.MarkNetworkConfigurationUnavailable(reason);
 
         var resetCount = 0;
         long? resetStarted = null;
@@ -144,6 +148,10 @@ internal static class Program
         {
             var runtime = await RuntimeRecovery.CreateAsync(
                 node, options, resetCount, shutdownToken).ConfigureAwait(false);
+            using var statusStop = CancellationTokenSource
+                .CreateLinkedTokenSource(shutdownToken);
+            var statusHeartbeat = RunStatusHeartbeatAsync(
+                options, runtime, resetCount, statusStop.Token);
 
             try
             {
@@ -225,6 +233,9 @@ internal static class Program
                     }
                 }
 
+                await statusStop.CancelAsync().ConfigureAwait(false);
+                await statusHeartbeat.ConfigureAwait(false);
+
                 var nextResetCount = checked(resetCount + 1);
                 resetStarted = Stopwatch.GetTimestamp();
                 Volatile.Write(ref resetRuntimeOnNetworkChange, 0);
@@ -274,12 +285,50 @@ internal static class Program
             }
             finally
             {
+                await statusStop.CancelAsync().ConfigureAwait(false);
+                await statusHeartbeat.ConfigureAwait(false);
                 Volatile.Write(ref activeRuntime, null);
                 await runtime.DisposeAsync().ConfigureAwait(false);
             }
         }
 
         return 0;
+    }
+
+    private static async Task RunStatusHeartbeatAsync(
+        HostOptions options,
+        NetLoopRuntime runtime,
+        int resetCount,
+        CancellationToken cancellationToken)
+    {
+        if (options.StatusFile is null)
+            return;
+
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(15));
+        try
+        {
+            while (await timer.WaitForNextTickAsync(cancellationToken)
+                       .ConfigureAwait(false))
+            {
+                try
+                {
+                    await WriteReadyStatusAsync(
+                        options, runtime, resetCount,
+                        null, null, cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                    when (ex is IOException or UnauthorizedAccessException)
+                {
+                    JsonLog.Error("status_heartbeat_write_failed", new {
+                        error_type = ex.GetType().Name,
+                        error = ex.Message
+                    });
+                }
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
     }
 
     private static Task WriteReadyStatusAsync(
@@ -292,7 +341,12 @@ internal static class Program
         => StatusWriter.WriteAsync(
             options.StatusFile,
             new {
-                phase = "ready",
+                phase = runtime.IsHealthy ? "ready" : "degraded",
+                reason = runtime.DegradedReason,
+                updated_at_utc = DateTimeOffset.UtcNow,
+                last_network_query_utc = runtime.State.QueriedAtUtc,
+                network_config_available = runtime.IsNetworkConfigAvailable,
+                overlay_bind_assigned = runtime.IsAgentBindAddressAssigned,
                 network_id = options.NetworkId.ToString("x16"),
                 node_id = runtime.State.NodeId.ToString("x10"),
                 primary_overlay_address =
@@ -311,6 +365,16 @@ internal static class Program
                         metric = route.Metric
                     }).ToArray(),
                 route_generation = runtime.State.Generation,
+                agent_source_acl_enabled = runtime.AccessPolicy.RestrictSources,
+                agent_target_acl_enabled = runtime.AccessPolicy.RestrictTargets,
+                agent_source_denied = runtime.AccessPolicy.RejectedSources,
+                agent_target_denied = runtime.AccessPolicy.RejectedTargets,
+                libzt_poller = LibztPolling.SnapshotMetrics(),
+                udp_queue_dropped = UdpQueueMetrics.Snapshot(),
+                tcp_tunnel_capacity_per_listener = options.MaxTcpTunnels,
+                udp_association_capacity_per_entry = options.MaxUdpAssociations,
+                udp_queue_capacity_per_transport = options.UdpQueueCapacity,
+                relay_buffer_kib = options.RelayBufferKiB,
                 default_exit = options.DefaultExit?.ToString(),
                 egress = options.Egress,
                 reset_count = resetCount,

@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Net;
+using System.Threading.Channels;
 using NetLoop.Core;
 using NetLoop.Libzt;
 using NetLoop.Socks;
@@ -11,9 +12,12 @@ internal sealed class OverlayUdpAgent : IAsyncDisposable
     private readonly LibztUdpSocket _socket;
     private readonly IPAddress _primarySelfAddress;
     private readonly RouteSelector _selector;
+    private readonly AgentAccessPolicy _accessPolicy;
     private readonly IProxyUdpTransportFactory _egressFactory;
     private readonly TimeSpan _idleTimeout;
     private readonly int _maxAssociations;
+    private readonly int _queueCapacity;
+    private readonly TimeSpan _sendTimeout;
     private readonly ConcurrentDictionary<IPEndPoint, OverlayUdpAssociation> _associations = new();
     private readonly CancellationTokenSource _stop = new();
     private readonly Task _receiveLoop;
@@ -28,15 +32,21 @@ internal sealed class OverlayUdpAgent : IAsyncDisposable
         RouteSelector selector,
         IProxyUdpTransportFactory egressFactory,
         int maxAssociations,
-        TimeSpan idleTimeout)
+        TimeSpan idleTimeout,
+        AgentAccessPolicy accessPolicy,
+        int queueCapacity,
+        TimeSpan sendTimeout)
     {
         if (maxAssociations <= 0)
             throw new ArgumentOutOfRangeException(nameof(maxAssociations));
 
         _primarySelfAddress = bindAddress;
         _selector = selector;
+        _accessPolicy = accessPolicy;
         _egressFactory = egressFactory;
         _maxAssociations = maxAssociations;
+        _queueCapacity = queueCapacity;
+        _sendTimeout = sendTimeout;
         _idleTimeout = idleTimeout;
         _socket = LibztUdpSocket.Bind(bindAddress, port);
         _receiveLoop = ReceiveLoopAsync(_stop.Token);
@@ -56,11 +66,29 @@ internal sealed class OverlayUdpAgent : IAsyncDisposable
             while (!cancellationToken.IsCancellationRequested)
             {
                 var datagram = await _socket.ReceiveFromAsync(cancellationToken).ConfigureAwait(false);
+                if (!_accessPolicy.AllowsSource(datagram.RemoteEndPoint.Address))
+                {
+                    JsonLog.Info("agent_source_denied", new {
+                        protocol = "udp",
+                        source = datagram.RemoteEndPoint.ToString()
+                    });
+                    continue;
+                }
                 if (!Socks5UdpPacket.TryParse(datagram.Content, out var packet, out var error))
                 {
                     JsonLog.Info("overlay_udp_packet_dropped", new {
                         source = datagram.RemoteEndPoint.ToString(),
                         error
+                    });
+                    continue;
+                }
+
+                if (!_accessPolicy.AllowsTarget(packet.Target))
+                {
+                    JsonLog.Info("agent_target_denied", new {
+                        protocol = "udp",
+                        source = datagram.RemoteEndPoint.ToString(),
+                        target = packet.Target.ToString()
                     });
                     continue;
                 }
@@ -78,24 +106,15 @@ internal sealed class OverlayUdpAgent : IAsyncDisposable
                     continue;
                 }
 
-                try
+                if (!association.TryEnqueue(packet.Target, packet.Content))
                 {
-                    await association.ForwardAsync(
-                        packet.Target,
-                        packet.Content,
-                        cancellationToken).ConfigureAwait(false);
-                }
-                catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
-                {
-                    JsonLog.Error("overlay_udp_forward_failed", new {
-                        peer = datagram.RemoteEndPoint.ToString(),
+                    UdpQueueMetrics.OverlayForwardDropped();
+                    JsonLog.Info("overlay_udp_queue_drop", new {
+                        source = datagram.RemoteEndPoint.ToString(),
                         target = packet.Target.ToString(),
-                        error_type = ex.GetType().Name,
-                        error = ex.Message
+                        queue_capacity = _queueCapacity,
+                        max_queued_bytes = OverlayUdpAssociation.MaxQueuedBytes
                     });
-
-                    if (TryRemoveAssociation(datagram.RemoteEndPoint, association))
-                        await association.DisposeAsync().ConfigureAwait(false);
                 }
             }
         }
@@ -130,9 +149,11 @@ internal sealed class OverlayUdpAgent : IAsyncDisposable
             peer,
             _primarySelfAddress,
             _selector,
-            new SystemUdpTransport(),
+            new SystemUdpTransport(_queueCapacity),
             _egressFactory,
             _idleTimeout,
+            _queueCapacity,
+            _sendTimeout,
             SendResponseAsync,
             _stop.Token);
 
@@ -244,20 +265,26 @@ internal sealed class OverlayUdpAgent : IAsyncDisposable
 
 internal sealed class OverlayUdpAssociation : IAsyncDisposable
 {
+    internal const int MaxQueuedBytes = 1024 * 1024;
+    private sealed record ForwardItem(ProxyTarget Target, byte[] Content);
     private readonly IPEndPoint _peer;
     private readonly IPAddress _primarySelfAddress;
     private readonly RouteSelector _selector;
     private readonly IProxyUdpTransport _localTransport;
     private readonly IProxyUdpTransportFactory _egressFactory;
     private readonly TimeSpan _idleTimeout;
+    private readonly TimeSpan _sendTimeout;
+    private readonly Channel<ForwardItem> _forwardQueue;
     private readonly Func<IPEndPoint, ProxyUdpDatagram, CancellationToken, ValueTask> _responseSender;
     private readonly CancellationTokenSource _stop;
     private readonly SemaphoreSlim _egressCreateLock = new(1, 1);
     private readonly Task _localReceiveLoop;
     private readonly Task _idleMonitor;
+    private readonly Task _forwardLoop;
     private IProxyUdpTransport? _egressTransport;
     private Task? _egressReceiveLoop;
     private long _lastActivity;
+    private int _queuedBytes;
     private int _aborted;
     private int _disposed;
 
@@ -268,6 +295,8 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
         IProxyUdpTransport localTransport,
         IProxyUdpTransportFactory egressFactory,
         TimeSpan idleTimeout,
+        int queueCapacity,
+        TimeSpan sendTimeout,
         Func<IPEndPoint, ProxyUdpDatagram, CancellationToken, ValueTask> responseSender,
         CancellationToken cancellationToken)
     {
@@ -277,6 +306,14 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
         _localTransport = localTransport;
         _egressFactory = egressFactory;
         _idleTimeout = idleTimeout;
+        _sendTimeout = sendTimeout;
+        _forwardQueue = Channel.CreateBounded<ForwardItem>(
+            new BoundedChannelOptions(queueCapacity) {
+                SingleReader = true,
+                SingleWriter = false,
+                FullMode = BoundedChannelFullMode.Wait,
+                AllowSynchronousContinuations = false
+            });
         _responseSender = responseSender;
         _stop = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         _lastActivity = Environment.TickCount64;
@@ -287,10 +324,64 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
         _idleMonitor = RunGuardedAsync(
             IdleMonitorAsync,
             "overlay_udp_idle_monitor_failed");
-        Completion = Task.WhenAll(_localReceiveLoop, _idleMonitor);
+        _forwardLoop = RunGuardedAsync(
+            ForwardQueuedAsync,
+            "overlay_udp_forward_failed");
+        Completion = Task.WhenAll(_localReceiveLoop, _idleMonitor, _forwardLoop);
     }
 
     internal Task Completion { get; }
+
+    internal bool TryEnqueue(ProxyTarget target, ReadOnlyMemory<byte> content)
+    {
+        if (_stop.IsCancellationRequested || content.Length > MaxQueuedBytes)
+            return false;
+
+        var bytes = content.Length;
+        while (true)
+        {
+            var queued = Volatile.Read(ref _queuedBytes);
+            if (queued + bytes > MaxQueuedBytes)
+                return false;
+            if (Interlocked.CompareExchange(
+                    ref _queuedBytes, queued + bytes, queued) == queued)
+                break;
+        }
+
+        if (!_forwardQueue.Writer.TryWrite(new ForwardItem(target, content.ToArray())))
+        {
+            Interlocked.Add(ref _queuedBytes, -bytes);
+            return false;
+        }
+
+        Touch();
+        return true;
+    }
+
+    private async Task ForwardQueuedAsync(CancellationToken cancellationToken)
+    {
+        await foreach (var item in _forwardQueue.Reader
+                           .ReadAllAsync(cancellationToken).ConfigureAwait(false))
+        {
+            Interlocked.Add(ref _queuedBytes, -item.Content.Length);
+            using var deadline =
+                CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            deadline.CancelAfter(_sendTimeout);
+            try
+            {
+                await ForwardAsync(item.Target, item.Content, deadline.Token)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+                when (!cancellationToken.IsCancellationRequested
+                      && deadline.IsCancellationRequested)
+            {
+                throw new TimeoutException(
+                    $"Overlay UDP forwarding to {item.Target} exceeded "
+                    + $"{_sendTimeout.TotalSeconds:0.#} seconds.");
+            }
+        }
+    }
 
     internal async ValueTask ForwardAsync(
         ProxyTarget target,
@@ -464,6 +555,7 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
             return;
 
         _stop.Cancel();
+        _forwardQueue.Writer.TryComplete();
         _ = DisposeTransportNoThrowAsync(_localTransport);
         if (_egressTransport is { } egressTransport)
             _ = DisposeTransportNoThrowAsync(egressTransport);

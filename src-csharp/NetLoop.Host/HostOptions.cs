@@ -1,4 +1,5 @@
 using System.Net;
+using NetLoop.Core;
 using NetLoop.Socks;
 
 namespace NetLoop.Host;
@@ -12,6 +13,8 @@ internal sealed class HostOptions
             "--socks-port",
             "--overlay-port",
             "--overlay-udp-port",
+            "--agent-allow-source",
+            "--agent-allow-target-port",
             "--default-exit",
             "--egress",
             "--upstream-host",
@@ -26,6 +29,12 @@ internal sealed class HostOptions
             "--connect-timeout",
             "--socks-handshake-timeout",
             "--socks-connect-reply-timeout",
+            "--max-tcp-tunnels",
+            "--max-udp-associations",
+            "--relay-buffer-kib",
+            "--udp-queue-capacity",
+            "--udp-send-timeout",
+            "--libzt-poll-mode",
             "--udp-idle-timeout",
             "--reset-debounce-ms",
             "--reset-command-file"
@@ -38,6 +47,8 @@ internal sealed class HostOptions
     internal ushort SocksPort { get; init; } = 1080;
     internal ushort OverlayPort { get; init; } = 42042;
     internal ushort OverlayUdpPort { get; init; } = 42043;
+    internal IReadOnlyList<OverlayPrefix> AgentAllowedSources { get; init; } = [];
+    internal IReadOnlyList<AgentAccessPolicy.PortRange> AgentAllowedTargetPorts { get; init; } = [];
     internal IPAddress? DefaultExit { get; init; }
     internal string Egress { get; init; } = "direct";
     internal string? UpstreamHost { get; init; }
@@ -53,6 +64,12 @@ internal sealed class HostOptions
     internal TimeSpan SocksHandshakeTimeout { get; init; } = TimeSpan.FromSeconds(15);
     internal TimeSpan SocksConnectReplyTimeout { get; init; } = TimeSpan.FromSeconds(25);
     internal TimeSpan UdpIdleTimeout { get; init; } = TimeSpan.FromSeconds(60);
+    internal int MaxTcpTunnels { get; init; } = 128;
+    internal int MaxUdpAssociations { get; init; } = 64;
+    internal int RelayBufferKiB { get; init; } = 64;
+    internal int UdpQueueCapacity { get; init; } = 256;
+    internal TimeSpan UdpSendTimeout { get; init; } = TimeSpan.FromSeconds(30);
+    internal string LibztPollMode { get; init; } = "per-socket";
     internal TimeSpan ResetEventDebounce { get; init; } = TimeSpan.FromMilliseconds(250);
     internal string? ResetCommandFile { get; init; }
     internal bool ShowHelp { get; init; }
@@ -83,7 +100,7 @@ internal sealed class HostOptions
             {
                 values[key] = list = [];
             }
-            else
+            else if (key is not ("--agent-allow-source" or "--agent-allow-target-port"))
             {
                 throw new ArgumentException($"Duplicate option: {key}");
             }
@@ -130,6 +147,9 @@ internal sealed class HostOptions
             Socks5Credentials.Validate(upstreamUsername, upstreamPassword);
 
         var logFile = Optional(values, "--log-file");
+        var pollMode = Optional(values, "--libzt-poll-mode") ?? "per-socket";
+        if (pollMode is not ("per-socket" or "shared"))
+            throw new ArgumentException("--libzt-poll-mode must be per-socket or shared.");
         var logMaxMb = ParsePositiveInt(Optional(values, "--log-max-mb") ?? "16", "--log-max-mb");
         var logRetain = ParsePositiveInt(Optional(values, "--log-retain") ?? "5", "--log-retain");
         if (logFile is null && (values.ContainsKey("--log-max-mb") || values.ContainsKey("--log-retain")))
@@ -143,6 +163,10 @@ internal sealed class HostOptions
             SocksPort = ParsePort(Optional(values, "--socks-port") ?? "1080", "--socks-port"),
             OverlayPort = ParsePort(Optional(values, "--overlay-port") ?? "42042", "--overlay-port"),
             OverlayUdpPort = ParsePort(Optional(values, "--overlay-udp-port") ?? "42043", "--overlay-udp-port"),
+            AgentAllowedSources = values.GetValueOrDefault("--agent-allow-source")?
+                .Select(AgentAccessPolicy.ParseSource).ToArray() ?? [],
+            AgentAllowedTargetPorts = values.GetValueOrDefault("--agent-allow-target-port")?
+                .Select(AgentAccessPolicy.ParsePortRange).ToArray() ?? [],
             DefaultExit = defaultExit,
             Egress = egress,
             UpstreamHost = upstreamHost,
@@ -158,6 +182,13 @@ internal sealed class HostOptions
             SocksHandshakeTimeout = TimeSpan.FromSeconds(ParseBoundedTimeout(values, "--socks-handshake-timeout", 15)),
             SocksConnectReplyTimeout = TimeSpan.FromSeconds(ParseBoundedTimeout(values, "--socks-connect-reply-timeout", 25)),
             UdpIdleTimeout = TimeSpan.FromSeconds(ParsePositiveInt(Optional(values, "--udp-idle-timeout") ?? "60", "--udp-idle-timeout")),
+            MaxTcpTunnels = ParseBoundedInt(values, "--max-tcp-tunnels", 128, 1, 1024),
+            MaxUdpAssociations = ParseBoundedInt(values, "--max-udp-associations", 64, 1, 512),
+            RelayBufferKiB = ParseBoundedInt(values, "--relay-buffer-kib", 64, 4, 256),
+            UdpQueueCapacity = ParseBoundedInt(values, "--udp-queue-capacity", 256, 16, 4096),
+            UdpSendTimeout = TimeSpan.FromSeconds(
+                ParseBoundedInt(values, "--udp-send-timeout", 30, 1, 120)),
+            LibztPollMode = pollMode,
             ResetEventDebounce = TimeSpan.FromMilliseconds(ParsePositiveInt(Optional(values, "--reset-debounce-ms") ?? "250", "--reset-debounce-ms")),
             ResetCommandFile = Optional(values, "--reset-command-file")
         };
@@ -193,6 +224,17 @@ internal sealed class HostOptions
         return seconds;
     }
 
+    private static int ParseBoundedInt(
+        Dictionary<string, List<string>> values,
+        string name, int defaultValue, int minValue, int maxValue)
+    {
+        var parsed = ParsePositiveInt(
+            Optional(values, name) ?? defaultValue.ToString(), name);
+        if (parsed < minValue || parsed > maxValue)
+            throw new ArgumentException($"{name} must be {minValue}..{maxValue}.");
+        return parsed;
+    }
+
     internal static string Usage =>
         """
         netloop --network <hex> --state-dir <dir> --default-exit <managed-ip> [options]
@@ -201,6 +243,8 @@ internal sealed class HostOptions
           --socks-port <port>         Local SOCKS5 port (default 1080)
           --overlay-port <port>       NetLoop peer Agent TCP port (default 42042)
           --overlay-udp-port <port>   NetLoop peer Agent UDP port (default 42043)
+          --agent-allow-source <IP/CIDR> Repeatable inbound Agent source ACL (default all network members)
+          --agent-allow-target-port <PORT|START-END> Repeatable Agent destination port ACL
           --default-exit <managed-ip> Required primary Managed IP of default egress peer
           --egress <mode>             direct | upstream-socks5 (default direct)
           --upstream-host <host>      Upstream SOCKS5 host
@@ -215,6 +259,12 @@ internal sealed class HostOptions
           --connect-timeout <sec>     Local/egress connect timeout (default 20)
           --socks-handshake-timeout <sec> Client SOCKS5 handshake deadline (default 15)
           --socks-connect-reply-timeout <sec> Upstream CONNECT reply deadline (default 25)
+          --max-tcp-tunnels <count>   Per-listener TCP connection cap (default 128; 1..1024)
+          --max-udp-associations <count> Per-entry UDP association cap (default 64; 1..512)
+          --relay-buffer-kib <KiB>   Buffer per relay direction (default 64; 4..256)
+          --udp-queue-capacity <count> Per-transport UDP receive queue cap (default 256; 16..4096)
+          --udp-send-timeout <sec>   Overlay UDP per-datagram forwarding deadline (default 30; 1..120)
+          --libzt-poll-mode <mode>   per-socket (default) | shared (opt-in, requires validation)
           --udp-idle-timeout <sec>    UDP association idle timeout (default 60)
           --reset-debounce-ms <ms>    Coalesce OS network-change events (default 250)
           --reset-command-file <path> Optional deterministic reset trigger input

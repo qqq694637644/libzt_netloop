@@ -7,6 +7,7 @@ namespace NetLoop.Libzt;
 
 public sealed class LibztNode : IAsyncDisposable
 {
+    private static readonly TimeSpan NetworkRevalidationInterval = TimeSpan.FromSeconds(30);
     private readonly ulong _networkId;
     private readonly string _stateDirectory;
     private readonly TimeSpan _startupTimeout;
@@ -25,6 +26,7 @@ public sealed class LibztNode : IAsyncDisposable
     private Task? _networkConfigWorker;
     private LibztNetworkState? _state;
     private long _stateGeneration;
+    private int _configAvailable;
     private bool _started;
     private bool _freed;
 
@@ -39,6 +41,7 @@ public sealed class LibztNode : IAsyncDisposable
     public ulong NetworkId => _networkId;
 
     public LibztNetworkState? State => Volatile.Read(ref _state);
+    public bool NetworkConfigurationAvailable => Volatile.Read(ref _configAvailable) != 0;
 
     /// <summary>
     /// Raised on the background config worker, never from the native event
@@ -46,6 +49,13 @@ public sealed class LibztNode : IAsyncDisposable
     /// the Node or abort existing connections.
     /// </summary>
     public event Action<LibztNetworkState>? NetworkStateChanged;
+
+    /// <summary>
+    /// The ZeroTier core cannot currently supply a complete configuration.
+    /// Keep the last verified state for diagnostics, but callers must fail
+    /// closed for new routing decisions until the next successful query.
+    /// </summary>
+    public event Action<string>? NetworkConfigurationUnavailable;
 
     public async Task<LibztNetworkState> StartAsync(CancellationToken cancellationToken)
     {
@@ -88,9 +98,18 @@ public sealed class LibztNode : IAsyncDisposable
 
         lock (_stateSync)
         {
-            var state = QueryNetworkState();
-            Volatile.Write(ref _state, state);
-            return state;
+            try
+            {
+                var state = QueryNetworkState();
+                Volatile.Write(ref _state, state);
+                Volatile.Write(ref _configAvailable, 1);
+                return state;
+            }
+            catch
+            {
+                Volatile.Write(ref _configAvailable, 0);
+                throw;
+            }
         }
     }
 
@@ -160,9 +179,21 @@ public sealed class LibztNode : IAsyncDisposable
         LibztNetworkState state;
         while (true)
         {
-            state = RefreshNetworkState();
-            if (state.ManagedAddresses.Count != 0)
-                break;
+            token.ThrowIfCancellationRequested();
+            try
+            {
+                state = RefreshNetworkState();
+                if (state.ManagedAddresses.Count != 0)
+                    break;
+            }
+            catch (LibztException ex)
+                when (ex.ApiResult == LibztNative.ErrNoResult
+                      && !token.IsCancellationRequested)
+            {
+                // The transport can report readiness just before the native
+                // network configuration appears in core. Do not treat this
+                // transient state as a permanent startup failure.
+            }
 
             await Task.Delay(100, token).ConfigureAwait(false);
         }
@@ -212,7 +243,8 @@ public sealed class LibztNode : IAsyncDisposable
     {
         var count = LibztNative.CoreQueryAddressCount(_networkId);
         if (count == LibztNative.ErrNoResult)
-            return [];
+            throw new LibztException(
+                "zts_core_query_addr_count(network unavailable)", count);
         if (count < 0)
             throw new LibztException("zts_core_query_addr_count", count);
 
@@ -250,7 +282,8 @@ public sealed class LibztNode : IAsyncDisposable
     {
         var count = LibztNative.CoreQueryRouteCount(_networkId);
         if (count == LibztNative.ErrNoResult)
-            return [];
+            throw new LibztException(
+                "zts_core_query_route_count(network unavailable)", count);
         if (count < 0)
             throw new LibztException("zts_core_query_route_count", count);
 
@@ -301,9 +334,27 @@ public sealed class LibztNode : IAsyncDisposable
     {
         try
         {
-            await foreach (var eventCode in _networkConfigEvents.Reader
-                               .ReadAllAsync(cancellationToken).ConfigureAwait(false))
+            while (!cancellationToken.IsCancellationRequested)
             {
+                short? eventCode = null;
+                using (var heartbeat = CancellationTokenSource
+                           .CreateLinkedTokenSource(cancellationToken))
+                {
+                    heartbeat.CancelAfter(NetworkRevalidationInterval);
+                    try
+                    {
+                        eventCode = await _networkConfigEvents.Reader
+                            .ReadAsync(heartbeat.Token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                        when (!cancellationToken.IsCancellationRequested
+                              && heartbeat.IsCancellationRequested)
+                    {
+                        // Periodic native snapshot revalidation also detects
+                        // a controller state disappearing without an event.
+                    }
+                }
+
                 try
                 {
                     // Native libzt callbacks must not acquire the core lock:
@@ -315,7 +366,9 @@ public sealed class LibztNode : IAsyncDisposable
                     JsonLog.Info("libzt_network_config_refreshed", new {
                         network = _networkId.ToString("x16"),
                         event_code = eventCode,
+                        source = eventCode is null ? "periodic" : "native_event",
                         generation = state.Generation,
+                        queried_at_utc = state.QueriedAtUtc,
                         assigned_addresses = state.ManagedAddresses.Select(
                             static x => x.ToString()).ToArray(),
                         assigned_prefixes = state.AssignedPrefixes.Select(
@@ -340,6 +393,16 @@ public sealed class LibztNode : IAsyncDisposable
                         error_type = ex.GetType().Name,
                         error = ex.Message
                     });
+                    try
+                    {
+                        NetworkConfigurationUnavailable?.Invoke(ex.Message);
+                    }
+                    catch (Exception notificationError)
+                    {
+                        JsonLog.Error("libzt_network_config_unavailable_callback_failed", new {
+                            error = notificationError.Message
+                        });
+                    }
                 }
             }
         }

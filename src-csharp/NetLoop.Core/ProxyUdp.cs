@@ -24,10 +24,18 @@ public interface IProxyUdpTransportFactory
 
 public sealed class DirectUdpTransportFactory : IProxyUdpTransportFactory
 {
+    private readonly int _queueCapacity;
+
+    public DirectUdpTransportFactory(int queueCapacity = 256)
+    {
+        _queueCapacity = queueCapacity;
+    }
+
     public ValueTask<IProxyUdpTransport> CreateAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return ValueTask.FromResult<IProxyUdpTransport>(new SystemUdpTransport());
+        return ValueTask.FromResult<IProxyUdpTransport>(
+            new SystemUdpTransport(_queueCapacity));
     }
 }
 
@@ -40,19 +48,22 @@ public sealed class SystemUdpTransport : IProxyUdpTransport
     private readonly UdpClient _ipv4;
     private readonly UdpClient _ipv6;
     private readonly ConcurrentDictionary<IPEndPoint, long> _destinations = new();
-    private readonly Channel<ProxyUdpDatagram> _received = Channel.CreateBounded<ProxyUdpDatagram>(
-        new BoundedChannelOptions(ReceiveQueueCapacity) {
-            SingleReader = false,
-            SingleWriter = false,
-            AllowSynchronousContinuations = false,
-            FullMode = BoundedChannelFullMode.DropOldest
-        });
+    private readonly Channel<ProxyUdpDatagram> _received;
     private readonly CancellationTokenSource _stop = new();
     private readonly Task[] _receiveLoops;
     private int _disposed;
 
-    public SystemUdpTransport()
+    public SystemUdpTransport(int queueCapacity = ReceiveQueueCapacity)
     {
+        if (queueCapacity is < 16 or > 4096)
+            throw new ArgumentOutOfRangeException(nameof(queueCapacity));
+        _received = Channel.CreateBounded<ProxyUdpDatagram>(
+            new BoundedChannelOptions(queueCapacity) {
+                SingleReader = false,
+                SingleWriter = false,
+                AllowSynchronousContinuations = false,
+                FullMode = BoundedChannelFullMode.Wait
+            });
         _ipv4 = new UdpClient(new IPEndPoint(IPAddress.Any, 0));
         _ipv6 = new UdpClient(new IPEndPoint(IPAddress.IPv6Any, 0));
         _receiveLoops = [
@@ -98,13 +109,15 @@ public sealed class SystemUdpTransport : IProxyUdpTransport
                 }
 
                 _destinations[result.RemoteEndPoint] = Environment.TickCount64;
-                await _received.Writer.WriteAsync(
+                if (!_received.Writer.TryWrite(
                     new ProxyUdpDatagram(
                         new ProxyTarget(
                             result.RemoteEndPoint.Address.ToString(),
                             checked((ushort)result.RemoteEndPoint.Port)),
-                        result.Buffer),
-                    cancellationToken).ConfigureAwait(false);
+                        result.Buffer)))
+                {
+                    UdpQueueMetrics.SystemReceiveDropped();
+                }
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)

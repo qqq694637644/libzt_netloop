@@ -90,7 +90,9 @@ public sealed class OverlayNetworkSnapshot
         IEnumerable<ManagedOverlayRoute> managedRoutes)
     {
         PrimarySelfAddress = primarySelfAddress;
-        _selfAddresses = new HashSet<IPAddress>(selfAddresses) { primarySelfAddress };
+        // A previously bound listener address must not silently remain a
+        // valid local target after the controller revokes that Managed IP.
+        _selfAddresses = new HashSet<IPAddress>(selfAddresses);
         _assignedPrefixes = assignedPrefixes.Distinct().ToArray();
         _managedRoutes = managedRoutes.ToArray();
     }
@@ -152,6 +154,7 @@ public sealed class RouteSelector
 {
     private OverlayNetworkSnapshot _network;
     private readonly IPAddress _defaultExit;
+    private int _configAvailable = 1;
 
     public RouteSelector(OverlayNetworkSnapshot network, IPAddress defaultExit)
     {
@@ -160,13 +163,27 @@ public sealed class RouteSelector
     }
 
     public void UpdateNetwork(OverlayNetworkSnapshot network)
-        => Volatile.Write(ref _network, network);
+    {
+        Volatile.Write(ref _network, network);
+        Volatile.Write(ref _configAvailable, 1);
+    }
+
+    public void MarkNetworkUnavailable()
+        => Volatile.Write(ref _configAvailable, 0);
+
+    public bool NetworkAvailable => Volatile.Read(ref _configAvailable) != 0;
 
     public RouteDecision Select(ProxyTarget target, bool overlayIngress)
     {
         // One atomic snapshot per new decision; no in-place mutation of the
         // route table and no disruption to already-established TCP tunnels.
         var network = Volatile.Read(ref _network);
+        if (!NetworkAvailable)
+        {
+            return new RouteDecision(
+                RouteKind.Reject, null,
+                "ZeroTier network configuration unavailable; refusing unverified routes");
+        }
         if (target.TryGetIPAddress(out var address))
         {
             if (network.IsSelf(address))

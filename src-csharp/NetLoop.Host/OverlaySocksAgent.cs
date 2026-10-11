@@ -8,8 +8,10 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
 {
     private readonly LibztTcpListener _listener;
     private readonly Socks5ConnectionHandler _handler;
+    private readonly AgentAccessPolicy _accessPolicy;
     private readonly SemaphoreSlim _capacity;
     private readonly CancellationTokenSource _stop = new();
+    private readonly CancellationTokenSource _acceptStop;
     private readonly object _clientsGate = new();
     private readonly HashSet<Task> _clients = [];
     private readonly HashSet<LibztTcpConnection> _activeClients = [];
@@ -23,12 +25,15 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
         string bindAddress,
         ushort port,
         Socks5ConnectionHandler handler,
-        int maxConnections)
+        int maxConnections,
+        AgentAccessPolicy accessPolicy)
     {
         _handler = handler;
+        _accessPolicy = accessPolicy;
         _capacity = new SemaphoreSlim(maxConnections, maxConnections);
         _listener = LibztTcpListener.Start(bindAddress, port, maxConnections);
-        _loop = AcceptLoopAsync(_stop.Token);
+        _acceptStop = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token);
+        _loop = AcceptLoopAsync(_acceptStop.Token);
     }
 
     private async Task AcceptLoopAsync(CancellationToken cancellationToken)
@@ -62,6 +67,18 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
             }
 
             consecutiveFailures = 0;
+            var source = (connection.RemoteEndPoint as System.Net.IPEndPoint)?.Address;
+            if (!_accessPolicy.AllowsSource(source))
+            {
+                JsonLog.Info("agent_source_denied", new {
+                    protocol = "tcp",
+                    connection_id = connection.ConnectionId,
+                    source = connection.RemoteEndPoint?.ToString()
+                });
+                await connection.DisposeAsync().ConfigureAwait(false);
+                continue;
+            }
+
             if (!await _capacity.WaitAsync(0, cancellationToken).ConfigureAwait(false))
             {
                 JsonLog.Info("tcp_accept_rejected", new {
@@ -75,7 +92,10 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
 
             lock (_clientsGate)
                 _activeClients.Add(connection);
-            TrackClient(HandleClientAsync(connection, cancellationToken), connection);
+            // Accept can be stopped when the Controller reassigns our
+            // Managed IP, but existing TCP sessions must keep their original
+            // runtime lifetime until they close naturally.
+            TrackClient(HandleClientAsync(connection, _stop.Token), connection);
         }
     }
 
@@ -137,13 +157,36 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
             return;
 
         _stop.Cancel();
-        _ = _listener.DisposeAsync();
+        StopAccepting();
 
         LibztTcpConnection[] activeClients;
         lock (_clientsGate)
             activeClients = [.. _activeClients];
         foreach (var connection in activeClients)
             _ = connection.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Retire the old listening IP without canceling already accepted TCP
+    /// connections. The caller may start a replacement Agent on a new IP.
+    /// </summary>
+    internal void StopAccepting()
+    {
+        if (!_acceptStop.IsCancellationRequested)
+            _acceptStop.Cancel();
+        _ = _listener.DisposeAsync();
+    }
+
+    internal async Task DrainAndDisposeAsync()
+    {
+        StopAccepting();
+        await _loop.ConfigureAwait(false);
+        Task[] clients;
+        lock (_clientsGate)
+            clients = [.. _clients];
+        if (clients.Length != 0)
+            await Task.WhenAll(clients).ConfigureAwait(false);
+        await DisposeAsync().ConfigureAwait(false);
     }
 
     public async ValueTask DisposeAsync()
@@ -168,6 +211,7 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
             await Task.WhenAll(activeClients).ConfigureAwait(false);
 
         _stop.Dispose();
+        _acceptStop.Dispose();
         _capacity.Dispose();
     }
 }
