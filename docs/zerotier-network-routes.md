@@ -78,17 +78,28 @@ native 回调只向容量为 1 的队列发送通知，不直接加 native core 
 连续多次控制器更新可合并，最终查询的是**最新完整快照**。
 
 Windows/Linux Host 和 Android Service 都订阅了此事件。
-它们不会因为 `219` 或地址/路由更新而触发 NetLoop reset、
+每 30 秒还会重新核验一次完整网络配置。原生 count 查询返回
+`ErrNoResult`（native 网络条目不存在）不再发布一份误导性的空
+Managed Routes。遇到查询失败，保留最近一份快照供诊断，同时
+新路由判定**拒绝**，不会偷用旧 CIDR 或回退 B；配置恢复后才
+重新开放新请求。
+
+仅仅更新路由时，不会触发 NetLoop reset、
 重启 libzt、关闭 SOCKS5 listener 或强制断开已有 TCP。
 新连接根据更新后的快照选路；已有 TCP 连接继续使用现有 socket。
 **物理网络变化引起的原有 runtime reset 逻辑保持不变**，
 不能将这两类事件混为一谈。
 
 若 Controller 撤销了当前 Agent listener 所绑定的 Managed IP，
-运行时发出 `overlay_bind_address_no_longer_assigned`。
-当前不会在保持旧 TCP session 的同时热迁移监听地址；
-这类真正的地址变更需要另外设计平滑监听器迁移。当前版本
-只保证正常的**路由配置变化**不破坏既有连接。
+运行时发出 `overlay_bind_address_no_longer_assigned`，优先在
+新的 Managed IP 上创建 TCP/UDP listener，再退役旧 TCP listener，
+让已接受的 TCP 会话尽量自然结束。旧 UDP association 会被终止；
+为了限制地址快速变化导致的资源积累，最多保留 16 个退役 TCP
+Agent，超过上限会主动中断最早的旧会话。
+若新 IP 监听器绑定失败则记录 `overlay_bind_migration_failed`、
+将状态标记为 `degraded` 并在后续配置刷新时重新尝试，**不重启
+libzt Node**。未获 Controller 授权的旧本机 IP 也不会继续被判断成
+`LocalLoopback`。
 
 ## 如何检查
 
@@ -101,7 +112,9 @@ Windows/Linux Host 和 Android Service 都订阅了此事件。
 - `route_decision`：访问远端 Managed IP 时应为 `OverlayPeer`，
   而不是错误的 `DefaultExit`
 - `libzt_network_config_refresh_failed`：原生配置查询失败；
-  此时保留上一份有效路由表，而不是推测新的网段
+  保留旧快照仅用于诊断，新路由一律 `Reject`，不静默兜底
+- `overlay_bind_migrated` / `overlay_bind_migration_failed`：
+  Agent IP 替换结果与已连接 TCP 的处理
 
 在 B/C 的 Agent 日志中可用
 `tcp_accept_completed` 和 `socks_connect_request`

@@ -30,7 +30,7 @@ Each runtime chooses one **primary overlay address** for its peer TCP/UDP listen
 
 Controller **direct** routes (no `via` gateway) allow direct peer Agent forwarding. More-specific routes with a `via` gateway are **rejected explicitly**: the NetLoop Agent SOCKS5 protocol does not implement ZeroTier gateway/multihop routing. ZeroTier `/0` default routes are not treated as Overlay Peer networks; ordinary internet traffic still uses the configured NetLoop default exit. Missing Controller prefixes are never guessed. This behavior includes IPv6. Desktop SOCKS always binds to loopback; `--socks-host` is intentionally unsupported.
 
-Only the primary Managed IP is bound for the NetLoop TCP/UDP Agent listeners. A configuration update that revokes that listener IP is logged as `overlay_bind_address_no_longer_assigned`; it cannot transparently move an existing listening socket to a different IP without rebinding. Existing TCP sessions are not aborted by **route-only** configuration updates. See [dynamic ZeroTier routing](docs/zerotier-network-routes.md).
+Only the current primary Managed IP is bound for new NetLoop TCP/UDP Agent connections. If the Controller revokes that address and grants a replacement, the runtime binds replacement Agent listeners first, retires the old TCP acceptor and **drains its established TCP sessions** without restarting libzt. Existing UDP associations on the revoked address are closed; old TCP sessions can be aborted when the 16-retired-listener safety limit is exceeded. **Route-only** configuration updates do not interrupt existing TCP. See [dynamic ZeroTier routing](docs/zerotier-network-routes.md).
 
 ## Peer P2P / relay diagnostics
 
@@ -157,6 +157,20 @@ Logging uses a bounded asynchronous queue. If overloaded, look for
 `json_log_records_dropped`. See the
 [long-running reliability guide](docs/reliability-hardening.md) for
 recovery limitations, event names, and parameter details.
+
+Further PR #3 hardening includes 30-second native Controller config
+revalidation (new routing rejects requests while configuration is missing),
+15-second health/status-file updates, opt-in inbound Agent source-IP/CIDR and
+destination-port ACLs, and resource-budget/UDP queue-drop counters.
+`--libzt-poll-mode shared` is an **experimental opt-in** batched socket
+poller; the original `per-socket` mode remains the default until real-device
+connection-lifetime testing is available.
+
+For **manual**, offline Windows application upgrades/rollback,
+DPAPI-encrypted identity backups and JSONL probe statistics, see the
+[operations guide](docs/long-term-operations.md). This project intentionally
+does **not** install a watchdog, Windows service, process auto-restart or
+scheduled background task.
 
 Desktop builds are orchestrated by:
 

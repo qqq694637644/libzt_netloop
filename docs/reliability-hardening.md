@@ -45,10 +45,9 @@ Overlay TCP accept 连续失败 30 次（每次间隔约 100ms）也视作
 时写入 `phase=degraded`、`attempt` 与 `max_attempts`。
 重建成功写 `runtime_creation_recovered` 以及新的 ready 状态。
 
-永久配置错误不应无限重试；12 次仍不能恢复则向进程管理器上报
-失败。Windows 7×24 小时运行需要额外的**进程守护和失败重启**
-（例如 Windows 服务管理器的恢复策略）。本 PR 不添加不受限的
-自动重启循环，也不要求删除原来的 ZeroTier state 文件。
+永久配置错误不应无限重试；12 次仍不能恢复则记录终态错误并退出。
+**按用户要求，不提供 Windows 服务、进程守护、自动重启或任务计划。**
+需要人工诊断后手动重新启动程序；不要求删除 ZeroTier state 文件。
 
 `netloop_ready` 仅意味着监听器已成功建立，**不是** C 端 RDP、
 B 端 Web 或互联网出口已通过端到端探测。
@@ -90,14 +89,28 @@ manifest 对应的 libzt submodule SHA、CMake、build script、
 编译成功不能代替真实节点上 A→B / A→C 的新建 TCP 与旧 TCP
 会话保活验证。
 
-## 后续阶段（暂不在本 PR 修改）
+## PR #3 的第二、第三、第四阶段
 
-- 10ms libzt polling 的 CPU、线程及长连接性能调优；
-- TCP Keepalive 策略和 750ms Peer negotiation 优化；
-- Managed IP 撤销时的平滑监听地址迁移；
-- Controller 路由快照新鲜度、需要 via 的 Managed Route；
-- UDP queue drop 指标、限速与独立转发队列；
-- Overlay Agent 的成员/端口 ACL 和线上指标采集。
+第二阶段实现：30 秒周期性 native Controller 配置核验、查询失败
+`Reject`（而非空路由或 B 兜底）、监听地址撤销后的 Agent 热迁移、
+15 秒 status-file 心跳、可选来源 CIDR / 目标 TCP/UDP 端口 ACL。
+来源 ACL 基于 ZeroTier socket 已呈现的来源 IP，**不是独立的
+ZeroTier Node ID 加密认证**；不能用它选择 Overlay 路由。
+
+第三阶段实现：可配置 TCP / UDP association 容量、relay 缓冲大小、
+UDP 接收队列、单包发送时限、每个 UDP 远端独立的有界队列
+（最多 1MiB，满时直接丢弃新包）、`udp_queue_dropped` 计数器。
+默认 `--libzt-poll-mode per-socket` 不变；`shared` 使用 native
+多 FD 批量 poll，但**尚未完成真实设备上 socket 保活及切网实测**，
+因此仅作试验选项。不要盲目把容量提升到最大值。
+
+第四阶段实现：手动 ZIP 应用升级/回滚、同机同账户 DPAPI
+身份加密备份与权限收紧、离线 JSONL 探测日志的小时/72h/7天统计。
+**没有自动升级、后台守护、Windows 服务、计划任务。**
+参见 [运维工具文档](long-term-operations.md)。
+
+仍然没有依据调整的参数：10ms poll 周期、TCP Keepalive、
+750ms/3秒 Peer negotiation 窗口。
 
 建议先按 72 小时、7 天两个时间窗口观察，并配合独立 PowerShell
 connection probe；避免多个高风险参数同时调整。
