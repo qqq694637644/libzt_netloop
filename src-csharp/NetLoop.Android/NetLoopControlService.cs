@@ -109,18 +109,15 @@ public sealed class NetLoopControlService : Service
 
         var networkId = data.GetString("network_id") ?? string.Empty;
         var defaultExit = data.GetString("default_exit") ?? string.Empty;
-        var peerValues = data.GetStringArrayList("peers");
-        var peers = peerValues is null
-            ? Array.Empty<string>()
-            : peerValues
-                .Where(static value => value is not null)
-                .Select(static value => value!)
-                .ToArray();
+        if (data.ContainsKey("peers"))
+        {
+            ReplyError(message, "START no longer supports 'peers'; remove it from the request.");
+            return;
+        }
 
         var config = ControlledRuntimeConfig.Parse(
             networkId,
-            defaultExit,
-            peers);
+            defaultExit);
         var result = NetLoopRuntimeController.StartControlled(this, config);
         if (!result.Success)
         {

@@ -240,10 +240,6 @@ internal static class Program
                 overlay_udp_port = options.OverlayUdpPort,
                 socks_host = options.SocksAddress.ToString(),
                 socks_port = options.SocksPort,
-                peers = runtime.Peers
-                    .Select(static address => address.ToString())
-                    .Order()
-                    .ToArray(),
                 assigned_prefixes = runtime.State.AssignedPrefixes
                     .Select(static prefix => prefix.ToString()).ToArray(),
                 managed_routes = runtime.State.ManagedRoutes

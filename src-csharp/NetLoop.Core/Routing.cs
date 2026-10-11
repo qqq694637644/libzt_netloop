@@ -80,7 +80,6 @@ public sealed record ManagedOverlayRoute(
 public sealed class OverlayNetworkSnapshot
 {
     private readonly HashSet<IPAddress> _selfAddresses;
-    private readonly HashSet<IPAddress> _explicitPeers;
     private readonly OverlayPrefix[] _assignedPrefixes;
     private readonly ManagedOverlayRoute[] _managedRoutes;
 
@@ -88,12 +87,10 @@ public sealed class OverlayNetworkSnapshot
         IPAddress primarySelfAddress,
         IEnumerable<IPAddress> selfAddresses,
         IEnumerable<OverlayPrefix> assignedPrefixes,
-        IEnumerable<ManagedOverlayRoute> managedRoutes,
-        IEnumerable<IPAddress> explicitPeers)
+        IEnumerable<ManagedOverlayRoute> managedRoutes)
     {
         PrimarySelfAddress = primarySelfAddress;
         _selfAddresses = new HashSet<IPAddress>(selfAddresses) { primarySelfAddress };
-        _explicitPeers = new HashSet<IPAddress>(explicitPeers);
         _assignedPrefixes = assignedPrefixes.Distinct().ToArray();
         _managedRoutes = managedRoutes.ToArray();
     }
@@ -102,9 +99,6 @@ public sealed class OverlayNetworkSnapshot
 
     public bool IsSelf(IPAddress address)
         => _selfAddresses.Contains(address);
-
-    public bool IsExplicitPeer(IPAddress address)
-        => _explicitPeers.Contains(address);
 
     /// <summary>
     /// Longest-prefix match, including gateway routes that must not be mistaken
@@ -178,16 +172,6 @@ public sealed class RouteSelector
             if (network.IsSelf(address))
                 return new RouteDecision(RouteKind.LocalLoopback, null, "target is a local ZeroTier managed IP");
 
-            // Explicit --peer and --default-exit remain compatible; they are
-            // not the only way of discovering a remote Overlay Peer.
-            if (network.IsExplicitPeer(address) || address.Equals(_defaultExit))
-            {
-                if (overlayIngress)
-                    return new RouteDecision(RouteKind.Reject, null, "overlay ingress cannot transit to another overlay node");
-
-                return new RouteDecision(RouteKind.OverlayPeer, address, "target is an explicitly configured overlay peer");
-            }
-
             var match = network.FindOverlayRoute(address);
             if (match.Matches)
             {
@@ -202,6 +186,14 @@ public sealed class RouteSelector
 
                 return new RouteDecision(RouteKind.OverlayPeer, address, $"target matches ZeroTier direct route {match.Prefix}");
             }
+
+            // The default-exit setting is not a substitute for the
+            // Controller's routing data when addressing that peer itself.
+            if (address.Equals(_defaultExit))
+                return new RouteDecision(
+                    RouteKind.Reject,
+                    null,
+                    "configured default exit has no matching ZeroTier direct route");
         }
 
         if (overlayIngress)

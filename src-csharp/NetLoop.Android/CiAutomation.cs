@@ -148,15 +148,9 @@ internal static class CiAutomationOptions
             "--egress", "direct"
         };
 
-        var peers = intent.GetStringExtra("peers") ?? string.Empty;
-        foreach (var peer in peers.Split(
-                     [',', ';', ' ', '\t', '\r', '\n'],
-                     StringSplitOptions.RemoveEmptyEntries
-                     | StringSplitOptions.TrimEntries))
-        {
-            args.Add("--peer");
-            args.Add(peer);
-        }
+        if (intent.HasExtra("peers"))
+            throw new InvalidOperationException(
+                "CI start no longer supports 'peers'; remove it from the intent.");
 
         return HostOptions.Parse(args.ToArray());
     }

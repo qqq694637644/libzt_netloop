@@ -27,10 +27,15 @@ Controller 版本的地址和路由。Android 和 Windows/Linux 的 native
 | 目标 | 新连接行为 |
 | --- | --- |
 | 本机任一 Managed IP | 本机 loopback 服务（IPv4/IPv6） |
-| 显式 `--peer` 或默认出口 Agent 地址 | 访问对应 Agent，兼容已有配置 |
 | 匹配 Controller 下发的本地直连前缀 / Managed Route（无 `via`） | 直接访问目标 IP 的 NetLoop Agent `:42042` / UDP Agent `:42043` |
 | 匹配需要 `via` 的 Managed Route | **明确拒绝**；不转给 B，不猜测网关上有 NetLoop Agent |
-| 其他目标 | 使用配置的默认出口 B（出口节点使用自身 egress） |
+| 默认出口 B 的 Managed IP 却不匹配有效直连路由 | **明确拒绝**；不会依靠出口配置绕过 Controller 路由 |
+| 其他非 Overlay 目标 | 使用配置的默认出口 B（出口节点使用自身 egress） |
+
+**破坏性变更：`--peer` 已彻底移除**。旧 CLI 带这个参数将报
+`Unknown option: --peer`，必须从启动脚本删除。Android 受控 START 的
+`peers` 字段同样移除，继续传递会收到明确的控制协议错误。
+`default_exit` 仍负责非 Overlay 请求的出口选择，但不能用作直连路由兜底。
 
 优先选择**最长匹配前缀**；相同长度时，Controller 的显式
 Managed Route 优先于从本机地址生成的直连前缀。

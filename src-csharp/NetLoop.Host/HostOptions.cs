@@ -12,7 +12,6 @@ internal sealed class HostOptions
             "--socks-port",
             "--overlay-port",
             "--overlay-udp-port",
-            "--peer",
             "--default-exit",
             "--egress",
             "--upstream-host",
@@ -35,7 +34,6 @@ internal sealed class HostOptions
     internal ushort OverlayPort { get; init; } = 42042;
     internal ushort OverlayUdpPort { get; init; } = 42043;
     internal IPAddress? DefaultExit { get; init; }
-    internal IReadOnlyList<IPAddress> Peers { get; init; } = [];
     internal string Egress { get; init; } = "direct";
     internal string? UpstreamHost { get; init; }
     internal ushort UpstreamPort { get; init; } = 1080;
@@ -75,7 +73,7 @@ internal sealed class HostOptions
             {
                 values[key] = list = [];
             }
-            else if (key != "--peer")
+            else
             {
                 throw new ArgumentException($"Duplicate option: {key}");
             }
@@ -91,8 +89,6 @@ internal sealed class HostOptions
         var stateDirectory = Required(values, "--state-dir");
         var networkId = Convert.ToUInt64(networkText, 16);
 
-        var peerValues = Values(values, "--peer");
-        var peers = peerValues.Select(IPAddress.Parse).Distinct().ToArray();
         var defaultExit = IPAddress.Parse(Required(values, "--default-exit"));
 
         var egress = Optional(values, "--egress") ?? "direct";
@@ -130,7 +126,6 @@ internal sealed class HostOptions
             OverlayPort = ParsePort(Optional(values, "--overlay-port") ?? "42042", "--overlay-port"),
             OverlayUdpPort = ParsePort(Optional(values, "--overlay-udp-port") ?? "42043", "--overlay-udp-port"),
             DefaultExit = defaultExit,
-            Peers = peers,
             Egress = egress,
             UpstreamHost = upstreamHost,
             UpstreamPort = ParsePort(Optional(values, "--upstream-port") ?? "1080", "--upstream-port"),
@@ -150,9 +145,6 @@ internal sealed class HostOptions
 
     private static string? Optional(Dictionary<string, List<string>> values, string key)
         => values.TryGetValue(key, out var list) && list.Count != 0 ? list[^1] : null;
-
-    private static IReadOnlyList<string> Values(Dictionary<string, List<string>> values, string key)
-        => values.TryGetValue(key, out var list) ? list : [];
 
     private static ushort ParsePort(string value, string name)
     {
@@ -176,7 +168,6 @@ internal sealed class HostOptions
           --socks-port <port>         Local SOCKS5 port (default 1080)
           --overlay-port <port>       NetLoop peer Agent TCP port (default 42042)
           --overlay-udp-port <port>   NetLoop peer Agent UDP port (default 42043)
-          --peer <managed-ip>         Optional explicit peer Agent override; repeatable
           --default-exit <managed-ip> Required primary Managed IP of default egress peer
           --egress <mode>             direct | upstream-socks5 (default direct)
           --upstream-host <host>      Upstream SOCKS5 host

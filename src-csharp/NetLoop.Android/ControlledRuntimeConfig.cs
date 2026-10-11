@@ -9,24 +9,19 @@ internal sealed class ControlledRuntimeConfig
 {
     private ControlledRuntimeConfig(
         ulong networkId,
-        IPAddress defaultExit,
-        IReadOnlyList<IPAddress> peers)
+        IPAddress defaultExit)
     {
         NetworkId = networkId;
         DefaultExit = defaultExit;
-        Peers = peers;
     }
 
     internal ulong NetworkId { get; }
 
     internal IPAddress DefaultExit { get; }
 
-    internal IReadOnlyList<IPAddress> Peers { get; }
-
     internal static ControlledRuntimeConfig Parse(
         string networkIdText,
-        string defaultExitText,
-        IEnumerable<string> peerTexts)
+        string defaultExitText)
     {
         var networkText = networkIdText.Trim();
         if (networkText.Length == 0
@@ -46,34 +41,7 @@ internal sealed class ControlledRuntimeConfig
                 "Invalid NetLoop default exit Managed IP.");
         }
 
-        var peers = new HashSet<IPAddress>();
-        foreach (var value in peerTexts)
-        {
-            var text = value.Trim();
-            if (text.Length == 0)
-                continue;
-
-            if (!IPAddress.TryParse(text, out var peer))
-            {
-                throw new InvalidOperationException(
-                    $"Invalid NetLoop direct peer Managed IP: {text}");
-            }
-
-            if (peer.Equals(defaultExit))
-            {
-                throw new InvalidOperationException(
-                    "NetLoop direct peers must not repeat default_exit.");
-            }
-
-            peers.Add(peer);
-        }
-
-        return new ControlledRuntimeConfig(
-            networkId,
-            defaultExit,
-            peers
-                .OrderBy(AddressSortKey, StringComparer.Ordinal)
-                .ToArray());
+        return new ControlledRuntimeConfig(networkId, defaultExit);
     }
 
     internal HostOptions BuildRuntimeOptions(Context context)
@@ -84,7 +52,6 @@ internal sealed class ControlledRuntimeConfig
             OverlayPort = 42042,
             OverlayUdpPort = 42043,
             DefaultExit = DefaultExit,
-            Peers = Peers,
             Egress = "direct",
             UpstreamHost = null,
             UpstreamPort = 1080,
@@ -97,17 +64,6 @@ internal sealed class ControlledRuntimeConfig
         };
 
     internal bool IsEquivalentTo(ControlledRuntimeConfig other)
-    {
-        if (NetworkId != other.NetworkId
-            || !DefaultExit.Equals(other.DefaultExit)
-            || Peers.Count != other.Peers.Count)
-        {
-            return false;
-        }
-
-        return Peers.SequenceEqual(other.Peers);
-    }
-
-    private static string AddressSortKey(IPAddress address)
-        => $"{(int)address.AddressFamily:D4}:{Convert.ToHexString(address.GetAddressBytes())}";
+        => NetworkId == other.NetworkId
+           && DefaultExit.Equals(other.DefaultExit);
 }

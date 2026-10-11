@@ -77,11 +77,12 @@ IPv4 默认映射到 127.0.0.1，IPv6 默认映射到 ::1。后续可以提供�
 
 一个 Node 可能同时得到多个 Managed IP。TCP/UDP Agent 仍选择一个
 deterministic primary overlay address（优先数值最小的 IPv4，否则 IPv6）。
-访问其他节点时，RouteSelector 根据 **ZeroTier Controller 下发的分配
-地址前缀与 Managed Routes** 判断直连网段，不再要求每个 peer 都显式
-列在 `--peer`。`default_exit` 仍是必填项，远端时自动成为已知 Agent；
-`--peer` 保留向后兼容的显式覆盖。本机所有 Managed IP 都作为本机目标，
-但 Agent 监听器仍只绑定 primary IP。
+访问其他节点时，RouteSelector **只根据 ZeroTier Controller 下发的分配
+地址前缀与 Managed Routes** 判断直连网段，不维护手工 peer 列表。
+`--peer` 参数已删除且旧参数会被拒绝，**没有兼容兜底**。
+`default_exit` 仍是非 Overlay 流量的必填出口配置，但不会作为
+直连 Peer 的额外路由来源。本机所有 Managed IP 都作为本机目标，
+Agent 监听器仍只绑定 primary IP。
 
 ## 5. 统一出网
 
@@ -114,7 +115,7 @@ deterministic primary overlay address（优先数值最小的 IPv4，否则 IPv6
     8.8.8.8:443       -> default_exit B -> Internet
 
 其中访问 C 的示例要求 Controller 确实分配了可匹配的直连网段、
-且 C 运行 NetLoop Agent；不再要求把 C 显式配置到 `--peer`。
+且 C 运行 NetLoop Agent；不存在手工 `--peer` 配置入口。
 `/0` 不用于 Peer 识别，公网请求仍走 NetLoop default_exit B。
 
 ### 5.1 域名解析
@@ -311,7 +312,6 @@ Android：使用 .NET for Android，长期运行 Node 使用 foreground service�
     socks.port = 1080
     overlay.tcp_port = 42042
     overlay.udp_port = 42043
-    routing.peers = 172.26.0.20,172.26.0.30
     routing.default_exit = 172.26.0.254
     egress.mode = direct | upstream_socks5
     reset.event_debounce_ms = 250
@@ -447,14 +447,15 @@ C# native libzt 构建所需要的第三方源码、最小 CMake 入口和补丁
    跨平台协议/E2E 测试冻结。
 6. Managed IP 是 Node 身份和逻辑服务地址，不是 OS 虚拟网卡。
 7. 非 Overlay 目标默认走统一出口。
-8. 不访问远端 LAN，因此不引入 CIDR 路由系统。
+8. 不访问远端 LAN；仅从 ZeroTier Controller 配置读取 CIDR 和 Managed Routes，
+   用于 NetLoop Agent 的直接路由判断，不修改系统路由。
 9. 平台差异限制在 Native/Host 层。
 10. 个人使用优先：简单、可诊断、可恢复，比企业级抽象更重要。
 
 ## 23. 已冻结的实现决策
 
 以下列出当前决策。`23.2` 已随 PR #2 的 Controller 动态路由功能
-更新，取代早期只使用显式 `--peer` 的限制。
+更新，彻底移除旧的显式 Peer 列表模型。
 
 ### 23.1 Toolchain 与原生基线
 
@@ -478,8 +479,9 @@ C# native libzt 构建所需要的第三方源码、最小 CMake 入口和补丁
   相同长度的 Controller 显式路由优先。
 - 需要 `via` gateway 的 Managed Route 暂不支持多跳，明确拒绝，
   不把网段内地址假定为 Agent，也不转给 default_exit。
-- `/0` 不被识别为直连 peer 网段；非本机的 `default_exit` 自动加入
-  已知 Agent。`--peer` 仅用于显式兼容覆盖，不再是路由发现的唯一方式。
+- `/0` 不被识别为直连 Peer 网段，`default_exit` 只负责非 Overlay
+  流量的出口选择，**不能替代 Controller 直连路由**。
+  `--peer` 已删除，旧 CLI 参数明确报错，Android START 的 `peers` 字段也拒绝。
 - Overlay Agent 收到请求后是最终处理节点：本机 Managed IP 访问 loopback；
   非 overlay 目标执行本机 egress；**不得再次转发给第三个 NetLoop 节点**。
 - 本机 `default_exit == primary` 时，非 overlay 目标直接执行本机 egress，不经 libzt self-connect。
