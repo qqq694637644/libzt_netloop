@@ -1,5 +1,6 @@
 using System.Net;
 using System.Runtime.InteropServices;
+using System.Threading.Channels;
 using NetLoop.Core;
 
 namespace NetLoop.Libzt;
@@ -12,6 +13,18 @@ public sealed class LibztNode : IAsyncDisposable
     private readonly LibztNative.EventCallback _eventCallback;
     private readonly TaskCompletionSource _nodeUp = new(
         TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly object _stateSync = new();
+    private readonly CancellationTokenSource _networkConfigStop = new();
+    private readonly Channel<short> _networkConfigEvents = Channel.CreateBounded<short>(
+        new BoundedChannelOptions(1) {
+            SingleReader = true,
+            SingleWriter = false,
+            AllowSynchronousContinuations = false,
+            FullMode = BoundedChannelFullMode.DropOldest
+        });
+    private Task? _networkConfigWorker;
+    private LibztNetworkState? _state;
+    private long _stateGeneration;
     private bool _started;
     private bool _freed;
 
@@ -25,7 +38,14 @@ public sealed class LibztNode : IAsyncDisposable
 
     public ulong NetworkId => _networkId;
 
-    public LibztNetworkState? State { get; private set; }
+    public LibztNetworkState? State => Volatile.Read(ref _state);
+
+    /// <summary>
+    /// Raised on the background config worker, never from the native event
+    /// callback. Listeners should atomically swap routing snapshots, not reset
+    /// the Node or abort existing connections.
+    /// </summary>
+    public event Action<LibztNetworkState>? NetworkStateChanged;
 
     public async Task<LibztNetworkState> StartAsync(CancellationToken cancellationToken)
     {
@@ -45,16 +65,17 @@ public sealed class LibztNode : IAsyncDisposable
         ThrowIfError("zts_init_from_storage", LibztNative.InitFromStorage(_stateDirectory));
         ThrowIfError("zts_init_allow_peer_cache", LibztNative.InitAllowPeerCache(0));
         ThrowIfError("zts_init_set_event_handler", LibztNative.InitSetEventHandler(_eventCallback));
-        ThrowIfError("zts_node_start", LibztNative.NodeStart());
-        Volatile.Write(ref _started, true);
-
+        _networkConfigWorker = Task.Run(
+            () => ProcessNetworkConfigEventsAsync(_networkConfigStop.Token));
         try
         {
-            State = await JoinAndWaitAsync(cancellationToken).ConfigureAwait(false);
-            return State;
+            ThrowIfError("zts_node_start", LibztNative.NodeStart());
+            Volatile.Write(ref _started, true);
+            return await JoinAndWaitAsync(cancellationToken).ConfigureAwait(false);
         }
         catch
         {
+            await StopNetworkConfigWorkerAsync().ConfigureAwait(false);
             TryStop();
             throw;
         }
@@ -65,8 +86,12 @@ public sealed class LibztNode : IAsyncDisposable
         if (!_started)
             throw new InvalidOperationException("libzt node has not been started.");
 
-        State = QueryNetworkState();
-        return State;
+        lock (_stateSync)
+        {
+            var state = QueryNetworkState();
+            Volatile.Write(ref _state, state);
+            return state;
+        }
     }
 
     public void NotifyPhysicalNetworkChanged()
@@ -135,7 +160,7 @@ public sealed class LibztNode : IAsyncDisposable
         LibztNetworkState state;
         while (true)
         {
-            state = QueryNetworkState();
+            state = RefreshNetworkState();
             if (state.ManagedAddresses.Count != 0)
                 break;
 
@@ -146,7 +171,16 @@ public sealed class LibztNode : IAsyncDisposable
             network = _networkId.ToString("x16"),
             node = state.NodeId.ToString("x10"),
             node_online = LibztNative.NodeIsOnline() == 1,
-            addresses = state.ManagedAddresses.Select(static x => x.ToString()).ToArray()
+            addresses = state.ManagedAddresses.Select(static x => x.ToString()).ToArray(),
+            assigned_prefixes = state.AssignedPrefixes.Select(static x => x.ToString()).ToArray(),
+            managed_routes = state.ManagedRoutes.Select(
+                static x => new {
+                    target = x.Target.ToString(),
+                    via = x.Via?.ToString(),
+                    flags = x.Flags,
+                    metric = x.Metric
+                }).ToArray(),
+            generation = state.Generation
         });
         return state;
     }
@@ -157,10 +191,14 @@ public sealed class LibztNode : IAsyncDisposable
         try
         {
             var addresses = QueryAddresses();
+            var routes = QueryRoutes();
             return new LibztNetworkState(
                 _networkId,
                 LibztNative.NodeGetId(),
-                addresses);
+                addresses.Select(static x => x.Address).ToArray(),
+                addresses.Select(static x => x.Prefix).Distinct().ToArray(),
+                routes,
+                ++_stateGeneration);
         }
         finally
         {
@@ -170,26 +208,34 @@ public sealed class LibztNode : IAsyncDisposable
         }
     }
 
-    private IReadOnlyList<IPAddress> QueryAddresses()
+    private IReadOnlyList<(IPAddress Address, OverlayPrefix Prefix)> QueryAddresses()
     {
         var count = LibztNative.CoreQueryAddressCount(_networkId);
+        if (count == LibztNative.ErrNoResult)
+            return [];
         if (count < 0)
             throw new LibztException("zts_core_query_addr_count", count);
 
-        var result = new List<IPAddress>(count);
-        var buffer = Marshal.AllocHGlobal(LibztNative.IpStringLength);
+        var result = new List<(IPAddress, OverlayPrefix)>(count);
+        var buffer = Marshal.AllocHGlobal(LibztNative.CidrStringLength);
         try
         {
             for (var index = 0; index < count; index++)
             {
-                ZeroBuffer(buffer, LibztNative.IpStringLength);
+                ZeroBuffer(buffer, LibztNative.CidrStringLength);
                 ThrowIfError(
-                    "zts_core_query_addr",
-                    LibztNative.CoreQueryAddress(_networkId, index, buffer, LibztNative.IpStringLength));
+                    "zts_netloop_query_addr_cidr",
+                    LibztNative.CoreQueryAddressCidr(
+                        _networkId, (uint)index, buffer, LibztNative.CidrStringLength));
 
-                var value = Marshal.PtrToStringAnsi(buffer);
-                if (!string.IsNullOrWhiteSpace(value) && IPAddress.TryParse(value, out var address))
-                    result.Add(address);
+                var value = Marshal.PtrToStringAnsi(buffer)
+                    ?? throw new InvalidOperationException("libzt returned no assigned address");
+                var separator = value.LastIndexOf('/');
+                if (separator <= 0
+                    || !IPAddress.TryParse(value[..separator], out var address))
+                    throw new FormatException($"Invalid ZeroTier assigned CIDR address: {value}");
+
+                result.Add((address, OverlayPrefix.Parse(value)));
             }
         }
         finally
@@ -198,6 +244,128 @@ public sealed class LibztNode : IAsyncDisposable
         }
 
         return result;
+    }
+
+    private IReadOnlyList<ManagedOverlayRoute> QueryRoutes()
+    {
+        var count = LibztNative.CoreQueryRouteCount(_networkId);
+        if (count == LibztNative.ErrNoResult)
+            return [];
+        if (count < 0)
+            throw new LibztException("zts_core_query_route_count", count);
+
+        var routes = new List<ManagedOverlayRoute>(count);
+        var targetBuffer = Marshal.AllocHGlobal(LibztNative.CidrStringLength);
+        var viaBuffer = Marshal.AllocHGlobal(LibztNative.CidrStringLength);
+        try
+        {
+            for (var index = 0; index < count; index++)
+            {
+                ZeroBuffer(targetBuffer, LibztNative.CidrStringLength);
+                ZeroBuffer(viaBuffer, LibztNative.CidrStringLength);
+                ThrowIfError(
+                    "zts_netloop_query_route_cidr",
+                    LibztNative.CoreQueryRouteCidr(
+                        _networkId, (uint)index,
+                        targetBuffer, viaBuffer, LibztNative.CidrStringLength,
+                        out var flags, out var metric));
+
+                var target = Marshal.PtrToStringAnsi(targetBuffer)
+                    ?? throw new InvalidOperationException("libzt returned no route target");
+                var viaText = Marshal.PtrToStringAnsi(viaBuffer);
+                IPAddress? via = null;
+                if (!string.IsNullOrWhiteSpace(viaText))
+                {
+                    via = IPAddress.Parse(viaText);
+                    if (via.Equals(IPAddress.Any) || via.Equals(IPAddress.IPv6Any))
+                        via = null;
+                }
+
+                routes.Add(new ManagedOverlayRoute(
+                    OverlayPrefix.Parse(target),
+                    via,
+                    flags,
+                    metric));
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(targetBuffer);
+            Marshal.FreeHGlobal(viaBuffer);
+        }
+
+        return routes;
+    }
+
+    private async Task ProcessNetworkConfigEventsAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await foreach (var eventCode in _networkConfigEvents.Reader
+                               .ReadAllAsync(cancellationToken).ConfigureAwait(false))
+            {
+                try
+                {
+                    // Native libzt callbacks must not acquire the core lock:
+                    // the config is queried only from this dedicated worker.
+                    while (State is null)
+                        await Task.Delay(50, cancellationToken).ConfigureAwait(false);
+
+                    var state = RefreshNetworkState();
+                    JsonLog.Info("libzt_network_config_refreshed", new {
+                        network = _networkId.ToString("x16"),
+                        event_code = eventCode,
+                        generation = state.Generation,
+                        assigned_addresses = state.ManagedAddresses.Select(
+                            static x => x.ToString()).ToArray(),
+                        assigned_prefixes = state.AssignedPrefixes.Select(
+                            static x => x.ToString()).ToArray(),
+                        routes = state.ManagedRoutes.Select(static x => new {
+                            target = x.Target.ToString(),
+                            via = x.Via?.ToString(),
+                            flags = x.Flags,
+                            metric = x.Metric
+                        }).ToArray()
+                    });
+                    NetworkStateChanged?.Invoke(state);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    JsonLog.Error("libzt_network_config_refresh_failed", new {
+                        event_code = eventCode,
+                        error_type = ex.GetType().Name,
+                        error = ex.Message
+                    });
+                }
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+    }
+
+    private static bool IsNetworkConfigEvent(short eventCode)
+        => eventCode is LibztNative.EventNetworkOk
+            or LibztNative.EventNetworkReadyIp4
+            or LibztNative.EventNetworkReadyIp6
+            or LibztNative.EventNetworkUpdate
+            or LibztNative.EventRouteAdded
+            or LibztNative.EventRouteRemoved
+            or LibztNative.EventAddressAddedIp4
+            or LibztNative.EventAddressRemovedIp4
+            or LibztNative.EventAddressAddedIp6
+            or LibztNative.EventAddressRemovedIp6;
+
+    private async Task StopNetworkConfigWorkerAsync()
+    {
+        _networkConfigStop.Cancel();
+        _networkConfigEvents.Writer.TryComplete();
+        if (_networkConfigWorker is not null)
+            await _networkConfigWorker.ConfigureAwait(false);
     }
 
     private static unsafe void ZeroBuffer(nint buffer, int length)
@@ -252,6 +420,11 @@ public sealed class LibztNode : IAsyncDisposable
                     new LibztException(
                         "libzt node initialization fatal event",
                         LibztNative.ErrService));
+
+            if (IsNetworkConfigEvent(native.EventCode)
+                && (native.Network == 0
+                    || unchecked((ulong)Marshal.ReadInt64(native.Network)) == _networkId))
+                _networkConfigEvents.Writer.TryWrite(native.EventCode);
         }
         catch (Exception ex)
         {
@@ -276,8 +449,9 @@ public sealed class LibztNode : IAsyncDisposable
         }
     }
 
-    public ValueTask DisposeAsync()
+    public async ValueTask DisposeAsync()
     {
+        await StopNetworkConfigWorkerAsync().ConfigureAwait(false);
         TryStop();
 
         if (!_freed)
@@ -288,6 +462,6 @@ public sealed class LibztNode : IAsyncDisposable
                 JsonLog.Error("libzt_node_free_failed", new { api_rc = result });
         }
 
-        return ValueTask.CompletedTask;
+        _networkConfigStop.Dispose();
     }
 }

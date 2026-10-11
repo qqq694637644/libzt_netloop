@@ -146,9 +146,6 @@ Enabled          [ on/off ]
 Network ID       8056c2e21c000001
 Default Exit     172.26.0.254
 
-Advanced
-  Direct Peers   172.26.0.20, 172.26.0.30
-
 Status           Ready
 Node             abcdef1234
 Managed IP       172.26.0.10
@@ -161,14 +158,13 @@ For the first version:
 - NetLoop state directory is internal to the NetLoop app.
 - overlay TCP/UDP ports keep their existing defaults.
 - `networkId` and `defaultExit` are required.
-- `peers` is optional and contains only additional nodes whose primary Managed IP must be reachable directly.
 - `defaultExit` is required on every node; the exit node sets it to its own primary Managed IP.
-- a remote `defaultExit` is automatically included in NetLoop's effective peer set; do not duplicate it in `peers`.
-- `peers` is directional: A -> C requires C's primary Managed IP in A's
-  `peers`; C -> A separately requires A in C's `peers`. With an empty
-  `peers` list, a node can directly address only itself and its configured
-  default exit.
-- do not add peer discovery, topology sync, or a controller-side peer database.
+- Direct Overlay Peer routing comes exclusively from the ZeroTier Controller's
+  assigned CIDR prefixes and direct Managed Routes; the UI does not expose a
+  manual peer list.
+- The removed `peers` START field is rejected rather than silently ignored.
+- Do not add a separate peer discovery database; NetLoop uses native libzt's
+  current Controller network configuration.
 
 Normal operation:
 
@@ -182,7 +178,7 @@ status = GET_STATUS
 if status.api_version != CONTROL_API_VERSION:
     fail
 
-start_status = START(api_version, network_id, default_exit, optional peers)
+start_status = START(api_version, network_id, default_exit)
 
 if START reports "stop before changing configuration":
     fail and require the normal Disconnect -> Connect lifecycle
@@ -210,8 +206,8 @@ START itself is also frozen:
 - READY/STARTING + START with a different configuration -> reject with
   "stop before changing configuration".
 
-Configuration equality compares only the v1 controlled fields:
-`network_id`, `default_exit`, and the normalized optional `peers` set.
+Configuration equality compares only the controlled fields:
+`network_id` and `default_exit`.
 No hot reload or implicit STOP/START is performed.
 
 Production Android has no standalone runtime path. Every production runtime is
@@ -290,9 +286,10 @@ Suggested minimal START content:
 }
 ```
 
-An optional `peers` array may be added for additional explicit direct overlay
-peers. It may also be omitted or empty. `default_exit` is effective
-automatically when it is remote and must not be repeated in this array.
+The old `peers` array is **no longer supported**. START rejects its presence,
+even when empty. Remote direct Overlay targets are resolved from the current
+ZeroTier Controller network configuration; `default_exit` only selects the
+egress node for non-Overlay traffic.
 
 The request `api_version` must equal `CONTROL_API_VERSION`; otherwise reject
 START immediately. Do not add compatibility layers for multiple historical
@@ -403,7 +400,7 @@ The control service should run in the same `:netloop` process so it can observe 
 
 v2rayNG is the user-facing source of truth.
 
-NetLoop does not persist controlled `network_id`, `default_exit`, or `peers`.
+NetLoop does not persist controlled `network_id` or `default_exit`.
 Every bind/rebind follows GET_STATUS -> START(full desired config). If the
 `:netloop` process dies, the in-memory configuration dies with it and v2rayNG
 supplies the desired configuration again.

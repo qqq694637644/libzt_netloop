@@ -16,30 +16,31 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
     private readonly OverlaySocksAgent _overlayAgent;
     private readonly OverlayUdpAgent _overlayUdpAgent;
     private readonly LocalSocksServer _localSocks;
+    private readonly RouteSelector _selector;
+    private readonly object _routeUpdateSync = new();
+    private LibztNetworkState _state;
     private int _aborted;
     private int _disposed;
 
     private NetLoopRuntime(
         LibztNetworkState state,
-        HashSet<IPAddress> peers,
         IPAddress overlayBindAddress,
+        RouteSelector selector,
         Socks5UdpAssociationFactory udpAssociationFactory,
         OverlaySocksAgent overlayAgent,
         OverlayUdpAgent overlayUdpAgent,
         LocalSocksServer localSocks)
     {
-        State = state;
-        Peers = peers;
+        _state = state;
         OverlayBindAddress = overlayBindAddress;
+        _selector = selector;
         _udpAssociationFactory = udpAssociationFactory;
         _overlayAgent = overlayAgent;
         _overlayUdpAgent = overlayUdpAgent;
         _localSocks = localSocks;
     }
 
-    internal LibztNetworkState State { get; }
-
-    internal IReadOnlyCollection<IPAddress> Peers { get; }
+    internal LibztNetworkState State => Volatile.Read(ref _state);
 
     internal IPAddress OverlayBindAddress { get; }
 
@@ -51,15 +52,8 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
         ValidateConfiguredOverlayAddresses(options, state.ManagedAddresses, overlayBind);
         var defaultExit = options.DefaultExit
             ?? throw new InvalidOperationException("Default exit is required.");
-        var peers = options.Peers.ToHashSet();
-        if (!overlayBind.Equals(defaultExit))
-        {
-            peers.Add(defaultExit);
-        }
 
-        var snapshot = new OverlayNetworkSnapshot(
-            overlayBind,
-            peers);
+        var snapshot = BuildNetworkSnapshot(state, overlayBind);
         var selector = new RouteSelector(snapshot, defaultExit);
 
         var libztConnector = new LibztTcpConnector(PeerConnectTimeout);
@@ -121,8 +115,8 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
 
             return new NetLoopRuntime(
                 state,
-                peers,
                 overlayBind,
+                selector,
                 udpAssociations,
                 overlayAgent,
                 overlayUdpAgent,
@@ -141,6 +135,62 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
             throw;
         }
     }
+
+    /// <summary>
+    /// Replaces only the routing table. Existing TCP handlers retain their
+    /// connected streams and no native listener or ZeroTier Node is restarted.
+    /// </summary>
+    internal void UpdateNetworkState(LibztNetworkState updated)
+    {
+        lock (_routeUpdateSync)
+        {
+            var previous = State;
+            if (Volatile.Read(ref _disposed) != 0
+                || updated.Generation <= previous.Generation)
+                return;
+
+            if (updated.NetworkId != previous.NetworkId || updated.NodeId != previous.NodeId)
+                throw new InvalidOperationException("ZeroTier config update belongs to a different node/network.");
+
+            // Agent listeners are bound to the startup primary address. Do not
+            // tear them down (which would abort established connections) on a
+            // controller-driven address change; surface the limitation.
+            if (!updated.ManagedAddresses.Contains(OverlayBindAddress))
+            {
+                JsonLog.Error("overlay_bind_address_no_longer_assigned", new {
+                    bound_address = OverlayBindAddress.ToString(),
+                    assigned_addresses = updated.ManagedAddresses.Select(
+                        static x => x.ToString()).ToArray(),
+                    generation = updated.Generation
+                });
+            }
+
+            _selector.UpdateNetwork(
+                BuildNetworkSnapshot(updated, OverlayBindAddress));
+            Volatile.Write(ref _state, updated);
+
+            JsonLog.Info("overlay_routes_updated", new {
+                generation = updated.Generation,
+                assigned_prefixes = updated.AssignedPrefixes.Select(
+                    static x => x.ToString()).ToArray(),
+                managed_routes = updated.ManagedRoutes.Select(static x => new {
+                    target = x.Target.ToString(),
+                    via = x.Via?.ToString(),
+                    flags = x.Flags,
+                    metric = x.Metric
+                }).ToArray()
+            });
+        }
+    }
+
+    private static OverlayNetworkSnapshot BuildNetworkSnapshot(
+        LibztNetworkState state,
+        IPAddress overlayBind)
+        => new(
+            overlayBind,
+            state.ManagedAddresses,
+            state.AssignedPrefixes,
+            state.ManagedRoutes);
 
     internal void Abort()
     {
@@ -227,24 +277,9 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
         IReadOnlyList<IPAddress> managedAddresses,
         IPAddress primaryAddress)
     {
-        if (options.Peers.Contains(primaryAddress))
-        {
-            throw new InvalidOperationException(
-                $"Configured peer {primaryAddress} is this node primary Managed IP.");
-        }
-
         var secondarySelfAddresses = managedAddresses
             .Where(address => !primaryAddress.Equals(address))
             .ToHashSet();
-
-        var secondaryPeer = options.Peers.FirstOrDefault(
-            secondarySelfAddresses.Contains);
-        if (secondaryPeer is not null)
-        {
-            throw new InvalidOperationException(
-                $"Configured peer {secondaryPeer} is a secondary local Managed IP; "
-                + $"NetLoop primary address is {primaryAddress}.");
-        }
 
         if (options.DefaultExit is not null
             && secondarySelfAddresses.Contains(options.DefaultExit))

@@ -15,6 +15,7 @@ PATCHES = [
     ROOT / "patches" / "libzt" / "0001-host-network-change-refresh.patch",
     ROOT / "patches" / "libzt" / "0002-android-pinvoke.patch",
     ROOT / "patches" / "libzt" / "0003-peer-event-details.patch",
+    ROOT / "patches" / "libzt" / "0004-network-cidr-queries.patch",
 ]
 
 

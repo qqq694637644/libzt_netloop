@@ -67,6 +67,8 @@ public sealed class Socks5ProxyConnector : IProxyConnector
             return await ConnectAndNegotiateOnceAsync(
                 cancellationToken).ConfigureAwait(false);
 
+        var negotiationId = ConnectionTrace.NewId();
+        var inboundId = ConnectionTrace.InboundConnectionId;
         var deadline = DateTimeOffset.UtcNow + _negotiationRetryWindow.Value;
         var attempt = 0;
         Exception? lastError = null;
@@ -87,6 +89,8 @@ public sealed class Socks5ProxyConnector : IProxyConnector
                 CancellationTokenSource.CreateLinkedTokenSource(
                     cancellationToken);
             attemptCts.CancelAfter(attemptTimeout);
+            var peerAttemptId = ConnectionTrace.NewId();
+            using var attemptScope = ConnectionTrace.EnterPeerAttempt(peerAttemptId);
 
             try
             {
@@ -96,7 +100,10 @@ public sealed class Socks5ProxyConnector : IProxyConnector
                 {
                     JsonLog.Info("socks_peer_negotiation_recovered", new {
                         proxy = _proxyEndpoint.ToString(),
-                        attempts = attempt
+                        attempts = attempt,
+                        connection_id = inboundId,
+                        negotiation_id = negotiationId,
+                        peer_attempt_id = peerAttemptId
                     });
                 }
                 return connection;
@@ -123,7 +130,11 @@ public sealed class Socks5ProxyConnector : IProxyConnector
             JsonLog.Info("socks_peer_negotiation_retry", new {
                 proxy = _proxyEndpoint.ToString(),
                 attempts = attempt,
-                error = lastError?.Message
+                error = lastError?.Message,
+                connection_id = inboundId,
+                negotiation_id = negotiationId,
+                peer_attempt_id = peerAttemptId,
+                attempt_timeout_ms = attemptTimeout.TotalMilliseconds
             });
 
             var delay = deadline - DateTimeOffset.UtcNow;
@@ -145,6 +156,9 @@ public sealed class Socks5ProxyConnector : IProxyConnector
         var connection = await _transportConnector.ConnectAsync(
             _proxyEndpoint,
             cancellationToken).ConfigureAwait(false);
+        var transportId = (connection as IConnectionTrace)?.ConnectionId;
+        var inboundId = ConnectionTrace.InboundConnectionId;
+        var peerAttemptId = ConnectionTrace.PeerAttemptId;
         try
         {
             await Socks5ClientHandshake.NegotiateAsync(
@@ -152,10 +166,30 @@ public sealed class Socks5ProxyConnector : IProxyConnector
                 _username,
                 _password,
                 cancellationToken).ConfigureAwait(false);
+            if (peerAttemptId is not null)
+            {
+                JsonLog.Info("socks_peer_handshake_completed", new {
+                    connection_id = inboundId,
+                    peer_attempt_id = peerAttemptId,
+                    transport_attempt_id = transportId,
+                    proxy = _proxyEndpoint.ToString()
+                });
+            }
             return connection;
         }
-        catch
+        catch (Exception ex)
         {
+            if (peerAttemptId is not null)
+            {
+                JsonLog.Error("socks_peer_handshake_failed", new {
+                    connection_id = inboundId,
+                    peer_attempt_id = peerAttemptId,
+                    transport_attempt_id = transportId,
+                    proxy = _proxyEndpoint.ToString(),
+                    error_type = ex.GetType().Name,
+                    error = ex.Message
+                });
+            }
             await connection.DisposeAsync().ConfigureAwait(false);
             throw;
         }

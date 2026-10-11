@@ -86,8 +86,19 @@ public sealed class LibztTcpListener : IAsyncDisposable
                 }
                 if (result >= 0)
                 {
+                    // Record native accept *before* any socket setup or SOCKS5
+                    // parsing. Even if setup fails, the accepted fd is visible.
+                    var connectionId = ConnectionTrace.NewId();
+                    var remote = Marshal.PtrToStringAnsi(buffer) ?? "unknown";
+                    var peer = remote.Contains(':') ? $"[{remote}]:{port}" : $"{remote}:{port}";
                     try
                     {
+                        JsonLog.Info("tcp_accept_completed", new {
+                            connection_id = connectionId,
+                            listener = $"{BindAddress}:{Port}",
+                            remote = peer,
+                            fd = result
+                        });
                         cancellationToken.ThrowIfCancellationRequested();
                         var nonBlocking = LibztNative.SetBlocking(result, 0);
                         if (nonBlocking != LibztNative.Ok)
@@ -99,13 +110,21 @@ public sealed class LibztTcpListener : IAsyncDisposable
                         }
 
                         LibztTcpConnector.ConfigureStream(result);
-                        var remote = Marshal.PtrToStringAnsi(buffer) ?? "unknown";
                         return new LibztTcpConnection(
                             result,
-                            $"libzt-accepted:{remote}:{port}");
+                            $"libzt-accepted:{remote}:{port}",
+                            connectionId);
                     }
-                    catch
+                    catch (Exception ex)
                     {
+                        JsonLog.Error("tcp_accept_setup_failed", new {
+                            connection_id = connectionId,
+                            remote = peer,
+                            fd = result,
+                            error_type = ex.GetType().Name,
+                            error = ex.Message,
+                            socket_error = ex is LibztException zts ? (int?)zts.SocketError : null
+                        });
                         _ = LibztNative.Close(result);
                         throw;
                     }

@@ -75,13 +75,14 @@ A 上应用配置本地 SOCKS5 为 127.0.0.1:1080。应用请求 172.26.0.254:80
 
 IPv4 默认映射到 127.0.0.1，IPv6 默认映射到 ::1。后续可以提供简单配置覆盖本机服务映射地址，但不扩展为远端 LAN 路由。
 
-一个 Node 可能同时得到多个 Managed IP。第一版明确选择一个 deterministic canonical /
-primary overlay address：**优先数值最小的 IPv4，否则使用数值最小的 Managed IPv6**。TCP/UDP
-Agent 和 RouteSelector 都只使用这个地址；status 只暴露
-`primary_overlay_address`。`default_exit` 是必填项，并在它不是本机时自动加入
-effective peers；`--peer` 只用于额外的、需要直接访问的对端 primary overlay
-address，不需要也不应该重复填写 `default_exit`。其它 Managed IP 不进入
-NetLoop 路由模型。
+一个 Node 可能同时得到多个 Managed IP。TCP/UDP Agent 仍选择一个
+deterministic primary overlay address（优先数值最小的 IPv4，否则 IPv6）。
+访问其他节点时，RouteSelector **只根据 ZeroTier Controller 下发的分配
+地址前缀与 Managed Routes** 判断直连网段，不维护手工 peer 列表。
+`--peer` 参数已删除且旧参数会被拒绝，**没有兼容兜底**。
+`default_exit` 仍是非 Overlay 流量的必填出口配置，但不会作为
+直连 Peer 的额外路由来源。本机所有 Managed IP 都作为本机目标，
+Agent 监听器仍只绑定 primary IP。
 
 ## 5. 统一出网
 
@@ -97,8 +98,10 @@ NetLoop 路由模型。
 
     if target is self Managed IP:
         connect local loopback
-    else if target is an explicit direct peer Managed IP:
+    else if target matches a Controller-assigned connected subnet / direct route:
         send SOCKS request directly to that peer
+    else if target matches a route requiring a gateway (via):
+        reject (gateway forwarding is not implemented)
     else if this node is the selected exit:
         connect target using local egress backend
     else:
@@ -111,8 +114,9 @@ NetLoop 路由模型。
     example.com:443    -> default_exit B -> Internet
     8.8.8.8:443       -> default_exit B -> Internet
 
-其中访问 C 的示例要求 C 的 primary overlay address 显式出现在 A 的
-`--peer` 中；访问 default_exit B 不需要再把 B 重复写进 `--peer`。
+其中访问 C 的示例要求 Controller 确实分配了可匹配的直连网段、
+且 C 运行 NetLoop Agent；不存在手工 `--peer` 配置入口。
+`/0` 不用于 Peer 识别，公网请求仍走 NetLoop default_exit B。
 
 ### 5.1 域名解析
 
@@ -308,7 +312,6 @@ Android：使用 .NET for Android，长期运行 Node 使用 foreground service�
     socks.port = 1080
     overlay.tcp_port = 42042
     overlay.udp_port = 42043
-    routing.peers = 172.26.0.20,172.26.0.30
     routing.default_exit = 172.26.0.254
     egress.mode = direct | upstream_socks5
     reset.event_debounce_ms = 250
@@ -444,13 +447,15 @@ C# native libzt 构建所需要的第三方源码、最小 CMake 入口和补丁
    跨平台协议/E2E 测试冻结。
 6. Managed IP 是 Node 身份和逻辑服务地址，不是 OS 虚拟网卡。
 7. 非 Overlay 目标默认走统一出口。
-8. 不访问远端 LAN，因此不引入 CIDR 路由系统。
+8. 不访问远端 LAN；仅从 ZeroTier Controller 配置读取 CIDR 和 Managed Routes，
+   用于 NetLoop Agent 的直接路由判断，不修改系统路由。
 9. 平台差异限制在 Native/Host 层。
 10. 个人使用优先：简单、可诊断、可恢复，比企业级抽象更重要。
 
 ## 23. 已冻结的实现决策
 
-以下决策已经确认，后续实现和 CI 以此为准，不再把它们当作开放问题。
+以下列出当前决策。`23.2` 已随 PR #2 的 Controller 动态路由功能
+更新，彻底移除旧的显式 Peer 列表模型。
 
 ### 23.1 Toolchain 与原生基线
 
@@ -462,14 +467,22 @@ C# native libzt 构建所需要的第三方源码、最小 CMake 入口和补丁
 
 ### 23.2 Overlay 路由
 
-- NetLoop 不做 CIDR / Managed Route routing，也不查询 libzt route table。
+- NetLoop 读取 ZeroTier Controller 分配的地址前缀与 Managed Routes，
+  通过 libzt core-locked 原生查询形成不可变快照，支持 IPv4/IPv6、
+  最长前缀匹配与配置变更的热更新，不硬编码网段。
 - 每个 Node 只使用一个 deterministic primary overlay address：数值最小 IPv4 优先，否则数值最小 IPv6。
-- 本机 primary address -> 本机 loopback；其它本机 Managed IP 对 NetLoop 不存在，
-  若被配置成 `--peer` 或 `default_exit` 则启动失败。
-- overlay peer 只由显式 `--peer` primary addresses 定义；非本机的 `default_exit`
-  自动加入 peer 集合；本机 primary 不进入 peer 集合。
-- 其他显式 peer primary address -> 直接连接该 peer Agent。
-- Overlay Agent 收到请求后是最终处理节点：本机 primary address 访问 loopback；
+- 本机所有 Managed IP -> 本机 loopback；Agent 只绑定 primary
+  address，若 primary 被 Controller 撤销则记录警告，不在路由热更新时
+  销毁监听器与既有 TCP 连接。
+- Controller 中直接连接的地址前缀 / 无 `via` 的 Managed Route ->
+  连接目标 IP 的 NetLoop Agent；重叠路由按最长前缀匹配，
+  相同长度的 Controller 显式路由优先。
+- 需要 `via` gateway 的 Managed Route 暂不支持多跳，明确拒绝，
+  不把网段内地址假定为 Agent，也不转给 default_exit。
+- `/0` 不被识别为直连 Peer 网段，`default_exit` 只负责非 Overlay
+  流量的出口选择，**不能替代 Controller 直连路由**。
+  `--peer` 已删除，旧 CLI 参数明确报错，Android START 的 `peers` 字段也拒绝。
+- Overlay Agent 收到请求后是最终处理节点：本机 Managed IP 访问 loopback；
   非 overlay 目标执行本机 egress；**不得再次转发给第三个 NetLoop 节点**。
 - 本机 `default_exit == primary` 时，非 overlay 目标直接执行本机 egress，不经 libzt self-connect。
 - 对某个 peer primary address 的 Agent 连接失败时明确失败，不改走 `default_exit`。

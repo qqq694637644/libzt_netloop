@@ -1,0 +1,3 @@
+# Embedded git patches must preserve diff context lines (a single space).
+# These are patch syntax, not whitespace mistakes in the actual source.
+patches/libzt/*.patch whitespace=-blank-at-eol,-blank-at-eof

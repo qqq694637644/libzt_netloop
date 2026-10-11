@@ -33,6 +33,16 @@ internal static class LibztNative
     internal const int NetworkStatusClientTooOld = 5;
     internal const short EventNodeUp = 200;
     internal const short EventNodeFatalError = 204;
+    internal const short EventNetworkOk = 213;
+    internal const short EventNetworkReadyIp4 = 215;
+    internal const short EventNetworkReadyIp6 = 216;
+    internal const short EventNetworkUpdate = 219;
+    internal const short EventRouteAdded = 250;
+    internal const short EventRouteRemoved = 251;
+    internal const short EventAddressAddedIp4 = 260;
+    internal const short EventAddressRemovedIp4 = 261;
+    internal const short EventAddressAddedIp6 = 262;
+    internal const short EventAddressRemovedIp6 = 263;
     internal const short EventPeerDirect = 240;
     internal const short EventPeerRelay = 241;
     internal const short EventPeerUnreachable = 242;
@@ -54,6 +64,7 @@ internal static class LibztNative
     internal const short PollInvalid = 0x008;
 
     internal const int IpStringLength = 46;
+    internal const int CidrStringLength = IpStringLength + 5;
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate void EventCallback(nint message);
@@ -108,6 +119,29 @@ internal static class LibztNative
 
     [DllImport(LibraryName, EntryPoint = "CSharp_zts_core_query_addr")]
     internal static extern int CoreQueryAddress(ulong networkId, int index, nint destination, int length);
+
+    // NetLoop-patched libzt: the upstream query functions omit prefix lengths.
+    [DllImport(
+        LibraryName,
+        EntryPoint = "zts_netloop_query_addr_cidr",
+        CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int CoreQueryAddressCidr(ulong networkId, uint index, nint destination, uint length);
+
+    [DllImport(LibraryName, EntryPoint = "CSharp_zts_core_query_route_count")]
+    internal static extern int CoreQueryRouteCount(ulong networkId);
+
+    [DllImport(
+        LibraryName,
+        EntryPoint = "zts_netloop_query_route_cidr",
+        CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int CoreQueryRouteCidr(
+        ulong networkId,
+        uint index,
+        nint target,
+        nint via,
+        uint length,
+        out ushort flags,
+        out ushort metric);
 
     [DllImport(LibraryName, EntryPoint = "CSharp_zts_bsd_socket")]
     internal static extern int Socket(int family, int type, int protocol);
@@ -191,6 +225,12 @@ internal static class LibztNative
         EntryPoint = "zts_get_last_socket_error",
         CallingConvention = CallingConvention.Cdecl)]
     internal static extern int GetLastSocketError(int fd);
+
+    [DllImport(
+        LibraryName,
+        EntryPoint = "zts_getsockname",
+        CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int GetSocketName(int fd, nint address, int length, ref ushort port);
 
     [DllImport(LibraryName, EntryPoint = "CSharp_zts_errno_get")]
     internal static extern int GetErrno();
