@@ -212,6 +212,8 @@ internal static class Program
                 agent_source_denied = runtime?.AccessPolicy.RejectedSources,
                 agent_target_denied = runtime?.AccessPolicy.RejectedTargets,
                 active_tcp_tunnels = runtime?.ActiveTcpTunnels,
+                tcp_session_phases = runtime?.TcpSessions,
+                peer_dials = runtime?.PeerDials,
                 tcp_tunnel_capacity = options.MaxTcpTunnels,
                 active_local_udp_associations = runtime?.ActiveLocalUdpAssociations,
                 active_overlay_udp_associations = runtime?.ActiveOverlayUdpAssociations,

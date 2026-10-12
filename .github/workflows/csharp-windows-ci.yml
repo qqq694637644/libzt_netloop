@@ -53,7 +53,8 @@ jobs:
           $networkRefreshPatch = git hash-object patches/libzt/0001-host-network-change-refresh.patch
           $peerEventPatch = git hash-object patches/libzt/0003-peer-event-details.patch
           $cidrPatch = git hash-object patches/libzt/0004-network-cidr-queries.patch
-          "key=libzt-pinvoke-win-x64-$libzt-$cmake-$script-$networkRefreshPatch-$peerEventPatch-$cidrPatch" >> $env:GITHUB_OUTPUT
+          $portsPatch = git hash-object patches/libzt/0005-underlay-port-diagnostics.patch
+          "key=libzt-pinvoke-win-x64-$libzt-$cmake-$script-$networkRefreshPatch-$peerEventPatch-$cidrPatch-$portsPatch" >> $env:GITHUB_OUTPUT
 
       - name: Restore compiled libzt bundle
         id: native-cache

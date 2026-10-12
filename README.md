@@ -169,6 +169,14 @@ The unvalidated shared Poller and its CLI switch have been removed. Only the
 known per-socket Poller remains while idle CPU, RDP, native fd ownership and
 handover performance await actual A/B/C device measurements.
 
+To diagnose multi-request floods and slow physical path recovery, the runtime
+now reports accepted TCP phases/sources (`tcp_session_phases`), bounded
+per-Peer dialing (`peer_dials`), and observed native UDP ports and
+RELAY/DIRECT/NODE_OFFLINE events. These do **not** claim to eliminate native
+70–110s Peer recovery or the observed ~226s Node cycle. See
+[the manual handover diagnosis guide](docs/network-handover-diagnostics.md)
+for the exact JSONL fields, limits and A/B/C tests.
+
 For new versions, download the relevant build directly from
 [GitHub Releases](https://github.com/qqq694637644/libzt_netloop/releases)
 and replace the application manually. No custom updater, previous-version

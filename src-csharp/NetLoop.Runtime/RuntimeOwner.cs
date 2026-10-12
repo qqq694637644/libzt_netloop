@@ -50,6 +50,7 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
     private int _resetCount;
     private int _running;
     private bool _physicalRefreshPending;
+    private long _failedReadyRefreshAttempts;
     private Event? _deferredManualReset;
 
     internal event Action<RuntimeStatus>? StatusChanged;
@@ -131,8 +132,20 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
 
         // The native Node might not have started yet. Retain one coalesced
         // refresh request and retry it on the next waiting iteration.
-        if (physicalRefreshPending && tryNotifyPhysicalNetworkChanged())
-            physicalRefreshPending = false;
+        TryDeliverPendingPhysicalRefresh(
+            ref physicalRefreshPending, tryNotifyPhysicalNetworkChanged);
+    }
+
+    internal static bool TryDeliverPendingPhysicalRefresh(
+        ref bool pending,
+        Func<bool> notify)
+    {
+        if (!pending)
+            return true;
+        if (!notify())
+            return false;
+        pending = false;
+        return true;
     }
 
     private void RestoreDeferredManualReset()
@@ -141,6 +154,16 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
             return;
         _deferredManualReset = null;
         _events.Writer.TryWrite(reset);
+    }
+
+    private void LogFailedReadyRefresh(string reason)
+    {
+        var failures = ++_failedReadyRefreshAttempts;
+        if ((failures & (failures - 1)) == 0)
+            JsonLog.Info("libzt_physical_network_refresh_pending", new {
+                reason,
+                failures_since_success = failures
+            });
     }
 
     internal static async Task AwaitStartupAsync(
@@ -245,11 +268,29 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
                     var nextEvent = _events.Reader.ReadAsync(supervision.Token).AsTask();
                     var listenerFailure = runtime.WaitForCriticalServiceFailureAsync(
                         supervision.Token);
+                    // Retry a failed native refresh within the same owner.
+                    // A healthy Node does not need a periodic refresh timer.
+                    var physicalRetry = _physicalRefreshPending
+                        ? Task.Delay(500, supervision.Token)
+                        : null;
                     try
                     {
-                        var completed = await Task.WhenAny(nextEvent, listenerFailure)
-                            .ConfigureAwait(false);
-                        if (ReferenceEquals(completed, listenerFailure))
+                        var completed = physicalRetry is null
+                            ? await Task.WhenAny(nextEvent, listenerFailure)
+                                .ConfigureAwait(false)
+                            : await Task.WhenAny(
+                                    nextEvent, listenerFailure, physicalRetry)
+                                .ConfigureAwait(false);
+                        if (ReferenceEquals(completed, physicalRetry))
+                        {
+                            if (!TryDeliverPendingPhysicalRefresh(
+                                    ref _physicalRefreshPending,
+                                    node.TryNotifyPhysicalNetworkChanged))
+                                LogFailedReadyRefresh("retry_after_native_failure");
+                            else
+                                _failedReadyRefreshAttempts = 0;
+                        }
+                        else if (ReferenceEquals(completed, listenerFailure))
                         {
                             try
                             {
@@ -269,7 +310,13 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
                             switch (currentEvent.Kind)
                             {
                                 case EventKind.Physical:
-                                    node.TryNotifyPhysicalNetworkChanged();
+                                    _physicalRefreshPending = true;
+                                    if (!TryDeliverPendingPhysicalRefresh(
+                                            ref _physicalRefreshPending,
+                                            node.TryNotifyPhysicalNetworkChanged))
+                                        LogFailedReadyRefresh(currentEvent.Reason);
+                                    else
+                                        _failedReadyRefreshAttempts = 0;
                                     // Physical handover alone never aborts a
                                     // potentially healthy long-lived TCP/RDP.
                                     break;
@@ -321,7 +368,9 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
                         await supervision.CancelAsync().ConfigureAwait(false);
                         try
                         {
-                            await Task.WhenAll(nextEvent, listenerFailure)
+                            await Task.WhenAll(
+                                    nextEvent, listenerFailure,
+                                    physicalRetry ?? Task.CompletedTask)
                                 .ConfigureAwait(false);
                         }
                         catch (Exception) when (supervision.IsCancellationRequested)

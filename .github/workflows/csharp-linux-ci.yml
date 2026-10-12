@@ -64,7 +64,8 @@ jobs:
           network_refresh_patch="$(git hash-object patches/libzt/0001-host-network-change-refresh.patch)"
           peer_event_patch="$(git hash-object patches/libzt/0003-peer-event-details.patch)"
           cidr_patch="$(git hash-object patches/libzt/0004-network-cidr-queries.patch)"
-          echo "key=libzt-pinvoke-linux-${{ matrix.arch }}-${libzt}-${cmake}-${script}-${network_refresh_patch}-${peer_event_patch}-${cidr_patch}" >> "$GITHUB_OUTPUT"
+          ports_patch="$(git hash-object patches/libzt/0005-underlay-port-diagnostics.patch)"
+          echo "key=libzt-pinvoke-linux-${{ matrix.arch }}-${libzt}-${cmake}-${script}-${network_refresh_patch}-${peer_event_patch}-${cidr_patch}-${ports_patch}" >> "$GITHUB_OUTPUT"
 
       - name: Restore compiled libzt bundle
         id: native-cache

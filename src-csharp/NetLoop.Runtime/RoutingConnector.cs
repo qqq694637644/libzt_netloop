@@ -16,6 +16,7 @@ internal sealed class RoutingConnector : IProxyConnector
     private readonly IProxyConnector _libztConnector;
     private readonly IProxyConnector _loopbackConnector;
     private readonly IProxyConnector _egressConnector;
+    private readonly PeerDialCoordinator _peerDials;
     private readonly TimeSpan _connectReplyTimeout;
 
     internal RoutingConnector(
@@ -25,6 +26,7 @@ internal sealed class RoutingConnector : IProxyConnector
         IProxyConnector libztConnector,
         IProxyConnector loopbackConnector,
         IProxyConnector egressConnector,
+        PeerDialCoordinator peerDials,
         TimeSpan connectReplyTimeout)
     {
         _selector = selector;
@@ -33,6 +35,7 @@ internal sealed class RoutingConnector : IProxyConnector
         _libztConnector = libztConnector;
         _loopbackConnector = loopbackConnector;
         _egressConnector = egressConnector;
+        _peerDials = peerDials;
         _connectReplyTimeout = connectReplyTimeout;
     }
 
@@ -73,6 +76,9 @@ internal sealed class RoutingConnector : IProxyConnector
             negotiationRetryWindow: PeerNegotiationRecoveryWindow,
             negotiationAttemptTimeout: PeerNegotiationAttemptTimeout,
             connectReplyTimeout: _connectReplyTimeout);
-        return proxy.ConnectAsync(target, cancellationToken);
+        return _peerDials.ConnectAsync(
+            peer,
+            token => proxy.ConnectAsync(target, token),
+            cancellationToken);
     }
 }

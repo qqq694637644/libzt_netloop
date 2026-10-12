@@ -10,6 +10,8 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
     private readonly Socks5ConnectionHandler _handler;
     private readonly AgentAccessPolicy _accessPolicy;
     private readonly SemaphoreSlim _capacity;
+    private readonly TcpSessionTracker _sessions;
+    private readonly int _maxConnections;
     private readonly CancellationTokenSource _stop = new();
     private readonly CancellationTokenSource _acceptStop;
     private readonly object _clientsGate = new();
@@ -27,11 +29,14 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
         Socks5ConnectionHandler handler,
         int maxConnections,
         SemaphoreSlim capacity,
+        TcpSessionTracker sessions,
         AgentAccessPolicy accessPolicy)
     {
         _handler = handler;
         _accessPolicy = accessPolicy;
         _capacity = capacity;
+        _sessions = sessions;
+        _maxConnections = maxConnections;
         _listener = LibztTcpListener.Start(bindAddress, port, maxConnections);
         _acceptStop = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token);
         _loop = AcceptLoopAsync(_acceptStop.Token);
@@ -93,11 +98,8 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
             }
             if (!accepted)
             {
-                JsonLog.Info("tcp_accept_rejected", new {
-                    connection_id = connection.ConnectionId,
-                    client = connection.Description,
-                    reason = "max_connections"
-                });
+                _sessions.Reject(
+                    "overlay", source?.ToString() ?? "unknown", _maxConnections);
                 await connection.DisposeAsync().ConfigureAwait(false);
                 continue;
             }
@@ -137,10 +139,15 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
         LibztTcpConnection connection,
         CancellationToken cancellationToken)
     {
+        using var usage = _sessions.Track(
+            "overlay",
+            (connection.RemoteEndPoint as System.Net.IPEndPoint)?
+                .Address.ToString() ?? "unknown");
         await using var client = connection;
         try
         {
-            await _handler.HandleAsync(client, cancellationToken).ConfigureAwait(false);
+            await _handler.HandleAsync(
+                client, cancellationToken, usage.SetPhase).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {

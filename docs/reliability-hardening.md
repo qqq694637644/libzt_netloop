@@ -87,7 +87,8 @@ Windows/Linux CLI 可选择：
 ## 原生构建缓存保护
 
 Windows/Linux/Android 的 native cache key 新增了
-`0004-network-cidr-queries.patch` 内容哈希。
+`0004-network-cidr-queries.patch`、`0005-underlay-port-diagnostics.patch`
+内容哈希。后者是只读 Binder 端口快照 ABI，不能与旧 native 包混用。
 Windows/Linux managed 打包之前，验证 native library
 manifest 对应的 libzt submodule SHA、CMake、build script、
 全部 native 补丁哈希与当前 checkout 相同；缺失或不一致则
@@ -129,6 +130,28 @@ UDP 接收队列、单包发送时限、每个 UDP 远端独立的有界队列
 
 仍然没有依据调整的参数：10ms poll 周期、TCP Keepalive、
 750ms/3秒 Peer negotiation 窗口。
+
+## 小规模 A/B/C 网络的后续连接风暴诊断
+
+旧版三端日志曾出现 B 的 128 条 TCP 额度饱和、A/C 大量失败重试，
+以及 Peer 路径恢复 70～110 秒和 NODE_ONLINE/OFFLINE 约 226 秒
+波动。修复业务 Runtime 的切网行为**不等于修复 native NAT**。
+
+`tcp_session_phases` 将本地和 Overlay TCP 占用按
+`Handshake / Connecting / Relay / UdpAssociation` 和实际来源
+Managed IP 统计；当额度耗尽时保留每来源拒绝计数，但密集
+JSONL 拒绝事件进行指数采样，避免二次日志风暴。
+`peer_dials` 对同 Peer（包括默认出口 B）最多允许 2 个
+正在建连协商、4 个等待；短暂失败冷却最多 2 秒，已经建立的
+RDP Relay **不受建连上限影响**，同时不盲目扩大 B 的 128 名额。
+
+Node Ready 后通知 libzt 更新物理路径时，若原生 API 返回失败，
+唯一 RuntimeOwner 保留请求并在原进程内稍后重试，成功后停止重试；
+不因切网通知而强行销毁原来的 TCP 会话。只读 native Binder
+快照记录真正采样到的主/副 UDP 端口变化，与 Peer RELAY→DIRECT
+和 Node ONLINE/OFFLINE 事件计算时间差；不根据这些事件本身
+猜测公网 NAT 映射、实际 SOCKS 连通性或最终故障根因。
+具体手动采样流程参见[三端切网诊断](network-handover-diagnostics.md)。
 
 建议先按 72 小时、7 天两个时间窗口观察，并配合独立 PowerShell
 connection probe；避免多个高风险参数同时调整。

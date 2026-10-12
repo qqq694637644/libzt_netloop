@@ -18,6 +18,8 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
     private readonly AgentAccessPolicy _accessPolicy;
     private readonly SemaphoreSlim _tcpCapacity;
     private readonly int _maxTcpTunnels;
+    private readonly TcpSessionTracker _tcpSessions;
+    private readonly PeerDialCoordinator _peerDials;
     private readonly UdpByteBudget _udpByteBudget;
     private readonly TaskCompletionSource<string> _criticalListenerStopped = new(
         TaskCreationOptions.RunContinuationsAsynchronously);
@@ -34,6 +36,8 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
         AgentAccessPolicy accessPolicy,
         SemaphoreSlim tcpCapacity,
         int maxTcpTunnels,
+        TcpSessionTracker tcpSessions,
+        PeerDialCoordinator peerDials,
         UdpByteBudget udpByteBudget,
         Socks5UdpAssociationFactory udpAssociationFactory,
         OverlaySocksAgent overlayAgent,
@@ -46,6 +50,8 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
         _accessPolicy = accessPolicy;
         _tcpCapacity = tcpCapacity;
         _maxTcpTunnels = maxTcpTunnels;
+        _tcpSessions = tcpSessions;
+        _peerDials = peerDials;
         _udpByteBudget = udpByteBudget;
         _udpAssociationFactory = udpAssociationFactory;
         _overlayAgent = overlayAgent;
@@ -63,6 +69,8 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
 
     internal IPAddress OverlayBindAddress => _overlayBindAddress;
     internal int ActiveTcpTunnels => _maxTcpTunnels - _tcpCapacity.CurrentCount;
+    internal TcpSessionUsage TcpSessions => _tcpSessions.Snapshot();
+    internal PeerDialCoordinator.PeerDialStatus[] PeerDials => _peerDials.Snapshot();
     internal int UdpQueuedBytes => _udpByteBudget.UsedBytes;
     internal int UdpPeakQueuedBytes => _udpByteBudget.PeakBytes;
     internal int UdpQueueByteLimit => _udpByteBudget.MaxBytes;
@@ -153,6 +161,8 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
 
         var tcpCapacity = new SemaphoreSlim(
             options.MaxTcpTunnels, options.MaxTcpTunnels);
+        var tcpSessions = new TcpSessionTracker();
+        var peerDials = new PeerDialCoordinator();
         Socks5UdpAssociationFactory? udpAssociations = null;
         OverlaySocksAgent? overlayAgent = null;
         OverlayUdpAgent? overlayUdpAgent = null;
@@ -171,6 +181,7 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
                 libztConnector,
                 loopbackConnector,
                 egressConnector,
+                peerDials,
                 options.SocksConnectReplyTimeout);
             var overlayRouter = new RoutingConnector(
                 selector,
@@ -179,6 +190,7 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
                 libztConnector,
                 loopbackConnector,
                 egressConnector,
+                peerDials,
                 options.SocksConnectReplyTimeout);
             var overlayHandler = new Socks5ConnectionHandler(
                 overlayRouter,
@@ -192,6 +204,7 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
                 overlayHandler,
                 options.MaxTcpTunnels,
                 tcpCapacity,
+                tcpSessions,
                 accessPolicy);
             overlayUdpAgent = new OverlayUdpAgent(
                 overlayBind,
@@ -212,7 +225,9 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
                     udpAssociations,
                     options.SocksHandshakeTimeout,
                     relayBufferBytes: options.RelayBufferKiB * 1024),
-                tcpCapacity);
+                tcpCapacity,
+                tcpSessions,
+                options.MaxTcpTunnels);
             localSocks.Start();
 
             return new NetLoopRuntime(
@@ -222,6 +237,8 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
                 accessPolicy,
                 tcpCapacity,
                 options.MaxTcpTunnels,
+                tcpSessions,
+                peerDials,
                 udpByteBudget,
                 udpAssociations,
                 overlayAgent,

@@ -32,7 +32,10 @@ public sealed class Socks5ConnectionHandler
             throw new ArgumentOutOfRangeException(nameof(handshakeTimeout));
     }
 
-    public async Task HandleAsync(IProxyConnection client, CancellationToken cancellationToken)
+    public async Task HandleAsync(
+        IProxyConnection client,
+        CancellationToken cancellationToken,
+        Action<TcpSessionPhase>? onPhaseChange = null)
     {
         var connectionId = client is IConnectionTrace traced
             ? traced.ConnectionId
@@ -69,11 +72,14 @@ public sealed class Socks5ConnectionHandler
             return;
         if (parsed.Value.Command == Socks5Protocol.UdpAssociate)
         {
+            onPhaseChange?.Invoke(TcpSessionPhase.Connecting);
             await HandleUdpAssociationAsync(
-                client, parsed.Value.Target, cancellationToken).ConfigureAwait(false);
+                client, parsed.Value.Target, cancellationToken, onPhaseChange)
+                .ConfigureAwait(false);
             return;
         }
 
+        onPhaseChange?.Invoke(TcpSessionPhase.Connecting);
         var target = parsed.Value.Target;
         if (_targetAllowed is not null && !_targetAllowed(target))
         {
@@ -100,6 +106,12 @@ public sealed class Socks5ConnectionHandler
             remote = await _connector.ConnectAsync(target, cancellationToken).ConfigureAwait(false);
             var success = Socks5Protocol.BuildReply(Socks5Protocol.ReplySucceeded);
             await client.WriteAsync(success, success.Length, cancellationToken).ConfigureAwait(false);
+            onPhaseChange?.Invoke(TcpSessionPhase.Relay);
+            JsonLog.Info("socks_relay_established", new {
+                connection_id = connectionId,
+                client = client.Description,
+                target = target.ToString()
+            });
             await ConnectionRelay.RunAsync(client, remote, cancellationToken, _relayBufferBytes)
                 .ConfigureAwait(false);
         }
@@ -217,7 +229,8 @@ public sealed class Socks5ConnectionHandler
     private async Task HandleUdpAssociationAsync(
         IProxyConnection client,
         ProxyTarget declaredEndpoint,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<TcpSessionPhase>? onPhaseChange)
     {
         ISocks5UdpAssociation association;
         try
@@ -250,6 +263,7 @@ public sealed class Socks5ConnectionHandler
             Socks5Protocol.ReplySucceeded,
             association.RelayEndPoint);
         await client.WriteAsync(reply, reply.Length, cancellationToken).ConfigureAwait(false);
+        onPhaseChange?.Invoke(TcpSessionPhase.UdpAssociation);
 
         JsonLog.Info("socks_udp_associate_ready", new {
             client = client.RemoteEndPoint?.ToString(),

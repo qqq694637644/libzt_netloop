@@ -28,12 +28,18 @@ internal static class Program
             Check("UDP association removal matches key and object", UdpConditionalRemove);
             Check("Native bind errors are classified without blanket retries", NativeBindClassification);
             Check("UDP response peer set is bounded and expires entries", UdpResponsePeers);
+            Check("TCP capacity occupancy classified by phase and source", TcpSessionPhases);
+            Check("Underlay port and Peer path timeline uses observed events", UnderlayTimeline);
             Check("SOCKS5 UDP datagram logical source", UdpPacketRoundTrip);
             Check("Shared UDP byte budget", UdpBudget);
             await CheckAsync("C Managed IP to 127.0.0.1 TCP", LoopbackTcp);
             await CheckAsync("C Managed IP to local UDP with source rewrite", LoopbackUdp);
             await CheckAsync("UDP Factory concurrent disposal", UdpFactoryDisposal);
             await CheckAsync("Startup processes physical events while Node waits", StartupPhysicalRefresh);
+            await CheckAsync("Peer dialing is bounded across simultaneous SOCKS requests", PeerDialAdmission);
+            await CheckAsync("Peer dialing releases canceled waiters and isolates different peers", PeerDialCancellation);
+            await CheckAsync("Peer failure backoff does not hold established TCP", PeerDialCooldown);
+            Check("Ready Runtime retries a failed native refresh", ReadyRefreshRetry);
             await CheckAsync("UDP cleanup errors never leak association capacity", UdpFaultyCleanup);
             await CheckAsync("Overlay UDP returns queued bytes after failed Dispose", OverlayFaultyCleanup);
             await CheckAsync("Optional status output failure isolation", StatusOutputFailure);
@@ -188,6 +194,222 @@ internal static class Program
         Require(!peers.IsAllowed(newer), "Expired peer remains authorized");
         peers.Allow(first);
         Require(peers.IsAllowed(first), "A subsequent outbound send should reauthorize peer");
+    }
+
+    private static void TcpSessionPhases()
+    {
+        var sessions = new TcpSessionTracker();
+        using var overlayA = sessions.Track("overlay", A.ToString());
+        using var overlayC = sessions.Track("overlay", C.ToString());
+        using var local = sessions.Track("local", "127.0.0.1");
+        overlayA.SetPhase(TcpSessionPhase.Relay);
+        overlayC.SetPhase(TcpSessionPhase.Connecting);
+        local.SetPhase(TcpSessionPhase.UdpAssociation);
+        var usage = sessions.Snapshot();
+        Require(usage.Total == 3
+                && usage.Handshake == 0 && usage.Connecting == 1
+                && usage.Relay == 1 && usage.UdpAssociation == 1
+                && usage.Overlay == 2 && usage.Local == 1,
+            "TCP permit phases do not match the three active sessions");
+        Require(usage.Sources.Any(source =>
+                source.Ingress == "overlay" && source.Source == A.ToString()
+                && source.Relay == 1),
+            "A's established RDP/TCP permit not attributed correctly");
+        sessions.Reject("overlay", C.ToString(), 3);
+        Require(sessions.Snapshot().RejectedOverlay == 1,
+            "Source rejection did not increment the overlay counter");
+        overlayA.Dispose();
+        overlayC.Dispose();
+        local.Dispose();
+        Require(sessions.Snapshot().Total == 0
+                && sessions.Snapshot().Sources.Count == 0,
+            "Closed TCP sessions remain in the source histogram");
+    }
+
+    private static void UnderlayTimeline()
+    {
+        long now = 1_000;
+        var observations = new LibztUnderlayDiagnostics(() => now);
+        var firstPorts = observations.ObservePorts(9993, 34000);
+        Require(firstPorts is { PreviousSecondary: null },
+            "Initial native port snapshot was not accepted");
+        Require(observations.ObservePorts(9993, 34000) is null,
+            "Unchanged ports should not produce a new log record");
+        observations.RecordPhysicalRefresh();
+        now += 250;
+        var changed = observations.ObservePorts(9993, 34100);
+        Require(changed is {
+            PreviousSecondary: 34000,
+            Secondary: 34100,
+            SinceRefreshMs: 250
+        }, "Observed native secondary port rotation was not recorded");
+
+        observations.ObservePeer(LibztNative.EventPeerRelay, 0x12345);
+        now += 91_000;
+        var peer = observations.ObservePeer(
+            LibztNative.EventPeerDirect, 0x12345);
+        Require(peer is { ElapsedMs: 91_000, Previous: "RELAY" },
+            "Native RELAY to DIRECT observation was not timed");
+        Require(observations.ObservePeer(
+            LibztNative.EventPeerDirect, 0x12345) is null,
+            "Repeated DIRECT is not another recovery");
+
+        observations.ObserveNode(LibztNative.EventNodeOnline);
+        now += 156_000;
+        var offline = observations.ObserveNode(
+            LibztNative.EventNodeOffline);
+        Require(offline is { LastPhaseDurationMs: 156_000 },
+            "NODE_OFFLINE did not capture prior online duration");
+        now += 70_000;
+        var online = observations.ObserveNode(
+            LibztNative.EventNodeOnline);
+        Require(online is { LastPhaseDurationMs: 70_000 },
+            "NODE_ONLINE did not capture offline interval");
+        now += 156_000;
+        offline = observations.ObserveNode(
+            LibztNative.EventNodeOffline);
+        Require(offline is { TimeSincePreviousOfflineMs: 226_000 },
+            "226-second NODE_OFFLINE cycle cannot be measured");
+    }
+
+    private static async Task PeerDialAdmission()
+    {
+        var gate = new PeerDialCoordinator();
+        var release = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var started = 0;
+        var active = 0;
+        var maxActive = 0;
+
+        async ValueTask<IProxyConnection> Dial(CancellationToken token)
+        {
+            Interlocked.Increment(ref started);
+            var current = Interlocked.Increment(ref active);
+            if (current > maxActive)
+                maxActive = current;
+            try
+            {
+                await release.Task.WaitAsync(token).ConfigureAwait(false);
+                return new FakeControl();
+            }
+            finally
+            {
+                Interlocked.Decrement(ref active);
+            }
+        }
+
+        var calls = Enumerable.Range(
+                0,
+                PeerDialCoordinator.MaxInFlightPerPeer
+                + PeerDialCoordinator.MaxWaitingPerPeer)
+            .Select(_ => gate.ConnectAsync(B, Dial, CancellationToken.None).AsTask())
+            .ToArray();
+        var usage = gate.Snapshot().Single();
+        Require(usage.InFlight == 2 && usage.Waiting == 4
+                && started == 2,
+            "Concurrent calls did not stop at two outgoing peer negotiations");
+        await ThrowsAsync<IOException>(async () =>
+            _ = await gate.ConnectAsync(B, Dial, CancellationToken.None));
+        Require(gate.Snapshot().Single().Rejected == 1,
+            "Overflow request was not rejected with a bounded queue");
+
+        release.TrySetResult();
+        var established = await Task.WhenAll(calls)
+            .WaitAsync(TimeSpan.FromSeconds(3));
+        Require(maxActive <= PeerDialCoordinator.MaxInFlightPerPeer
+                && gate.Snapshot().Single().InFlight == 0,
+            "The gate exceeded the outgoing dial budget");
+        foreach (var connection in established)
+            await connection.DisposeAsync();
+    }
+
+    private static async Task PeerDialCooldown()
+    {
+        long now = 10_000;
+        var gate = new PeerDialCoordinator(() => now);
+        await ThrowsAsync<IOException>(async () =>
+            _ = await gate.ConnectAsync(
+                B,
+                _ => ValueTask.FromException<IProxyConnection>(
+                    new IOException("synthetic peer outage")),
+                CancellationToken.None));
+        var failed = gate.Snapshot().Single();
+        Require(failed.ConsecutiveFailures == 1
+                && failed.RemainingCooldownMs == 250,
+            "First failed Peer attempt did not set bounded cooldown");
+        now += 250;
+
+        // Simulate an already-open RDP relay: after ConnectAsync returns the
+        // dial permit is free even while the caller retains that connection.
+        var connections = new List<IProxyConnection>();
+        for (var i = 0; i < 7; i++)
+            connections.Add(await gate.ConnectAsync(
+                B,
+                _ => ValueTask.FromResult<IProxyConnection>(new FakeControl()),
+                CancellationToken.None));
+        Require(gate.Snapshot().Single().InFlight == 0
+                && gate.Snapshot().Single().ConsecutiveFailures == 0,
+            "Established RDP connection was incorrectly counted as an in-flight dial");
+        foreach (var connection in connections)
+            await connection.DisposeAsync();
+    }
+
+    private static async Task PeerDialCancellation()
+    {
+        var gate = new PeerDialCoordinator();
+        var release = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        async ValueTask<IProxyConnection> Blocked(CancellationToken token)
+        {
+            await release.Task.WaitAsync(token);
+            return new FakeControl();
+        }
+
+        var first = gate.ConnectAsync(B, Blocked, CancellationToken.None).AsTask();
+        var second = gate.ConnectAsync(B, Blocked, CancellationToken.None).AsTask();
+        using var canceled = new CancellationTokenSource();
+        var waiting = gate.ConnectAsync(B, Blocked, canceled.Token).AsTask();
+        Require(gate.Snapshot().Single().Waiting == 1,
+            "Cancelable peer request was not queued");
+
+        // C has a separate dial budget despite B being fully occupied.
+        var directC = await gate.ConnectAsync(
+            C,
+            _ => ValueTask.FromResult<IProxyConnection>(new FakeControl()),
+            CancellationToken.None);
+        await directC.DisposeAsync();
+        canceled.Cancel();
+        await ThrowsAsync<OperationCanceledException>(() => waiting);
+        var bStatus = gate.Snapshot().Single(entry => entry.Peer == B.ToString());
+        Require(bStatus.Waiting == 0 && bStatus.InFlight == 2,
+            "Canceled waiter failed to release B's admission queue slot");
+        release.TrySetResult();
+        var opened = await Task.WhenAll(first, second)
+            .WaitAsync(TimeSpan.FromSeconds(2));
+        foreach (var connection in opened)
+            await connection.DisposeAsync();
+        Require(gate.Snapshot().All(entry =>
+                entry.Waiting == 0 && entry.InFlight == 0),
+            "Peer gates did not return their permits after cancellation");
+    }
+
+    private static void ReadyRefreshRetry()
+    {
+        var pending = true;
+        var tries = 0;
+        Require(!RuntimeOwner.TryDeliverPendingPhysicalRefresh(
+                    ref pending, () => { tries++; return false; })
+                && pending && tries == 1,
+            "Native refresh failure was dropped instead of marked pending");
+        Require(RuntimeOwner.TryDeliverPendingPhysicalRefresh(
+                    ref pending, () => { tries++; return true; })
+                && !pending && tries == 2,
+            "Pending native refresh was not retried successfully");
+        Require(RuntimeOwner.TryDeliverPendingPhysicalRefresh(
+                    ref pending, () => { tries++; return false; })
+                && tries == 2,
+            "A successful native refresh unexpectedly triggered another retry");
     }
 
     private static async Task StartupPhysicalRefresh()

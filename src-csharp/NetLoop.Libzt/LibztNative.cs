@@ -32,6 +32,8 @@ internal static class LibztNative
     internal const int NetworkStatusPortError = 4;
     internal const int NetworkStatusClientTooOld = 5;
     internal const short EventNodeUp = 200;
+    internal const short EventNodeOnline = 201;
+    internal const short EventNodeOffline = 202;
     internal const short EventNodeFatalError = 204;
     internal const short EventNetworkOk = 213;
     internal const short EventNetworkReadyIp4 = 215;
@@ -104,6 +106,12 @@ internal static class LibztNative
         EntryPoint = "zts_node_network_changed",
         CallingConvention = CallingConvention.Cdecl)]
     internal static extern int NodeNetworkChanged();
+
+    [DllImport(
+        LibraryName,
+        EntryPoint = "zts_netloop_get_bound_udp_ports",
+        CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int GetBoundUdpPorts(out ushort primary, out ushort secondary);
 
     [DllImport(LibraryName, EntryPoint = "CSharp_zts_net_join")]
     internal static extern int NetJoin(ulong networkId);
