@@ -230,16 +230,35 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
         }
         catch
         {
-            if (localSocks is not null)
-                await localSocks.DisposeAsync().ConfigureAwait(false);
-            if (overlayUdpAgent is not null)
-                await overlayUdpAgent.DisposeAsync().ConfigureAwait(false);
-            if (overlayAgent is not null)
-                await overlayAgent.DisposeAsync().ConfigureAwait(false);
-            if (udpAssociations is not null)
-                await udpAssociations.DisposeAsync().ConfigureAwait(false);
+            // Keep the original native bind error available to the recovery
+            // classifier. A secondary cleanup exception must neither hide it
+            // nor prevent the other partially-created listeners from closing.
+            await DisposeResourceNoThrowAsync(localSocks, "local_socks");
+            await DisposeResourceNoThrowAsync(overlayUdpAgent, "overlay_udp");
+            await DisposeResourceNoThrowAsync(overlayAgent, "overlay_tcp");
+            await DisposeResourceNoThrowAsync(udpAssociations, "udp_factory");
             tcpCapacity.Dispose();
             throw;
+        }
+    }
+
+    private static async Task DisposeResourceNoThrowAsync(
+        IAsyncDisposable? resource,
+        string component)
+    {
+        if (resource is null)
+            return;
+        try
+        {
+            await resource.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            JsonLog.Error("runtime_resource_dispose_failed", new {
+                component,
+                error_type = ex.GetType().Name,
+                error = ex.Message
+            });
         }
     }
 
@@ -324,10 +343,10 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
             return;
 
         Abort();
-        await _localSocks.DisposeAsync().ConfigureAwait(false);
-        await _overlayAgent.DisposeAsync().ConfigureAwait(false);
-        await _overlayUdpAgent.DisposeAsync().ConfigureAwait(false);
-        await _udpAssociationFactory.DisposeAsync().ConfigureAwait(false);
+        await DisposeResourceNoThrowAsync(_localSocks, "local_socks");
+        await DisposeResourceNoThrowAsync(_overlayAgent, "overlay_tcp");
+        await DisposeResourceNoThrowAsync(_overlayUdpAgent, "overlay_udp");
+        await DisposeResourceNoThrowAsync(_udpAssociationFactory, "udp_factory");
         _tcpCapacity.Dispose();
     }
 

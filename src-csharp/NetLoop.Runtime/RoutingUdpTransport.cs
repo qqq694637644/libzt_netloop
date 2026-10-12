@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Net;
 using System.Threading.Channels;
 using NetLoop.Core;
@@ -75,7 +74,7 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
     private readonly IProxyUdpTransport _localTransport;
     private readonly IProxyUdpTransportFactory _egressFactory;
     private readonly LibztUdpSocket _overlaySocket;
-    private readonly ConcurrentDictionary<IPEndPoint, byte> _allowedPeers = new();
+    private readonly UdpResponsePeerRegistry _allowedPeers = new();
     private readonly Channel<ProxyUdpDatagram> _received;
     private readonly UdpByteBudget _budget;
     private readonly CancellationTokenSource _stop = new();
@@ -155,7 +154,7 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
                 var peer = decision.PeerAddress
                     ?? throw new InvalidOperationException("UDP overlay route has no peer address.");
                 var agent = new IPEndPoint(peer, _overlayUdpPort);
-                _allowedPeers.TryAdd(agent, 0);
+                _allowedPeers.Allow(agent);
 
                 var packet = Socks5UdpPacket.Build(target, content.Span);
                 await _overlaySocket.SendToAsync(
@@ -267,7 +266,7 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
         while (!cancellationToken.IsCancellationRequested)
         {
             var datagram = await _overlaySocket.ReceiveFromAsync(cancellationToken).ConfigureAwait(false);
-            if (!_allowedPeers.ContainsKey(datagram.RemoteEndPoint))
+            if (!_allowedPeers.IsAllowed(datagram.RemoteEndPoint))
             {
                 JsonLog.Info("udp_overlay_unexpected_peer_dropped", new {
                     source = datagram.RemoteEndPoint.ToString()
@@ -381,5 +380,71 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
     {
         if (Volatile.Read(ref _disposed) != 0)
             throw new ObjectDisposedException(nameof(RoutingUdpTransport));
+    }
+}
+
+/// <summary>
+/// An Association only accepts UDP responses from endpoints it contacted.
+/// A small expiring set replaces the previous grow-only endpoint dictionary.
+/// Evicting an old peer can drop a late response, but never widens access.
+/// </summary>
+internal sealed class UdpResponsePeerRegistry
+{
+    internal const int MaxPeers = 64;
+    internal const long MaxIdleMilliseconds = 120_000;
+
+    private readonly Dictionary<IPEndPoint, long> _lastSent = new();
+    private readonly object _gate = new();
+    private readonly Func<long> _now;
+
+    internal UdpResponsePeerRegistry(Func<long>? clock = null)
+        => _now = clock ?? (() => Environment.TickCount64);
+
+    internal int Count
+    {
+        get
+        {
+            lock (_gate)
+                return _lastSent.Count;
+        }
+    }
+
+    internal void Allow(IPEndPoint peer)
+    {
+        lock (_gate)
+        {
+            var now = _now();
+            if (!_lastSent.ContainsKey(peer))
+            {
+                if (_lastSent.Count >= MaxPeers)
+                {
+                    // Remove stale peers first; with many active destinations
+                    // retain the most recently contacted ones.
+                    foreach (var stale in _lastSent
+                                 .Where(item => now - item.Value > MaxIdleMilliseconds)
+                                 .Select(static item => item.Key).ToArray())
+                        _lastSent.Remove(stale);
+                }
+                if (_lastSent.Count >= MaxPeers)
+                {
+                    var oldest = _lastSent.MinBy(static item => item.Value);
+                    _lastSent.Remove(oldest.Key);
+                }
+            }
+            _lastSent[peer] = now;
+        }
+    }
+
+    internal bool IsAllowed(IPEndPoint peer)
+    {
+        lock (_gate)
+        {
+            if (!_lastSent.TryGetValue(peer, out var lastSent))
+                return false;
+            if (_now() - lastSent <= MaxIdleMilliseconds)
+                return true;
+            _lastSent.Remove(peer);
+            return false;
+        }
     }
 }

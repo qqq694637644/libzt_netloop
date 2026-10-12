@@ -99,10 +99,33 @@ public sealed class Socks5UdpAssociationFactory : ISocks5UdpAssociationFactory, 
             }
             catch
             {
-                relay?.Dispose();
-                if (transport is not null)
-                    await transport.DisposeAsync().ConfigureAwait(false);
-                _capacity.Release();
+                // Always return the acquired permit, even if cleanup itself
+                // fails. Preserve the original creation error for diagnosis.
+                try
+                {
+                    relay?.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    JsonLog.Error("socks_udp_failed_creation_relay_dispose", new {
+                        error = ex.Message
+                    });
+                }
+                try
+                {
+                    if (transport is not null)
+                        await transport.DisposeAsync().ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    JsonLog.Error("socks_udp_failed_creation_transport_dispose", new {
+                        error = ex.Message
+                    });
+                }
+                finally
+                {
+                    _capacity.Release();
+                }
                 throw;
             }
         }
@@ -122,11 +145,27 @@ public sealed class Socks5UdpAssociationFactory : ISocks5UdpAssociationFactory, 
         {
             await association.Completion.ConfigureAwait(false);
         }
+        catch (Exception ex)
+        {
+            JsonLog.Error("socks_udp_association_completion_failed", new {
+                error_type = ex.GetType().Name,
+                error = ex.Message
+            });
+        }
         finally
         {
             try
             {
                 await association.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                // This observer is fire-and-forget; never leave an unobserved
+                // fault when the child transport rejects disposal.
+                JsonLog.Error("socks_udp_association_observer_dispose_failed", new {
+                    error_type = ex.GetType().Name,
+                    error = ex.Message
+                });
             }
             finally
             {
@@ -173,6 +212,7 @@ public sealed class Socks5UdpAssociationFactory : ISocks5UdpAssociationFactory, 
             return;
         }
 
+        Exception? disposalError = null;
         try
         {
             _stop.Cancel();
@@ -187,15 +227,30 @@ public sealed class Socks5UdpAssociationFactory : ISocks5UdpAssociationFactory, 
             foreach (var association in active)
                 association.Abort();
             foreach (var association in active)
-                await association.DisposeAsync().ConfigureAwait(false);
-
-            _capacity.Dispose();
-            _stop.Dispose();
+            {
+                try
+                {
+                    await association.DisposeAsync().ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    disposalError ??= ex;
+                    JsonLog.Error("socks_udp_factory_association_dispose_failed", new {
+                        error_type = ex.GetType().Name,
+                        error = ex.Message
+                    });
+                }
+            }
+            _active.Clear();
         }
         finally
         {
+            _capacity.Dispose();
+            _stop.Dispose();
             _factoryDisposed.TrySetResult();
         }
+        if (disposalError is not null)
+            throw new IOException("SOCKS5 UDP factory cleanup failed.", disposalError);
     }
 }
 
@@ -391,13 +446,21 @@ internal sealed class Socks5UdpAssociation : ISocks5UdpAssociation
         try
         {
             Abort();
-            await _transport.DisposeAsync().ConfigureAwait(false);
             try
             {
-                await Completion.ConfigureAwait(false);
+                await _transport.DisposeAsync().ConfigureAwait(false);
             }
-            catch (OperationCanceledException)
+            finally
             {
+                // Cancellation must drain loop tasks even if the transport's
+                // DisposeAsync throws. Releasing capacity is the final step.
+                try
+                {
+                    await Completion.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                }
             }
         }
         finally

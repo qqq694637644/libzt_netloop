@@ -4,8 +4,9 @@ using NetLoop.Libzt;
 namespace NetLoop.Host;
 
 /// <summary>
-/// Wait for temporarily missing Controller configuration without restarting
-/// the native Node. Other local programming/bind errors are terminal.
+/// Wait for missing Controller configuration and explicitly classified
+/// native-network bind failures without restarting the Node. Local port
+/// conflicts and all unknown errors are terminal, not blanket-retried.
 /// </summary>
 internal static class RuntimeRecovery
 {
@@ -13,12 +14,17 @@ internal static class RuntimeRecovery
         LibztNode node,
         HostOptions options,
         int resetCount,
+        Action processWaitingEvents,
         CancellationToken cancellationToken)
     {
         var waiting = false;
+        string? lastTransientIssue = null;
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            // A physical Wi-Fi/hotspot event must be processed even while
+            // this owner awaits a new Managed IP or native bind readiness.
+            processWaitingEvents();
             try
             {
                 var state = node.RefreshNetworkState();
@@ -40,13 +46,27 @@ internal static class RuntimeRecovery
                 }
             }
             catch (LibztException ex)
-                when (ex.IsNetworkUnavailable
+                when ((ex.IsNetworkUnavailable || ex.IsTransientRuntimeBindFailure)
                       && !cancellationToken.IsCancellationRequested)
             {
                 waiting = true;
+                if (ex.IsTransientRuntimeBindFailure)
+                {
+                    var issue = $"{ex.Operation}:{ex.SocketError}";
+                    if (issue != lastTransientIssue)
+                    {
+                        JsonLog.Error("runtime_native_network_bind_waiting", new {
+                            operation = ex.Operation,
+                            api_result = ex.ApiResult,
+                            socket_error = ex.SocketError,
+                            reset_count = resetCount
+                        });
+                        lastTransientIssue = issue;
+                    }
+                }
             }
-            // This is not a generic retry layer: only native unavailable/empty
-            // config is retryable. Do not loop forever on a port bind error.
+            // Retry only named transient network conditions. A permanent
+            // local port conflict or unknown error escapes immediately.
             await Task.Delay(500, cancellationToken).ConfigureAwait(false);
         }
     }

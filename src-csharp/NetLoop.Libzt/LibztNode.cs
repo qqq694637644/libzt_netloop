@@ -27,6 +27,7 @@ public sealed class LibztNode : IAsyncDisposable
     private LibztNetworkState? _state;
     private long _stateGeneration;
     private int _configAvailable;
+    private int _joinRequested;
     private bool _started;
     private bool _freed;
 
@@ -126,7 +127,11 @@ public sealed class LibztNode : IAsyncDisposable
 
     public bool TryNotifyPhysicalNetworkChanged()
     {
-        if (!Volatile.Read(ref _started))
+        // A NodeStart return does not imply NetJoin has been submitted.
+        // Keep the owner's pending refresh until native network join begins,
+        // otherwise an early successful refresh can be consumed too soon.
+        if (!Volatile.Read(ref _started)
+            || Volatile.Read(ref _joinRequested) == 0)
             return false;
 
         var result = LibztNative.NodeNetworkChanged();
@@ -168,6 +173,7 @@ public sealed class LibztNode : IAsyncDisposable
             node_online = LibztNative.NodeIsOnline() == 1
         });
         ThrowIfError("zts_net_join", LibztNative.NetJoin(_networkId));
+        Volatile.Write(ref _joinRequested, 1);
 
         while (LibztNative.NetTransportIsReady(_networkId) != 1)
         {
@@ -510,6 +516,7 @@ public sealed class LibztNode : IAsyncDisposable
         }
         finally
         {
+            Volatile.Write(ref _joinRequested, 0);
             Volatile.Write(ref _started, false);
         }
     }

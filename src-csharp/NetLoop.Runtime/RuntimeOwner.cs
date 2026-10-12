@@ -29,8 +29,8 @@ internal sealed record RuntimeStatus(
 internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
     : IAsyncDisposable
 {
-    private enum EventKind { Config, Unavailable, Physical, Manual }
-    private sealed record Event(
+    internal enum EventKind { Config, Unavailable, Physical, Manual }
+    internal sealed record Event(
         EventKind Kind, string Reason, LibztNetworkState? Network = null);
 
     private readonly Channel<Event> _events = Channel.CreateBounded<Event>(
@@ -49,6 +49,8 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
     private RuntimeStatus _status = new(RuntimePhase.Starting, null, null, null, 0);
     private int _resetCount;
     private int _running;
+    private bool _physicalRefreshPending;
+    private Event? _deferredManualReset;
 
     internal event Action<RuntimeStatus>? StatusChanged;
 
@@ -91,6 +93,84 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
         IReadOnlyList<IPAddress> latest)
         => latest.Count != 1 || !latest[0].Equals(boundAddress);
 
+    /// <summary>
+    /// The sole lifecycle owner must also handle physical path notifications
+    /// while StartAsync/RuntimeRecovery await Controller configuration.
+    /// Config/unavailable events need no replay: runtime creation re-queries
+    /// the native source. Preserve a manual reset until a runtime exists.
+    /// </summary>
+    private void DrainEventsWhileWaiting()
+        => DrainPendingWaitingEvents(
+            _events.Reader,
+            node.TryNotifyPhysicalNetworkChanged,
+            ref _physicalRefreshPending,
+            ref _deferredManualReset);
+
+    internal static void DrainPendingWaitingEvents(
+        ChannelReader<Event> events,
+        Func<bool> tryNotifyPhysicalNetworkChanged,
+        ref bool physicalRefreshPending,
+        ref Event? deferredManualReset)
+    {
+        while (events.TryRead(out var notification))
+        {
+            switch (notification.Kind)
+            {
+                case EventKind.Physical:
+                    physicalRefreshPending = true;
+                    break;
+                case EventKind.Manual:
+                    deferredManualReset = notification;
+                    break;
+                // A new runtime always reads the newest Controller state.
+                case EventKind.Config:
+                case EventKind.Unavailable:
+                    break;
+            }
+        }
+
+        // The native Node might not have started yet. Retain one coalesced
+        // refresh request and retry it on the next waiting iteration.
+        if (physicalRefreshPending && tryNotifyPhysicalNetworkChanged())
+            physicalRefreshPending = false;
+    }
+
+    private void RestoreDeferredManualReset()
+    {
+        if (_deferredManualReset is not { } reset)
+            return;
+        _deferredManualReset = null;
+        _events.Writer.TryWrite(reset);
+    }
+
+    internal static async Task AwaitStartupAsync(
+        Task startup,
+        Action processWaitingEvents,
+        Action reportDegraded,
+        CancellationToken cancellationToken)
+    {
+        var startedAt = Environment.TickCount64;
+        var degradedReported = false;
+        while (!startup.IsCompleted)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            processWaitingEvents();
+            if (!degradedReported
+                && Environment.TickCount64 - startedAt >= 3_000)
+            {
+                degradedReported = true;
+                reportDegraded();
+            }
+
+            if (!startup.IsCompleted)
+                await Task.WhenAny(
+                    startup, Task.Delay(250, cancellationToken))
+                    .ConfigureAwait(false);
+        }
+        processWaitingEvents();
+        await startup.ConfigureAwait(false);
+    }
+
     internal async Task RunAsync(CancellationToken cancellationToken)
     {
         if (Interlocked.Exchange(ref _running, 1) != 0)
@@ -115,10 +195,11 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
         {
             Publish(RuntimePhase.Starting, "native_node_starting");
             var startup = node.StartAsync(token);
-            var readinessDelay = Task.Delay(TimeSpan.FromSeconds(3), token);
-            if (await Task.WhenAny(startup, readinessDelay).ConfigureAwait(false) != startup)
-                Publish(RuntimePhase.Degraded, "waiting_for_controller");
-            await startup.ConfigureAwait(false);
+            await AwaitStartupAsync(
+                startup,
+                DrainEventsWhileWaiting,
+                () => Publish(RuntimePhase.Degraded, "waiting_for_controller"),
+                token).ConfigureAwait(false);
 
             while (!token.IsCancellationRequested)
             {
@@ -127,7 +208,7 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
                 {
                     Publish(RuntimePhase.Degraded, "waiting_for_runtime_configuration");
                     runtime = await RuntimeRecovery.CreateAsync(
-                            node, options, _resetCount, token)
+                            node, options, _resetCount, DrainEventsWhileWaiting, token)
                         .ConfigureAwait(false);
 
                     // Runtime creation includes several native binds. Never
@@ -154,6 +235,7 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
                     runtime.UpdateNetworkState(latest);
                     Volatile.Write(ref _active, runtime);
                     Publish(RuntimePhase.Ready, null);
+                    RestoreDeferredManualReset();
                 }
 
                 string? restart = null;

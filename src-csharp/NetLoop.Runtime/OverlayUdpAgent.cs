@@ -188,7 +188,18 @@ internal sealed class OverlayUdpAgent : IAsyncDisposable
         finally
         {
             var removed = TryRemoveAssociation(peer, association);
-            await association.DisposeAsync().ConfigureAwait(false);
+            try
+            {
+                await association.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                JsonLog.Error("overlay_udp_association_dispose_failed", new {
+                    peer = peer.ToString(),
+                    error_type = ex.GetType().Name,
+                    error = ex.Message
+                });
+            }
             if (removed)
             {
                 JsonLog.Info("overlay_udp_association_removed", new {
@@ -588,7 +599,7 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
         try
         {
             Abort();
-            await _localTransport.DisposeAsync().ConfigureAwait(false);
+            await DisposeTransportNoThrowAsync(_localTransport, "loopback");
 
             await _egressCreateLock.WaitAsync().ConfigureAwait(false);
             var egressTransport = _egressTransport;
@@ -598,7 +609,7 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
             _egressCreateLock.Release();
 
             if (egressTransport is not null)
-                await egressTransport.DisposeAsync().ConfigureAwait(false);
+                await DisposeTransportNoThrowAsync(egressTransport, "egress");
 
             try
             {
@@ -609,18 +620,37 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
             catch (OperationCanceledException)
             {
             }
-
+        }
+        finally
+        {
+            // Reclaim any queued datagrams even if a downstream transport
+            // refuses disposal or a worker fails while shutting down.
             while (_forwardQueue.Reader.TryRead(out var queued))
             {
                 Interlocked.Add(ref _queuedBytes, -queued.Content.Length);
                 _budget.Release(queued.Content.Length);
             }
-        }
-        finally
-        {
             _egressCreateLock.Dispose();
             _stop.Dispose();
             _disposedFinished.TrySetResult();
+        }
+    }
+
+    private static async Task DisposeTransportNoThrowAsync(
+        IProxyUdpTransport transport,
+        string kind)
+    {
+        try
+        {
+            await transport.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            JsonLog.Error("overlay_udp_transport_dispose_failed", new {
+                kind,
+                error_type = ex.GetType().Name,
+                error = ex.Message
+            });
         }
     }
 }

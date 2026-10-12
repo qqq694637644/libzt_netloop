@@ -4,6 +4,7 @@ using System.Net.Sockets;
 using System.Threading.Channels;
 using NetLoop.Core;
 using NetLoop.Host;
+using NetLoop.Libzt;
 using NetLoop.Socks;
 
 namespace NetLoop.Checks;
@@ -25,11 +26,16 @@ internal static class Program
             Check("Strict single Managed IPv4", SingleAddress);
             Check("Managed IP change requires exactly one rebuild", ManagedIpTransition);
             Check("UDP association removal matches key and object", UdpConditionalRemove);
+            Check("Native bind errors are classified without blanket retries", NativeBindClassification);
+            Check("UDP response peer set is bounded and expires entries", UdpResponsePeers);
             Check("SOCKS5 UDP datagram logical source", UdpPacketRoundTrip);
             Check("Shared UDP byte budget", UdpBudget);
             await CheckAsync("C Managed IP to 127.0.0.1 TCP", LoopbackTcp);
             await CheckAsync("C Managed IP to local UDP with source rewrite", LoopbackUdp);
             await CheckAsync("UDP Factory concurrent disposal", UdpFactoryDisposal);
+            await CheckAsync("Startup processes physical events while Node waits", StartupPhysicalRefresh);
+            await CheckAsync("UDP cleanup errors never leak association capacity", UdpFaultyCleanup);
+            await CheckAsync("Overlay UDP returns queued bytes after failed Dispose", OverlayFaultyCleanup);
             await CheckAsync("Optional status output failure isolation", StatusOutputFailure);
             await CheckAsync("JSONL consumer survives an output failure", JsonLogConsumerSurvives);
             Console.WriteLine($"PASS {_passed} offline tests");
@@ -135,6 +141,100 @@ internal static class Program
             "Unexpected change to newer association");
         Require(OverlayUdpAgent.RemoveMatching(dictionary, "peer", replacement),
             "Current association could not be removed");
+    }
+
+    private static void NativeBindClassification()
+    {
+        foreach (var errno in new[] { 99, 100, 101, 113 })
+        {
+            Require(new LibztException("zts_bsd_bind_easy", -1, errno)
+                .IsTransientRuntimeBindFailure, $"Expected transient native bind errno {errno}");
+            Require(new LibztException("zts_bsd_socket(udp)", -1, errno)
+                .IsTransientRuntimeBindFailure, $"Expected transient UDP socket errno {errno}");
+        }
+
+        Require(!new LibztException("zts_bsd_bind_easy", -1, 98)
+            .IsTransientRuntimeBindFailure, "EADDRINUSE must fail immediately");
+        Require(!new LibztException("zts_bsd_bind_easy", -2, 100)
+            .IsTransientRuntimeBindFailure, "Native service failure is not a bind retry");
+        Require(!new LibztException("zts_bsd_write", -1, 100)
+            .IsTransientRuntimeBindFailure, "Established TCP I/O must not trigger startup retries");
+        Require(!new LibztException("zts_bsd_bind_easy", -1, 0)
+            .IsTransientRuntimeBindFailure, "Unknown errno must not retry");
+        Require(new LibztException("zts_core_query_route_count", -4)
+            .IsNetworkUnavailable, "Temporarily missing Controller data must be retryable");
+    }
+
+    private static void UdpResponsePeers()
+    {
+        long now = 1000;
+        var peers = new UdpResponsePeerRegistry(() => now);
+        var first = new IPEndPoint(IPAddress.Parse("10.70.1.1"), 42043);
+        Require(!peers.IsAllowed(first), "Unsolicited peer response was accepted");
+        for (var i = 1; i <= UdpResponsePeerRegistry.MaxPeers; i++)
+        {
+            peers.Allow(new IPEndPoint(IPAddress.Parse($"10.70.1.{i}"), 42043));
+            now++;
+        }
+        Require(peers.Count == UdpResponsePeerRegistry.MaxPeers,
+            "Peer set did not reach expected cap");
+        var newer = new IPEndPoint(IPAddress.Parse("10.70.1.65"), 42043);
+        peers.Allow(newer);
+        Require(peers.Count == UdpResponsePeerRegistry.MaxPeers,
+            "Peer set exceeded fixed maximum");
+        Require(!peers.IsAllowed(first), "Oldest peer was not evicted");
+        Require(peers.IsAllowed(newer), "Most recent contacted peer missing");
+        now += UdpResponsePeerRegistry.MaxIdleMilliseconds + 1;
+        Require(!peers.IsAllowed(newer), "Expired peer remains authorized");
+        peers.Allow(first);
+        Require(peers.IsAllowed(first), "A subsequent outbound send should reauthorize peer");
+    }
+
+    private static async Task StartupPhysicalRefresh()
+    {
+        var notifications = Channel.CreateUnbounded<RuntimeOwner.Event>();
+        var startup = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstAttempt = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondAttempt = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var nativeReady = false;
+        var attempts = 0;
+        var pending = false;
+        RuntimeOwner.Event? deferredReset = null;
+
+        notifications.Writer.TryWrite(
+            new RuntimeOwner.Event(RuntimeOwner.EventKind.Physical, "wifi_changed"));
+        notifications.Writer.TryWrite(
+            new RuntimeOwner.Event(RuntimeOwner.EventKind.Manual, "manual_reset"));
+
+        var wait = RuntimeOwner.AwaitStartupAsync(
+            startup.Task,
+            () => RuntimeOwner.DrainPendingWaitingEvents(
+                notifications.Reader,
+                () => {
+                    if (Interlocked.Increment(ref attempts) == 1)
+                        firstAttempt.TrySetResult();
+                    else
+                        secondAttempt.TrySetResult();
+                    return nativeReady;
+                },
+                ref pending,
+                ref deferredReset),
+            () => { },
+            CancellationToken.None);
+        await firstAttempt.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Require(!startup.Task.IsCompleted,
+            "Physical notification was not processed before startup finished");
+        Require(pending, "Physical refresh was lost while native Node was unavailable");
+        nativeReady = true;
+        await secondAttempt.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Require(!pending, "Pending refresh was not sent once native Node was ready");
+        Require(deferredReset?.Kind == RuntimeOwner.EventKind.Manual,
+            "Manual reset must survive startup waiting");
+        startup.SetResult();
+        await wait.WaitAsync(TimeSpan.FromSeconds(2));
     }
 
     private static void UdpPacketRoundTrip()
@@ -264,6 +364,94 @@ internal static class Program
         await association.DisposeAsync();
     }
 
+    private static async Task UdpFaultyCleanup()
+    {
+        using var control = new FakeControl();
+        var factory = new Socks5UdpAssociationFactory(
+            new FaultyDisposeUdpFactory(), 1, TimeSpan.FromMinutes(1));
+
+        // Invalid declared client address fails AFTER transport creation.
+        // Its DisposeAsync also throws; CreateAsync must preserve the original
+        // protocol error and return the only capacity permit.
+        await ThrowsAsync<ProtocolViolationException>(async () => {
+            _ = await factory.CreateAsync(
+                control, new ProxyTarget("invalid-client-name", 5000),
+                CancellationToken.None);
+        });
+
+        var association = await factory.CreateAsync(
+            control, new ProxyTarget("0.0.0.0", 0), CancellationToken.None);
+        await ThrowsAsync<IOException>(
+            () => association.DisposeAsync().AsTask());
+
+        // Association DisposeAsync was faulty too, but the next admission
+        // must still succeed under the same maxAssociations=1 cap.
+        var next = await factory.CreateAsync(
+            control, new ProxyTarget("0.0.0.0", 0), CancellationToken.None);
+        try
+        {
+            await factory.DisposeAsync().AsTask()
+                .WaitAsync(TimeSpan.FromSeconds(3));
+        }
+        catch (IOException)
+        {
+            // Factory reports the transport cleanup failure, but must
+            // finish releasing every Association and shared semaphore.
+        }
+        await next.DisposeAsync();
+        await factory.DisposeAsync();
+        Require(factory.ActiveAssociations == 0,
+            "Factory still tracks associations after failed transport disposal");
+
+        // A failure in the first of several active Associations must not
+        // skip the others or release shared capacity while they still run.
+        var multi = new Socks5UdpAssociationFactory(
+            new FaultyDisposeUdpFactory(), 2, TimeSpan.FromMinutes(1));
+        var first = await multi.CreateAsync(
+            control, new ProxyTarget("0.0.0.0", 0), CancellationToken.None);
+        var second = await multi.CreateAsync(
+            control, new ProxyTarget("0.0.0.0", 0), CancellationToken.None);
+        try
+        {
+            await multi.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(3));
+        }
+        catch (IOException)
+        {
+        }
+        await Task.WhenAll(first.DisposeAsync().AsTask(), second.DisposeAsync().AsTask());
+        Require(multi.ActiveAssociations == 0,
+            "A failed association cleanup prevented the other from closing");
+    }
+
+    private static async Task OverlayFaultyCleanup()
+    {
+        var budget = new UdpByteBudget(1024 * 1024);
+        var transport = new FaultyDisposeUdpTransport(blockSends: true);
+        var association = new OverlayUdpAssociation(
+            new IPEndPoint(A, 54321),
+            C,
+            new RouteSelector(Snapshot(C), B, 1),
+            transport,
+            new EchoUdpFactory(),
+            TimeSpan.FromMinutes(1),
+            32,
+            TimeSpan.FromSeconds(2),
+            budget,
+            (_, _, _) => ValueTask.CompletedTask,
+            CancellationToken.None);
+
+        for (var i = 0; i < 16; i++)
+            Require(association.TryEnqueue(
+                new ProxyTarget(C.ToString(), 3389),
+                new byte[1024]), "Failed to enqueue test UDP datagram");
+        Require(budget.UsedBytes > 0, "No UDP data was held in the pending queue");
+
+        await association.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(3));
+        Require(budget.UsedBytes == 0,
+            "Failed UDP transport disposal left queued bytes reserved");
+        await association.DisposeAsync();
+    }
+
     private static async Task StatusOutputFailure()
     {
         var root = Path.Combine(Path.GetTempPath(),
@@ -352,6 +540,19 @@ internal static class Program
         throw new Exception($"Expected {typeof(T).Name}");
     }
 
+    private static async Task ThrowsAsync<T>(Func<Task> action) where T : Exception
+    {
+        try
+        {
+            await action().ConfigureAwait(false);
+        }
+        catch (T)
+        {
+            return;
+        }
+        throw new Exception($"Expected {typeof(T).Name}");
+    }
+
     private sealed class EchoUdpFactory : IProxyUdpTransportFactory
     {
         public ValueTask<IProxyUdpTransport> CreateAsync(CancellationToken token)
@@ -400,6 +601,40 @@ internal static class Program
             await Task.Delay(Timeout.InfiniteTimeSpan, token);
             throw new InvalidOperationException("Unexpected completion");
         }
+    }
+
+    private sealed class FaultyDisposeUdpFactory : IProxyUdpTransportFactory
+    {
+        public ValueTask<IProxyUdpTransport> CreateAsync(CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested();
+            return ValueTask.FromResult<IProxyUdpTransport>(
+                new FaultyDisposeUdpTransport());
+        }
+    }
+
+    private sealed class FaultyDisposeUdpTransport(bool blockSends = false)
+        : IProxyUdpTransport
+    {
+        public async ValueTask SendAsync(
+            ProxyTarget target,
+            ReadOnlyMemory<byte> content,
+            CancellationToken cancellationToken)
+        {
+            if (blockSends)
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+        }
+
+        public async ValueTask<ProxyUdpDatagram> ReceiveAsync(
+            CancellationToken cancellationToken)
+        {
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            throw new InvalidOperationException("Synthetic receive unexpectedly resumed");
+        }
+
+        public ValueTask DisposeAsync()
+            => ValueTask.FromException(
+                new IOException("synthetic transport cleanup failure"));
     }
 
     private sealed class FakeControl : IProxyConnection, IDisposable

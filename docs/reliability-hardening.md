@@ -43,9 +43,17 @@ RuntimeOwner 能关闭并创建业务 Runtime；旧本地 UDP Association
 
 `LibztNode.JoinAndWaitAsync` 中 native Node 启动有截止时间，
 Controller 暂时不可用则继续等待；明确拒绝加入是终态错误。
-`RuntimeRecovery` 只等待原生网络配置查询 `ErrNoResult` 或暂时
-没有 Managed IP；端口被占用、多个地址、不支持地址族等错误直接
-报错，**不增加自动兼容或无限重试**。
+`RuntimeOwner` 在 **Node 启动等待**和**业务 Runtime 等待**
+两个阶段都会及时消费物理网络变化通知：Node 尚未完成 `NetJoin`
+时合并保存刷新请求，加入完成后再通知 libzt；人工 Reset 请求
+保留到业务 Runtime 创建完毕处理。不额外运行守护进程。
+
+`RuntimeRecovery` 等待 `ErrNoResult`、暂时没有 Managed IP，
+以及**可明确分类**的原生 Agent socket/bind 网络错误：
+`EADDRNOTAVAIL (99)`、`ENETDOWN (100)`、`ENETUNREACH (101)`、
+`EHOSTUNREACH (113)`。这些代码来自本仓库固定的 libzt/lwIP ABI。
+`EADDRINUSE (98)`、未知 errno、其它 native 服务失败、多个
+Managed IP 和不支持地址族仍直接报错；**不对全部异常做无限重试**。
 **按用户要求，不提供 Windows 服务、进程守护、自动重启或任务计划。**
 需要人工诊断后手动重新启动程序；不要求删除 ZeroTier state 文件。
 
@@ -104,6 +112,14 @@ UDP 接收队列、单包发送时限、每个 UDP 远端独立的有界队列
 超限丢包计数 `udp_queue_dropped`。删除未完成原生 fd 生命周期
 验证的 shared Poller 和切换开关，保留单一 per-socket 实现。
 不要盲目把容量提升到最大值。
+
+本地 SOCKS5 UDP Factory 在创建失败时即使下游传输的
+`DisposeAsync` 也失败，仍归还已获得的容量令牌，并保留原始
+创建异常。Factory 关闭时逐个等待关联停止，清理某一个关联
+失败也要继续关闭其余关联后再释放共享信号量；Overlay UDP
+传输清理失败时仍归还未发送的排队字节预算。UDP 回复 Peer
+集合只保留最近使用的最多 **64** 个地址，闲置超过 **120 秒**
+的地址不再接受回复；这是响应来源限制，不参与 Controller 路由发现。
 
 第四阶段只保留已有的日志轮转和离线 JSONL 探测日志的
 小时/72h/7天统计。需要更新应用时直接从 GitHub Releases 下载，

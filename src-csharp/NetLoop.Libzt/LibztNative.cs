@@ -53,6 +53,12 @@ internal static class LibztNative
     // sizeof(zts_sockaddr_storage) in the pinned libzt ABI.
     internal const int SocketAddressStorageBytes = 28;
     internal const int EAgain = 11;
+    // Values from the pinned ZeroTierSockets.h / lwIP errno ABI.
+    internal const int EAddressInUse = 98;
+    internal const int EAddressNotAvailable = 99;
+    internal const int ENetworkDown = 100;
+    internal const int ENetworkUnreachable = 101;
+    internal const int EHostUnreachable = 113;
     internal const int ETimedOut = 110;
     // The pinned Windows libzt/lwIP build uses UCRT errno values for
     // SO_RCVTIMEO. Keep these explicit until the native ABI is normalized.
