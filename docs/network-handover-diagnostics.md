@@ -14,7 +14,9 @@ A 可通过 Controller 直连 C 的 SOCKS5 Agent。以下只解释新的诊断�
   `local / overlay` 以及来源 IP（A/C 的 Managed IP）汇总。
   `RejectedLocal` / `RejectedOverlay` 与 `RejectedSources`
   记录容量拒绝来源；大量连续拒绝的 JSONL 日志采用指数采样，
-  **状态文件中的计数保持精确**。空闲、已关闭的连接不会继续计入。
+  **内存中的计数保持精确**；`runtime_phase` 在状态变化时输出
+  占用快照，容量拒绝事件记录当时的分类与来源。
+  空闲、已关闭的连接不会继续计入。
 - **A/C 侧 Peer 拨号**：整个业务 Runtime 中，对同一个 B/C
   Managed IP 同时最多 2 个 TCP 连接 + SOCKS5 greeting 协商，
   另可排队
@@ -34,8 +36,9 @@ A 可通过 Controller 直连 C 的 SOCKS5 Agent。以下只解释新的诊断�
 - **TCP 退出计数一致性**：本地/Overlay 入站连接完成异步清理后，
   同一个 `TcpSessionTracker.Lease` 才移除当前阶段统计并归还
   全局 `SemaphoreSlim` 容量；重复关闭不会重复释放名额。
-  状态文件的 `active_tcp_tunnels` 与 `tcp_session_phases.Total`
-  取自**同一个统计快照**。极短的“信号量已被 accept 获取、
+  内存中的活跃连接数与 `tcp_session_phases.Total`
+  使用**同一个统计快照**，`runtime_phase` 在阶段变化时输出。
+  极短的“信号量已被 accept 获取、
   会话尚未注册”窗口仍可能存在，不夸大为整个数据面的原子快照。
 - **物理路径刷新失败**：Node Ready 期间
   `zts_node_network_changed` 返回失败，会在原本的单一
@@ -58,19 +61,20 @@ A 可通过 Controller 直连 C 的 SOCKS5 Agent。以下只解释新的诊断�
 ## 人工 A/B/C 验收
 
 1. 在 A、B、C 三端手动运行**同一构建**，不要覆盖或删除 ZeroTier
-   `state` 和 `identity`。可使用 `--status-file` 与有界 `--log-file`。
+   `state` 和 `identity`。使用有界 `--log-file` 保存事件，
+   **不需要 `--status-file` 或周期状态文件**。
    Windows JSONL 路径示例：`--log-file logs/netloop.jsonl --log-max-mb 16 --log-retain 5`。
 2. 在 A、C 各自的终端**手动**运行已有
    `tools/connection_probe.ps1`，例如指定 `-Node A -IntervalSeconds 2`，
    使采样窗口足够细。这个外部探测测量 SOCKS → 实际目标服务，
    而非只测 native NODE_ONLINE。手动结束探测即可。
 3. 依次测试：正常新建 A→B、A→C TCP/RDP；A/C 切 Wi-Fi/热点；
-   B 切网；短暂断网恢复。保留所有端 UTC 时间与状态文件。
+   B 切网；短暂断网恢复。保留各端带 UTC 时间戳的 JSONL 日志。
 4. 对照三端以下字段：
-   - **`tcp_accept_rejected` / `tcp_session_phases`**：容量拒绝时
+   - **`tcp_accept_rejected` / `runtime_phase.data.tcp_session_phases`**：容量拒绝时
      是哪个来源、握手/上游建连/Relay 哪一类占了 128 名额。
    - **`peer_dial_rejected`、`peer_dial_failure_backoff`、
-     `peer_dials`**：是否仍有单 Peer 并发洪峰；排队拒绝是否
+     `runtime_phase.data.peer_dials`**：是否仍有单 Peer 并发洪峰；排队拒绝是否
      只影响新连接，而原 RDP 不会被本限速器主动断开。
    - **`libzt_physical_network_refresh_requested`、
      `libzt_udp_bound_ports_changed`**：切网请求后，Binder

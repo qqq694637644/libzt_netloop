@@ -23,11 +23,12 @@ Controller 仅更新路由时替换原子快照，**不动已有 TCP/RDP**。
 原生 Node/身份文件不重建或覆盖。普通 Wi-Fi/热点切换只通知 libzt
 更新路径，**不能只因网络事件就中断旧 TCP**。
 
-Windows/Linux `--status-file` 每 15 秒原子更新
-`updated_at_utc`、`last_network_query_utc`、`route_generation`、
-`network_config_available`、活动绑定地址和当前
-`phase=starting|ready|degraded|resetting|stopped`，同时记录
-全局 TCP 活跃量、UDP 排队字节数、ACL 拒绝与 UDP 丢包计数。
+Windows/Linux **没有** `--status-file` 参数、定期状态文件或
+15 秒写盘心跳。Runtime 的路由快照、可用性、TCP 阶段及来源、
+Peer 拨号/冷却等状态始终保存在内存中；状态转换时记录
+`runtime_phase` JSONL，包含 `phase`、`reason`、
+`route_generation`、`node`、`bind_address` 及阶段/拨号快照。
+TCP 连接满额时，`tcp_accept_rejected` 记录当时的阶段/来源。
 `ready` 只代表业务端监听器就绪，不代表 A→C RDP 可达。
 Android 使用**破坏式 Control API v2**，直接输出
 `STARTING / READY / DEGRADED / RESETTING / STOPPED`，
@@ -55,8 +56,8 @@ Android 使用**破坏式 Control API v2**，直接输出
 
 TCP 未授权来源在 Agent 接入后拒绝并关闭；CONNECT 目标端口
 不允许则回复 SOCKS5 0x02。UDP 不符合来源或目标规则直接丢弃。
-日志 `agent_source_denied`、`agent_target_denied` 与状态
-`agent_source_denied`、`agent_target_denied` 提供汇总。
+`agent_source_denied`、`agent_target_denied` JSONL 事件及
+进程内 ACL 拒绝计数用于诊断。
 来源 Managed IP **不是**加密验证的 Node ID：成员权限仍应在
 ZeroTier Controller 里正确管理。ACL 不生成 Managed Routes，
 不改变 /0 和经 via 网关的拒绝策略。
@@ -75,9 +76,9 @@ Overlay UDP 接收后会交由**每个远端单独的处理队列**异步转发�
 一个上游的慢发送/建连不会阻塞其他远端的原生接收循环。
 每条关联限制排队数据量约 1MiB；整个 Runtime UDP 队列
 合计还限制为 16MiB，超限直接丢包，不会无期限等待。
-`system_receive`、`routing_receive`、
-`overlay_forward` 累计在状态文件 `udp_queue_dropped` 中。
-`overlay_udp_queue_drop` 有源地址和目标地址方便排障。
+`system_receive`、`routing_receive`、`overlay_forward`
+的丢包计数保存在进程内；`overlay_udp_queue_drop`
+JSONL 事件包含源地址和目标地址方便排障。
 
 实验性的共享 FD Poller 及其参数已删除，**只维护原有
 per-socket Poller**。原生 fd 批量 poll 的收益与断网安全性

@@ -26,7 +26,7 @@ jobs are currently disabled.
 
 ## Overlay addresses
 
-This personal-use runtime requires **exactly one Controller-assigned IPv4 Managed IP per node**. A missing address leaves the native Node alive while waiting for Controller configuration; multiple Managed IPs or an IPv6-only assignment are explicit configuration errors. It does not silently choose a "primary" address or maintain a second Agent listener. The single address is published in the status.
+This personal-use runtime requires **exactly one Controller-assigned IPv4 Managed IP per node**. A missing address leaves the native Node alive while waiting for Controller configuration; multiple Managed IPs or an IPv6-only assignment are explicit configuration errors. It does not silently choose a "primary" address or maintain a second Agent listener. The single address appears in the `runtime_phase` JSONL readiness event.
 
 `--default-exit` is required on every node and selects the exit used for non-overlay destinations; it **does not override ZeroTier's direct-peer routing**. Every direct ZeroTier peer is identified exclusively by matching the Controller-assigned address prefixes and Managed Routes, never by hardcoding a network such as `172.26.0.0/24` or maintaining a manually entered peer list. **The `--peer` CLI argument has been removed: old command lines that include it now fail to start.** The exit node may use its own primary address as `--default-exit`; in that case NetLoop uses local egress instead of connecting to itself.
 
@@ -45,8 +45,8 @@ peer transport/path event (codes 240–244). The entry includes:
 - `physical_paths`: IP:port endpoints, preferred/expired flags and latency
 - `change`: the underlying libzt event, e.g. `PEER_PATH_DEAD`
 
-To identify the A→B link, compare `peer_id` in A's log with `node_id` in
-B's `server-status.json` (or B's `libzt_network_ready` log). **Do not** infer
+To identify the A→B link, compare `peer_id` in A's log with `data.node` in
+B's `libzt_network_ready` or `runtime_phase` JSONL event. **Do not** infer
 the physical P2P state from `route: "OverlayPeer"`: that is the logical
 NetLoop route, not ZeroTier's direct/relay underlay.
 
@@ -76,7 +76,7 @@ waiting in libzt's blocking `zts_connect` helper. To diagnose failures,
 inspect `libzt_connect_retry` (including `elapsed_ms`),
 `libzt_connect_cancelled`, and `socks_peer_negotiation_retry` in the A-node
 log. When troubleshooting identity mismatches, compare both nodes'
-`status-file` `node_id` values to the actual authorized members in the
+`libzt_network_ready.data.node` values to the actual authorized members in the
 ZeroTier controller; Managed IP alone does not identify a peer.
 
 ### TCP connect / accept correlation
@@ -152,7 +152,6 @@ unbounded shell redirection. For example:
 ```powershell
 netloop.exe --network <network-id> --state-dir .\state `
   --default-exit <zt-managed-ip> `
-  --status-file .\netloop-status.json `
   --log-file .\logs\netloop.jsonl --log-max-mb 16 --log-retain 5
 ```
 
@@ -163,15 +162,18 @@ recovery limitations, event names, and parameter details.
 
 Further PR #3 hardening includes 30-second native Controller config
 revalidation (new routing rejects requests while configuration is missing),
-15-second health/status-file updates, opt-in inbound Agent source-IP/CIDR and
-destination-port ACLs, and resource-budget/UDP queue-drop counters.
+in-memory Runtime health and event-driven `runtime_phase` JSONL records,
+opt-in inbound Agent source-IP/CIDR and destination-port ACLs,
+and resource-budget/UDP queue-drop counters.
 The unvalidated shared Poller and its CLI switch have been removed. Only the
 known per-socket Poller remains while idle CPU, RDP, native fd ownership and
 handover performance await actual A/B/C device measurements.
 
 To diagnose multi-request floods and slow physical path recovery, the runtime
-now reports accepted TCP phases/sources (`tcp_session_phases`), bounded
-per-Peer dialing (`peer_dials`), and observed native UDP ports and
+keeps TCP phases/sources and per-Peer dial usage in memory, emits
+`tcp_session_phases` / `peer_dials` snapshots when `runtime_phase` changes
+and detailed `tcp_accept_rejected` / `peer_dial_rejected` JSONL events,
+alongside observed native UDP ports and
 RELAY/DIRECT/NODE_OFFLINE events. These do **not** claim to eliminate native
 70–110s Peer recovery or the observed ~226s Node cycle. See
 [the manual handover diagnosis guide](docs/network-handover-diagnostics.md)

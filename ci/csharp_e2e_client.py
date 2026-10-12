@@ -21,7 +21,7 @@ from common import (
     kill_process_tree,
     parse_stun_public_ip,
     start_detached,
-    wait_for_json,
+    wait_for_netloop_ready,
 )
 from github_artifacts import wait_and_download
 
@@ -397,7 +397,6 @@ def start_client(
     executable: Path,
     rendezvous: dict,
     listen_port: int,
-    status_path: Path,
     reset_command_path: Path | None = None,
 ) -> int:
     command = [
@@ -414,8 +413,6 @@ def start_client(
         str(rendezvous["overlay_udp_port"]),
         "--default-exit",
         rendezvous["server_ip"],
-        "--status-file",
-        str(status_path),
         "--startup-timeout",
         "180",
         "--connect-timeout",
@@ -450,37 +447,21 @@ def write_json_atomic(path: Path, content: dict) -> None:
 
 
 def wait_for_reset_ready(
-    status_path: Path,
+    log_path: Path,
     *,
     expected_process_id: int,
     expected_reset_count: int,
     expected_node_id: str,
+    start_offset: int,
     timeout: float,
 ) -> dict:
-    deadline = time.monotonic() + timeout
-    last: dict | None = None
-    while time.monotonic() < deadline:
-        try:
-            if status_path.exists():
-                last = json.loads(status_path.read_text(encoding="utf-8"))
-                if (
-                    last.get("phase") == "ready"
-                    and int(last.get("reset_count", -1)) == expected_reset_count
-                    and int(last.get("process_id", 0)) == expected_process_id
-                ):
-                    if last.get("node_id") != expected_node_id:
-                        raise AssertionError(
-                            "Node ID changed across runtime reset: "
-                            f"{expected_node_id} -> {last.get('node_id')}"
-                        )
-                    return last
-        except (json.JSONDecodeError, PermissionError, OSError, ValueError, TypeError):
-            pass
-        time.sleep(0.02)
-
-    raise TimeoutError(
-        "runtime reset did not become ready in time; "
-        f"expected_reset_count={expected_reset_count}, last={last}"
+    return wait_for_netloop_ready(
+        log_path,
+        timeout=timeout,
+        process_id=expected_process_id,
+        reset_count=expected_reset_count,
+        expected_node_id=expected_node_id,
+        start_offset=start_offset,
     )
 
 
@@ -565,7 +546,7 @@ def write_reset_timing_matrix(rows: list[dict[str, object]]) -> None:
         "tcp_attempts",
         "udp_assoc_attempts",
         "udp_attempts",
-        "status_ms",
+        "ready_event_ms",
         "result",
         "errors",
     ]
@@ -582,7 +563,7 @@ def write_reset_timing_matrix(rows: list[dict[str, object]]) -> None:
                     str(row.get("tcp_attempts", 0)),
                     str(row.get("udp_assoc_attempts", 0)),
                     str(row.get("udp_attempts", 0)),
-                    "" if row.get("status_ms") is None else f"{row['status_ms']:.1f}",
+                    "" if row.get("ready_event_ms") is None else f"{row['ready_event_ms']:.1f}",
                     "PASS" if row.get("passed") else "FAIL",
                     " | ".join(str(value) for value in errors),
                 ]
@@ -598,7 +579,7 @@ def write_reset_timing_matrix(rows: list[dict[str, object]]) -> None:
 def run_reset_stress(
     proxy_port: int,
     rendezvous: dict,
-    status_path: Path,
+    log_path: Path,
     reset_command_path: Path,
     initial_status: dict,
     cycles: int,
@@ -621,8 +602,8 @@ def run_reset_stress(
             "tcp_attempts": 0,
             "udp_assoc_attempts": 0,
             "udp_attempts": 0,
-            "status_ms": None,
-            "status_ok": False,
+            "ready_event_ms": None,
+            "ready_event_ok": False,
             "passed": False,
             "errors": [],
         }
@@ -862,6 +843,7 @@ def run_reset_stress(
             )
 
         threads: list[threading.Thread] = []
+        event_start_offset = log_path.stat().st_size if log_path.exists() else 0
         try:
             try:
                 write_json_atomic(
@@ -920,26 +902,27 @@ def run_reset_stress(
                     f"udp: {udp_state.get('last_error') or 'probe failed'}"
                 )
 
-            status_started = time.monotonic()
+            ready_started = time.monotonic()
             try:
                 ready_status = wait_for_reset_ready(
-                    status_path,
+                    log_path,
                     expected_process_id=process_id,
                     expected_reset_count=expected_reset_count,
                     expected_node_id=node_id,
+                    start_offset=event_start_offset,
                     timeout=5.0,
                 )
                 last_ready_status = ready_status
-                row["status_ms"] = (
-                    time.monotonic() - status_started
+                row["ready_event_ms"] = (
+                    time.monotonic() - ready_started
                 ) * 1000.0
-                row["status_ok"] = True
+                row["ready_event_ok"] = True
                 row["observed_reset_count"] = int(
                     ready_status.get("reset_count", -1)
                 )
             except Exception as exc:
                 row["errors"].append(
-                    f"status: {format_exception(exc)}"
+                    f"runtime_phase ready: {format_exception(exc)}"
                 )
 
             old_close_ok = (
@@ -960,7 +943,7 @@ def run_reset_stress(
                 old_close_ok
                 and tcp_ok
                 and udp_ok
-                and row.get("status_ok") is True
+                and row.get("ready_event_ok") is True
                 and not row["errors"]
             )
         finally:
@@ -1001,7 +984,7 @@ def run_reset_stress(
         "failed": cycles - passed,
         "success": passed == cycles,
         "identity_preserved": all(
-            row.get("status_ok") is True for row in rows
+            row.get("ready_event_ok") is True for row in rows
         ),
         "rows": rows,
         "old_close_p95_ms": nearest_rank_percentile(old_close_samples, 95),
@@ -1120,17 +1103,18 @@ def main() -> int:
         if not executable.exists():
             raise FileNotFoundError(executable)
 
-        status_path = EVIDENCE / "client_status.json"
+        log_path = EVIDENCE / "netloop_process.log"
+        log_path.unlink(missing_ok=True)
         reset_command_path = EVIDENCE / "reset_command.json"
         reset_command_path.unlink(missing_ok=True)
         client_pid = start_client(
             executable,
             rendezvous,
             args.listen_port,
-            status_path,
             reset_command_path if args.reset_stress else None,
         )
-        status = wait_for_json(status_path, timeout=200)
+        status = wait_for_netloop_ready(
+            log_path, timeout=200, process_id=client_pid)
         result["client_joined"] = True
         result["client_status"] = status
         first_node_id = status.get("node_id")
@@ -1223,7 +1207,7 @@ def main() -> int:
             reset_metrics = run_reset_stress(
                 args.listen_port,
                 rendezvous,
-                status_path,
+                log_path,
                 reset_command_path,
                 status,
                 args.reset_cycles,
@@ -1271,9 +1255,15 @@ def main() -> int:
                 except OSError:
                     pass
 
-        status_path.unlink(missing_ok=True)
-        client_pid = start_client(executable, rendezvous, args.listen_port, status_path)
-        restarted_status = wait_for_json(status_path, timeout=200)
+        event_start_offset = log_path.stat().st_size if log_path.exists() else 0
+        client_pid = start_client(executable, rendezvous, args.listen_port)
+        restarted_status = wait_for_netloop_ready(
+            log_path,
+            timeout=200,
+            process_id=client_pid,
+            expected_node_id=first_node_id,
+            start_offset=event_start_offset,
+        )
         result["restart_status"] = restarted_status
         result["identity_preserved"] = restarted_status.get("node_id") == first_node_id
         if not result["identity_preserved"]:
@@ -1303,16 +1293,6 @@ def main() -> int:
     finally:
         if client_pid:
             kill_process_tree(client_pid)
-        try:
-            if (EVIDENCE / "client_status.json").exists():
-                current_status = json.loads(
-                    (EVIDENCE / "client_status.json").read_text(encoding="utf-8")
-                )
-                current_pid = int(current_status.get("process_id", 0))
-                if current_pid and current_pid != client_pid:
-                    kill_process_tree(current_pid)
-        except (json.JSONDecodeError, OSError, ValueError, TypeError):
-            pass
         collect_windows_evidence(EVIDENCE / "network")
         (EVIDENCE / "result.json").write_text(
             json.dumps(result, indent=2), encoding="utf-8"

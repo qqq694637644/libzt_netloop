@@ -47,7 +47,7 @@ internal static class Program
             Check("Ready Runtime retries a failed native refresh", ReadyRefreshRetry);
             await CheckAsync("UDP cleanup errors never leak association capacity", UdpFaultyCleanup);
             await CheckAsync("Overlay UDP returns queued bytes after failed Dispose", OverlayFaultyCleanup);
-            await CheckAsync("Optional status output failure isolation", StatusOutputFailure);
+            Check("Removed --status-file CLI is rejected", RemovedStatusOption);
             await CheckAsync("JSONL consumer survives an output failure", JsonLogConsumerSurvives);
             Console.WriteLine($"PASS {_passed} offline tests");
             return 0;
@@ -893,24 +893,23 @@ internal static class Program
         await association.DisposeAsync();
     }
 
-    private static async Task StatusOutputFailure()
+    private static void RemovedStatusOption()
     {
-        var root = Path.Combine(Path.GetTempPath(),
-            "netloop-status-failure-" + Guid.NewGuid().ToString("N"));
-        // The parent is a regular file, not a directory. CreateDirectory
-        // must fail, and optional status output must swallow that failure.
-        File.WriteAllText(root, "dummy file blocking status directory");
-        try
-        {
-            await StatusWriter.TryWriteAsync(
-                Path.Combine(root, "status.json"),
-                new { phase = "ready" },
-                CancellationToken.None).ConfigureAwait(false);
-        }
-        finally
-        {
-            File.Delete(root);
-        }
+        Throws<ArgumentException>(() => HostOptions.Parse([
+            "--network", "123456789abcdef0",
+            "--state-dir", "state",
+            "--default-exit", "10.70.0.2",
+            "--status-file", "client-status.json"
+        ]));
+        var options = HostOptions.Parse([
+            "--network", "123456789abcdef0",
+            "--state-dir", "state",
+            "--default-exit", "10.70.0.2"
+        ]);
+        Require(options.DefaultExit?.Equals(B) == true,
+            "The supported configuration did not parse after status-file removal");
+        Require(!HostOptions.Usage.Contains("--status-file", StringComparison.Ordinal),
+            "Removed --status-file is still advertised in --help");
     }
 
     private static async Task JsonLogConsumerSurvives()

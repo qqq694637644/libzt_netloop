@@ -103,7 +103,8 @@ manifest 对应的 libzt submodule SHA、CMake、build script、
 
 第二阶段实现：30 秒周期性 native Controller 配置核验、查询失败
 `Reject`（而非空路由或 B 兜底），唯一 Managed IPv4 变化时
-重建业务 Runtime、不执行 Agent 热迁移；15 秒 status-file 心跳、
+重建业务 Runtime、不执行 Agent 热迁移；Windows/Linux 仅保留
+内存状态与事件驱动 JSONL（**已删除 status-file/15 秒写盘心跳**）、
 可选来源 CIDR / 目标 TCP/UDP 端口 ACL。
 来源 ACL 基于 ZeroTier socket 已呈现的来源 IP，**不是独立的
 ZeroTier Node ID 加密认证**；不能用它选择 Overlay 路由。
@@ -153,8 +154,8 @@ JSONL 拒绝事件进行指数采样，避免二次日志风暴。
 入站 TCP 结束时，先完成本地/Overlay 连接异步 Dispose，
 随后由单个 `TcpSessionTracker.Lease` 同步移除阶段统计、释放
 共享 `SemaphoreSlim` 名额，避免在关闭中的连接上提前归还名额；
-状态文件的 `active_tcp_tunnels` 和 `tcp_session_phases.Total`
-共用同一采样结果。并发退出、异常退出和重复 Dispose 已有离线
+`runtime_phase` JSONL 与 Runtime 内存中的 `tcp_session_phases.Total`
+使用同一份活动会话快照。并发退出、异常退出和重复 Dispose 已有离线
 回归检查。
 
 Node Ready 后通知 libzt 更新物理路径时，若原生 API 返回失败，

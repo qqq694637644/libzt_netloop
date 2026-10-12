@@ -21,7 +21,6 @@ internal sealed class HostOptions
             "--upstream-port",
             "--upstream-user",
             "--upstream-password",
-            "--status-file",
             "--log-file",
             "--log-max-mb",
             "--log-retain",
@@ -54,7 +53,6 @@ internal sealed class HostOptions
     internal ushort UpstreamPort { get; init; } = 1080;
     internal string? UpstreamUsername { get; init; }
     internal string? UpstreamPassword { get; init; }
-    internal string? StatusFile { get; init; }
     internal string? LogFile { get; init; }
     internal int LogMaxMegabytes { get; init; } = 16;
     internal int LogRetainedFiles { get; init; } = 5;
@@ -168,7 +166,6 @@ internal sealed class HostOptions
             UpstreamPort = ParsePort(Optional(values, "--upstream-port") ?? "1080", "--upstream-port"),
             UpstreamUsername = upstreamUsername,
             UpstreamPassword = upstreamPassword,
-            StatusFile = Optional(values, "--status-file"),
             LogFile = logFile,
             LogMaxMegabytes = logMaxMb,
             LogRetainedFiles = logRetain,
@@ -245,7 +242,6 @@ internal sealed class HostOptions
           --upstream-port <port>      Upstream SOCKS5 port (default 1080; upstream mode only)
           --upstream-user <user>      RFC1929 username; requires password
           --upstream-password <pass>  RFC1929 password; requires username
-          --status-file <path>        Atomic readiness/status JSON output
           --log-file <path>           Optional rotating JSONL file (stdout by default)
           --log-max-mb <MiB>          Maximum file size (default 16, range 1..1024)
           --log-retain <count>        Retained rotated files (default 5, range 1..50)
