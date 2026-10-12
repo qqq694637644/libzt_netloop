@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Threading.Channels;
 using NetLoop.Core;
 using NetLoop.Host;
@@ -31,6 +32,7 @@ internal static class Program
             Check("TCP capacity occupancy classified by phase and source", TcpSessionPhases);
             await CheckAsync("TCP permit shutdown and concurrent exits reconcile", TcpSessionPermitShutdown);
             Check("Underlay port and Peer path timeline uses observed events", UnderlayTimeline);
+            Check("Native underlay trace ABI and event kinds are fixed", NativeUnderlayTraceAbi);
             Check("SOCKS5 UDP datagram logical source", UdpPacketRoundTrip);
             Check("Shared UDP byte budget", UdpBudget);
             await CheckAsync("C Managed IP to 127.0.0.1 TCP", LoopbackTcp);
@@ -135,6 +137,49 @@ internal static class Program
             "Revoked IP must request one Runtime replacement");
         Require(RuntimeOwner.RequiresManagedIpRebind(C, []),
             "Missing IP must withdraw active Runtime");
+    }
+
+    private static void NativeUnderlayTraceAbi()
+    {
+        Require(Marshal.SizeOf<LibztNative.UnderlayTraceEvent>() == 240,
+            "Native trace C# ABI must match 240-byte native struct");
+        Require(Marshal.OffsetOf<LibztNative.UnderlayTraceEvent>(
+                nameof(LibztNative.UnderlayTraceEvent.Endpoint)).ToInt64() == 48,
+            "Native trace endpoint must start at offset 48");
+        Require(Marshal.OffsetOf<LibztNative.UnderlayTraceEvent>(
+                nameof(LibztNative.UnderlayTraceEvent.LocalEndpoint)).ToInt64() == 112,
+            "Native trace local endpoint must start at offset 112");
+        Require(Marshal.OffsetOf<LibztNative.UnderlayTraceEvent>(
+                nameof(LibztNative.UnderlayTraceEvent.InterfaceName)).ToInt64() == 176,
+            "Native trace interface name must start at offset 176");
+        Require(LibztUnderlayDiagnostics.NativeKind(1) == "network_refresh_queued"
+                && LibztUnderlayDiagnostics.NativeKind(3) == "binder_refresh_completed"
+                && LibztUnderlayDiagnostics.NativeKind(5) == "wire_udp_sent"
+                && LibztUnderlayDiagnostics.NativeKind(6) == "wire_udp_received"
+                && LibztUnderlayDiagnostics.NativeKind(8) == "planet_path_snapshot"
+                && LibztUnderlayDiagnostics.NativeKind(10) == "core_hello_sent"
+                && LibztUnderlayDiagnostics.NativeKind(11) == "core_hello_authenticated"
+                && LibztUnderlayDiagnostics.NativeKind(12) == "core_ok_hello_sent"
+                && LibztUnderlayDiagnostics.NativeKind(13) == "core_ok_hello_authenticated"
+                && LibztUnderlayDiagnostics.NativeKind(14) == "core_rendezvous_sent"
+                && LibztUnderlayDiagnostics.NativeKind(15) == "core_rendezvous_authenticated"
+                && LibztUnderlayDiagnostics.NativeKind(16) == "core_upstream_online_decision"
+                && LibztUnderlayDiagnostics.NativeKind(17) == "core_peer_path_learned"
+                && LibztUnderlayDiagnostics.NativeKind(18) == "core_echo_sent"
+                && LibztUnderlayDiagnostics.NativeKind(19) == "core_ok_echo_authenticated"
+                && LibztUnderlayDiagnostics.NativeKind(20) == "core_rendezvous_source"
+                && LibztUnderlayDiagnostics.NativeKind(21) == "core_surface_observed"
+                && LibztUnderlayDiagnostics.NativeKind(22) == "core_surface_previous"
+                && LibztUnderlayDiagnostics.NativeKind(23) == "core_peer_probe_or_path_removed"
+                && LibztUnderlayDiagnostics.NativeKind(24) == "core_memorized_path_lookup"
+                && LibztUnderlayDiagnostics.NativeKind(25) == "core_unknown_path_confirmation"
+                && LibztUnderlayDiagnostics.NativeKind(26) == "core_switch_route_selected"
+                && LibztUnderlayDiagnostics.NativeKind(27) == "core_upstream_probe_scheduler"
+                && LibztUnderlayDiagnostics.NativeKind(28) == "core_scope_path_invalidated"
+                && LibztUnderlayDiagnostics.NativeKind(29) == "core_surface_expired",
+            "Native trace kinds must remain compatible across builds");
+        Require(LibztUnderlayDiagnostics.NativeKind(200) == "unknown",
+            "Unknown native trace kind must remain safe");
     }
 
     private static void UdpConditionalRemove()

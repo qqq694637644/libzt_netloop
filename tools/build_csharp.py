@@ -19,6 +19,13 @@ LIBZT_PATCHES = [
     ROOT / "patches" / "libzt" / "0003-peer-event-details.patch",
     ROOT / "patches" / "libzt" / "0004-network-cidr-queries.patch",
     ROOT / "patches" / "libzt" / "0005-underlay-port-diagnostics.patch",
+    ROOT / "patches" / "libzt" / "0006-native-underlay-trace.patch",
+    ROOT / "patches" / "libzt" / "0007-core-underlay-socket-trace.patch",
+    ROOT / "patches" / "libzt" / "0008-recovery-decision-trace.patch",
+]
+ZERO_TIER_ONE_PATCHES = [
+    ROOT / "patches" / "zerotierone" / "0001-netloop-core-path-trace.patch",
+    ROOT / "patches" / "zerotierone" / "0002-netloop-recovery-decision-trace.patch",
 ]
 
 
@@ -70,6 +77,34 @@ def apply_libzt_patches() -> None:
                 f"apply: {check.stderr}\nreverse: {reverse.stderr}"
             )
 
+def apply_zerotierone_patches() -> None:
+    zerotier = ROOT / "external" / "libzt" / "ext" / "ZeroTierOne"
+    for patch in ZERO_TIER_ONE_PATCHES:
+        if not patch.is_file():
+            raise FileNotFoundError(patch)
+        check = subprocess.run(
+            ["git", "apply", "--check", str(patch)],
+            cwd=zerotier,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        if check.returncode == 0:
+            run(["git", "apply", str(patch)], cwd=zerotier)
+            continue
+        reverse = subprocess.run(
+            ["git", "apply", "--reverse", "--check", str(patch)],
+            cwd=zerotier,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        if reverse.returncode != 0:
+            raise RuntimeError(
+                f"ZeroTierOne patch does not apply cleanly: {patch}\n"
+                f"apply: {check.stderr}\nreverse: {reverse.stderr}"
+            )
+
 
 def native_cache_identity() -> dict[str, str]:
     libzt_tree = git_output("ls-tree", "HEAD", "external/libzt").split()
@@ -84,6 +119,10 @@ def native_cache_identity() -> dict[str, str]:
         identity[f"libzt_patch_{index}_sha"] = git_output(
             "hash-object",
             str(patch.relative_to(ROOT)),
+        )
+    for index, patch in enumerate(ZERO_TIER_ONE_PATCHES, start=1):
+        identity[f"zerotierone_patch_{index}_sha"] = git_output(
+            "hash-object", str(patch.relative_to(ROOT))
         )
     return identity
 
@@ -102,6 +141,7 @@ def build_native(args: argparse.Namespace) -> Path:
     started = time.monotonic()
     ensure_submodules()
     apply_libzt_patches()
+    apply_zerotierone_patches()
 
     build_dir = Path(args.native_build_dir).resolve()
     if args.clean_native and build_dir.exists():
