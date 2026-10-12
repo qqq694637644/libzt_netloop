@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>NetLoop.Checks</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../NetLoop.Runtime/NetLoop.Runtime.csproj" />
+    <ProjectReference Include="../NetLoop.Host/NetLoop.Host.csproj" />
+  </ItemGroup>
+</Project>

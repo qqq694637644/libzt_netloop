@@ -8,8 +8,12 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
 {
     private readonly LibztTcpListener _listener;
     private readonly Socks5ConnectionHandler _handler;
+    private readonly AgentAccessPolicy _accessPolicy;
     private readonly SemaphoreSlim _capacity;
+    private readonly TcpSessionTracker _sessions;
+    private readonly int _maxConnections;
     private readonly CancellationTokenSource _stop = new();
+    private readonly CancellationTokenSource _acceptStop;
     private readonly object _clientsGate = new();
     private readonly HashSet<Task> _clients = [];
     private readonly HashSet<LibztTcpConnection> _activeClients = [];
@@ -17,20 +21,30 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
     private int _aborted;
     private int _disposed;
 
+    internal Task Completion => _loop;
+
     internal OverlaySocksAgent(
         string bindAddress,
         ushort port,
         Socks5ConnectionHandler handler,
-        int maxConnections)
+        int maxConnections,
+        SemaphoreSlim capacity,
+        TcpSessionTracker sessions,
+        AgentAccessPolicy accessPolicy)
     {
         _handler = handler;
-        _capacity = new SemaphoreSlim(maxConnections, maxConnections);
+        _accessPolicy = accessPolicy;
+        _capacity = capacity;
+        _sessions = sessions;
+        _maxConnections = maxConnections;
         _listener = LibztTcpListener.Start(bindAddress, port, maxConnections);
-        _loop = AcceptLoopAsync(_stop.Token);
+        _acceptStop = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token);
+        _loop = AcceptLoopAsync(_acceptStop.Token);
     }
 
     private async Task AcceptLoopAsync(CancellationToken cancellationToken)
     {
+        var consecutiveFailures = 0;
         while (!cancellationToken.IsCancellationRequested)
         {
             LibztTcpConnection connection;
@@ -47,25 +61,52 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
                 if (cancellationToken.IsCancellationRequested)
                     break;
 
+                consecutiveFailures++;
                 JsonLog.Error("overlay_accept_failed", new { error = ex.Message });
+                // A listener repeatedly failing accept() is not healthy,
+                // even if the retry task itself is still technically alive.
+                if (consecutiveFailures >= 30)
+                    throw new IOException(
+                        "Overlay TCP accept failed 30 consecutive times.", ex);
                 await Task.Delay(100, cancellationToken).ConfigureAwait(false);
                 continue;
             }
 
-            if (!await _capacity.WaitAsync(0, cancellationToken).ConfigureAwait(false))
+            consecutiveFailures = 0;
+            var source = (connection.RemoteEndPoint as System.Net.IPEndPoint)?.Address;
+            if (!_accessPolicy.AllowsSource(source))
             {
-                JsonLog.Info("tcp_accept_rejected", new {
+                JsonLog.Info("agent_source_denied", new {
+                    protocol = "tcp",
                     connection_id = connection.ConnectionId,
-                    client = connection.Description,
-                    reason = "max_connections"
+                    source = connection.RemoteEndPoint?.ToString()
                 });
+                await connection.DisposeAsync().ConfigureAwait(false);
+                continue;
+            }
+
+            bool accepted;
+            try
+            {
+                accepted = await _capacity.WaitAsync(0, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                await connection.DisposeAsync().ConfigureAwait(false);
+                break;
+            }
+            if (!accepted)
+            {
+                _sessions.Reject(
+                    "overlay", source?.ToString() ?? "unknown", _maxConnections);
                 await connection.DisposeAsync().ConfigureAwait(false);
                 continue;
             }
 
             lock (_clientsGate)
                 _activeClients.Add(connection);
-            TrackClient(HandleClientAsync(connection, cancellationToken), connection);
+            TrackClient(HandleClientAsync(connection, _stop.Token), connection);
         }
     }
 
@@ -98,10 +139,16 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
         LibztTcpConnection connection,
         CancellationToken cancellationToken)
     {
+        using var usage = _sessions.Track(
+            "overlay",
+            (connection.RemoteEndPoint as System.Net.IPEndPoint)?
+                .Address.ToString() ?? "unknown",
+            _capacity);
         await using var client = connection;
         try
         {
-            await _handler.HandleAsync(client, cancellationToken).ConfigureAwait(false);
+            await _handler.HandleAsync(
+                client, cancellationToken, usage.SetPhase).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -115,10 +162,6 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
                 error = ex.Message
             });
         }
-        finally
-        {
-            _capacity.Release();
-        }
     }
 
     internal void Abort()
@@ -127,6 +170,7 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
             return;
 
         _stop.Cancel();
+        _acceptStop.Cancel();
         _ = _listener.DisposeAsync();
 
         LibztTcpConnection[] activeClients;
@@ -142,6 +186,7 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
             return;
 
         Abort();
+        await _listener.DisposeAsync().ConfigureAwait(false);
 
         try
         {
@@ -158,6 +203,7 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
             await Task.WhenAll(activeClients).ConfigureAwait(false);
 
         _stop.Dispose();
-        _capacity.Dispose();
+        _acceptStop.Dispose();
+        // The Runtime disposes the shared capacity after both listeners stop.
     }
 }

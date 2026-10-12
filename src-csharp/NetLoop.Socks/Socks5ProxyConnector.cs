@@ -6,6 +6,7 @@ namespace NetLoop.Socks;
 public sealed class Socks5ProxyConnector : IProxyConnector
 {
     private static readonly TimeSpan RetryDelay = TimeSpan.FromMilliseconds(100);
+    private static readonly TimeSpan DefaultReplyTimeout = TimeSpan.FromSeconds(25);
 
     private readonly IProxyConnector _transportConnector;
     private readonly ProxyTarget _proxyEndpoint;
@@ -13,6 +14,7 @@ public sealed class Socks5ProxyConnector : IProxyConnector
     private readonly string? _password;
     private readonly TimeSpan? _negotiationRetryWindow;
     private readonly TimeSpan _negotiationAttemptTimeout;
+    private readonly TimeSpan _connectReplyTimeout;
 
     public Socks5ProxyConnector(
         IProxyConnector transportConnector,
@@ -20,7 +22,8 @@ public sealed class Socks5ProxyConnector : IProxyConnector
         string? username = null,
         string? password = null,
         TimeSpan? negotiationRetryWindow = null,
-        TimeSpan? negotiationAttemptTimeout = null)
+        TimeSpan? negotiationAttemptTimeout = null,
+        TimeSpan? connectReplyTimeout = null)
     {
         Socks5Credentials.Validate(username, password);
         _transportConnector = transportConnector;
@@ -30,6 +33,9 @@ public sealed class Socks5ProxyConnector : IProxyConnector
         _negotiationRetryWindow = negotiationRetryWindow;
         _negotiationAttemptTimeout =
             negotiationAttemptTimeout ?? TimeSpan.FromSeconds(1);
+        _connectReplyTimeout = connectReplyTimeout ?? DefaultReplyTimeout;
+        if (_connectReplyTimeout <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(connectReplyTimeout));
     }
 
     public async ValueTask<IProxyConnection> ConnectAsync(
@@ -38,19 +44,65 @@ public sealed class Socks5ProxyConnector : IProxyConnector
     {
         var connection = await ConnectAndNegotiateAsync(
             cancellationToken).ConfigureAwait(false);
+        return await ConnectTargetAsync(
+            connection, target, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Connects to the SOCKS Peer and completes the greeting only.
+    /// The caller owns the returned connection and must either complete
+    /// CONNECT using ConnectTargetAsync or dispose it.
+    /// </summary>
+    public async ValueTask<IProxyConnection> ConnectAndNegotiateAsync(
+        CancellationToken cancellationToken)
+    {
+        if (_negotiationRetryWindow is null)
+            return await ConnectAndNegotiateOnceAsync(
+                cancellationToken).ConfigureAwait(false);
+
+        return await ConnectAndNegotiateWithRetriesAsync(
+            _negotiationRetryWindow.Value,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Asks a successfully negotiated SOCKS Peer to connect to the target.
+    /// This is target work: a refusal or slow reply does not mean the
+    /// Peer TCP/SOCKS greeting failed. Owns and disposes the connection
+    /// on any target-stage failure.
+    /// </summary>
+    public async ValueTask<IProxyConnection> ConnectTargetAsync(
+        IProxyConnection connection,
+        ProxyTarget target,
+        CancellationToken cancellationToken)
+    {
         try
         {
+            using var replyCts =
+                CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            replyCts.CancelAfter(_connectReplyTimeout);
+            var replyToken = replyCts.Token;
             var request = Socks5Protocol.BuildTargetRequest(Socks5Protocol.Connect, target);
-            await connection.WriteAsync(request, request.Length, cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await connection.WriteAsync(request, request.Length, replyToken).ConfigureAwait(false);
 
-            var reply = new byte[4];
-            await Socks5Protocol.ReadExactlyAsync(connection, reply, 4, cancellationToken).ConfigureAwait(false);
-            if (reply[0] != Socks5Protocol.Version)
-                throw new ProtocolViolationException($"Invalid SOCKS5 reply version {reply[0]}.");
-            if (reply[1] != Socks5Protocol.ReplySucceeded)
-                throw new IOException($"SOCKS5 CONNECT to {target} failed with reply 0x{reply[1]:x2}.");
+                var reply = new byte[4];
+                await Socks5Protocol.ReadExactlyAsync(connection, reply, 4, replyToken).ConfigureAwait(false);
+                if (reply[0] != Socks5Protocol.Version)
+                    throw new ProtocolViolationException($"Invalid SOCKS5 reply version {reply[0]}.");
+                if (reply[1] != Socks5Protocol.ReplySucceeded)
+                    throw new IOException($"SOCKS5 CONNECT to {target} failed with reply 0x{reply[1]:x2}.");
 
-            await Socks5Protocol.ConsumeReplyAddressAsync(connection, reply[3], cancellationToken).ConfigureAwait(false);
+                await Socks5Protocol.ConsumeReplyAddressAsync(connection, reply[3], replyToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+                when (!cancellationToken.IsCancellationRequested
+                      && replyCts.IsCancellationRequested)
+            {
+                throw new TimeoutException(
+                    $"SOCKS5 CONNECT reply from {_proxyEndpoint} exceeded {_connectReplyTimeout.TotalSeconds:0.#} seconds.");
+            }
             return connection;
         }
         catch
@@ -60,16 +112,13 @@ public sealed class Socks5ProxyConnector : IProxyConnector
         }
     }
 
-    private async ValueTask<IProxyConnection> ConnectAndNegotiateAsync(
+    private async ValueTask<IProxyConnection> ConnectAndNegotiateWithRetriesAsync(
+        TimeSpan retryWindow,
         CancellationToken cancellationToken)
     {
-        if (_negotiationRetryWindow is null)
-            return await ConnectAndNegotiateOnceAsync(
-                cancellationToken).ConfigureAwait(false);
-
         var negotiationId = ConnectionTrace.NewId();
         var inboundId = ConnectionTrace.InboundConnectionId;
-        var deadline = DateTimeOffset.UtcNow + _negotiationRetryWindow.Value;
+        var deadline = DateTimeOffset.UtcNow + retryWindow;
         var attempt = 0;
         Exception? lastError = null;
 

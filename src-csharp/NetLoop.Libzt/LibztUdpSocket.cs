@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
@@ -71,8 +72,6 @@ public sealed class LibztUdpSocket : IAsyncDisposable
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var bytes = content.ToArray();
-            var contentHandle = GCHandle.Alloc(bytes, GCHandleType.Pinned);
             var address = Marshal.AllocHGlobal(SocketAddressBufferSize);
             try
             {
@@ -105,20 +104,27 @@ public sealed class LibztUdpSocket : IAsyncDisposable
                     lock (_nativeGate)
                     {
                         EnsureCurrentFd(fd, cancellationToken);
-                        sent = LibztNative.SendTo(
-                            fd,
-                            contentHandle.AddrOfPinnedObject(),
-                            checked((uint)bytes.Length),
-                            0,
-                            address,
-                            checked((ushort)addressLength));
+                        // Pin caller-owned ReadOnlyMemory only for the
+                        // synchronous native syscall. Avoid copying every
+                        // outgoing UDP packet or pinning across an await.
+                        unsafe
+                        {
+                            using var pinned = content.Pin();
+                            sent = LibztNative.SendTo(
+                                fd,
+                                (nint)pinned.Pointer,
+                                checked((uint)content.Length),
+                                0,
+                                address,
+                                checked((ushort)addressLength));
+                        }
                         if (sent == LibztNative.ErrSocket)
                             socketError = LibztNative.GetLastSocketError(fd);
                     }
                     if (sent >= 0)
                     {
-                        if (sent != bytes.Length)
-                            throw new IOException($"libzt UDP partial send: requested={bytes.Length}, sent={sent}");
+                        if (sent != content.Length)
+                            throw new IOException($"libzt UDP partial send: requested={content.Length}, sent={sent}");
                         return;
                     }
 
@@ -141,7 +147,6 @@ public sealed class LibztUdpSocket : IAsyncDisposable
             finally
             {
                 Marshal.FreeHGlobal(address);
-                contentHandle.Free();
             }
         }
         finally
@@ -152,7 +157,9 @@ public sealed class LibztUdpSocket : IAsyncDisposable
 
     public async ValueTask<LibztUdpDatagram> ReceiveFromAsync(CancellationToken cancellationToken)
     {
-        var buffer = Marshal.AllocHGlobal(MaxDatagramSize);
+        // Reuse the 64 KiB backing store: do not allocate/free unmanaged
+        // memory for every single datagram received.
+        var buffer = ArrayPool<byte>.Shared.Rent(MaxDatagramSize);
         var address = Marshal.AllocHGlobal(SocketAddressBufferSize);
         var addressLengthPointer = Marshal.AllocHGlobal(sizeof(uint));
         var text = Marshal.AllocHGlobal(LibztNative.IpStringLength);
@@ -178,15 +185,23 @@ public sealed class LibztUdpSocket : IAsyncDisposable
                 lock (_nativeGate)
                 {
                     EnsureCurrentFd(fd, cancellationToken);
-                    received = LibztNative.ReceiveFrom(
-                        fd,
-                        buffer,
-                        checked((uint)MaxDatagramSize),
-                        0,
-                        address,
-                        addressLengthPointer);
-                    if (received == LibztNative.ErrSocket)
-                        socketError = LibztNative.GetLastSocketError(fd);
+                    var handle = GCHandle.Alloc(buffer, GCHandleType.Pinned);
+                    try
+                    {
+                        received = LibztNative.ReceiveFrom(
+                            fd,
+                            handle.AddrOfPinnedObject(),
+                            checked((uint)MaxDatagramSize),
+                            0,
+                            address,
+                            addressLengthPointer);
+                        if (received == LibztNative.ErrSocket)
+                            socketError = LibztNative.GetLastSocketError(fd);
+                    }
+                    finally
+                    {
+                        handle.Free();
+                    }
                 }
 
                 if (received < 0)
@@ -222,7 +237,7 @@ public sealed class LibztUdpSocket : IAsyncDisposable
                 var ipText = Marshal.PtrToStringAnsi(text)
                     ?? throw new IOException("libzt returned an empty UDP source address.");
                 var content = new byte[received];
-                Marshal.Copy(buffer, content, 0, received);
+                Buffer.BlockCopy(buffer, 0, content, 0, received);
                 return new LibztUdpDatagram(
                     new IPEndPoint(IPAddress.Parse(ipText), port),
                     content);
@@ -233,7 +248,7 @@ public sealed class LibztUdpSocket : IAsyncDisposable
             Marshal.FreeHGlobal(text);
             Marshal.FreeHGlobal(addressLengthPointer);
             Marshal.FreeHGlobal(address);
-            Marshal.FreeHGlobal(buffer);
+            ArrayPool<byte>.Shared.Return(buffer);
         }
     }
 

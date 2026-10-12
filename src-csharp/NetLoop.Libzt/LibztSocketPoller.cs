@@ -2,6 +2,9 @@ namespace NetLoop.Libzt;
 
 internal static class LibztSocketPoller
 {
+    private static long _pollCalls;
+    internal static long PollCalls => Interlocked.Read(ref _pollCalls);
+
     private static readonly TimeSpan RetryDelay =
         TimeSpan.FromMilliseconds(10);
 
@@ -31,6 +34,7 @@ internal static class LibztSocketPoller
                     currentFdProvider,
                     cancellationToken,
                     disposedObjectName);
+                Interlocked.Increment(ref _pollCalls);
                 result = LibztNative.Poll(
                     ref descriptor,
                     1,

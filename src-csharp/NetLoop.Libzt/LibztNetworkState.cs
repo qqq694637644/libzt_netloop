@@ -9,4 +9,9 @@ public sealed record LibztNetworkState(
     IReadOnlyList<IPAddress> ManagedAddresses,
     IReadOnlyList<OverlayPrefix> AssignedPrefixes,
     IReadOnlyList<ManagedOverlayRoute> ManagedRoutes,
-    long Generation);
+    long Generation)
+{
+    // Observed when native core returned a complete config snapshot. A
+    // missing native network is never published as an empty route table.
+    public DateTimeOffset QueriedAtUtc { get; init; } = DateTimeOffset.UtcNow;
+}

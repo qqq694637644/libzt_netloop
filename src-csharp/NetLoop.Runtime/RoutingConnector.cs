@@ -16,6 +16,8 @@ internal sealed class RoutingConnector : IProxyConnector
     private readonly IProxyConnector _libztConnector;
     private readonly IProxyConnector _loopbackConnector;
     private readonly IProxyConnector _egressConnector;
+    private readonly PeerDialCoordinator _peerDials;
+    private readonly TimeSpan _connectReplyTimeout;
 
     internal RoutingConnector(
         RouteSelector selector,
@@ -23,7 +25,9 @@ internal sealed class RoutingConnector : IProxyConnector
         ushort overlayPort,
         IProxyConnector libztConnector,
         IProxyConnector loopbackConnector,
-        IProxyConnector egressConnector)
+        IProxyConnector egressConnector,
+        PeerDialCoordinator peerDials,
+        TimeSpan connectReplyTimeout)
     {
         _selector = selector;
         _overlayIngress = overlayIngress;
@@ -31,6 +35,8 @@ internal sealed class RoutingConnector : IProxyConnector
         _libztConnector = libztConnector;
         _loopbackConnector = loopbackConnector;
         _egressConnector = egressConnector;
+        _peerDials = peerDials;
+        _connectReplyTimeout = connectReplyTimeout;
     }
 
     public async ValueTask<IProxyConnection> ConnectAsync(
@@ -56,7 +62,7 @@ internal sealed class RoutingConnector : IProxyConnector
         };
     }
 
-    private ValueTask<IProxyConnection> ConnectViaPeerAsync(
+    private async ValueTask<IProxyConnection> ConnectViaPeerAsync(
         RouteDecision decision,
         ProxyTarget target,
         CancellationToken cancellationToken)
@@ -68,7 +74,16 @@ internal sealed class RoutingConnector : IProxyConnector
             _libztConnector,
             new ProxyTarget(peer.ToString(), _overlayPort),
             negotiationRetryWindow: PeerNegotiationRecoveryWindow,
-            negotiationAttemptTimeout: PeerNegotiationAttemptTimeout);
-        return proxy.ConnectAsync(target, cancellationToken);
+            negotiationAttemptTimeout: PeerNegotiationAttemptTimeout,
+            connectReplyTimeout: _connectReplyTimeout);
+        // Admission/backoff covers only transport + SOCKS greeting.
+        // Destination CONNECT can be slow/refused despite a healthy Peer:
+        // do not hold Peer dial slots or cool down B/C for target errors.
+        var negotiated = await _peerDials.ConnectAsync(
+            peer,
+            proxy.ConnectAndNegotiateAsync,
+            cancellationToken).ConfigureAwait(false);
+        return await proxy.ConnectTargetAsync(
+            negotiated, target, cancellationToken).ConfigureAwait(false);
     }
 }

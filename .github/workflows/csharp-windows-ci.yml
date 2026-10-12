@@ -52,7 +52,9 @@ jobs:
           $script = git hash-object tools/build_csharp.py
           $networkRefreshPatch = git hash-object patches/libzt/0001-host-network-change-refresh.patch
           $peerEventPatch = git hash-object patches/libzt/0003-peer-event-details.patch
-          "key=libzt-pinvoke-win-x64-$libzt-$cmake-$script-$networkRefreshPatch-$peerEventPatch" >> $env:GITHUB_OUTPUT
+          $cidrPatch = git hash-object patches/libzt/0004-network-cidr-queries.patch
+          $portsPatch = git hash-object patches/libzt/0005-underlay-port-diagnostics.patch
+          "key=libzt-pinvoke-win-x64-$libzt-$cmake-$script-$networkRefreshPatch-$peerEventPatch-$cidrPatch-$portsPatch" >> $env:GITHUB_OUTPUT
 
       - name: Restore compiled libzt bundle
         id: native-cache
@@ -87,9 +89,10 @@ jobs:
           if (-not (Test-Path native-cache/libzt.dll)) {
             throw "native-cache/libzt.dll is missing"
           }
-          if (Test-Path native-cache/libzt.dll.manifest.json) {
-            Get-Content native-cache/libzt.dll.manifest.json
+          if (-not (Test-Path native-cache/libzt.dll.manifest.json)) {
+            throw "Native library manifest is missing"
           }
+          Get-Content native-cache/libzt.dll.manifest.json
 
       - name: Save compiled libzt bundle immediately
         if: steps.native-cache.outputs.cache-hit != 'true'
@@ -105,6 +108,9 @@ jobs:
           --native-input native-cache/libzt.dll
           --output dist-csharp
           --runtime win-x64
+
+      - name: Run deterministic offline C# regressions
+        run: dotnet run --project src-csharp/NetLoop.Checks/NetLoop.Checks.csproj --configuration Release
 
       - name: Upload C# runtime
         uses: actions/upload-artifact@v4

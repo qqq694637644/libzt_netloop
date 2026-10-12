@@ -1,0 +1,111 @@
+diff --git a/include/ZeroTierSockets.h b/include/ZeroTierSockets.h
+index d338a6f..0bf5401 100644
+--- a/include/ZeroTierSockets.h
++++ b/include/ZeroTierSockets.h
+@@ -1724,6 +1724,12 @@ ZTS_API int ZTCALL zts_node_get_id_pair(char* key, unsigned int* key_dst_len);
+  */
+ ZTS_API int ZTCALL zts_node_get_port();
+ 
++/**
++ * Read-only snapshot of the primary and secondary UDP ports actually
++ * present in libzt's binder local-interface address set. Zero means not bound.
++ */
++ZTS_API int ZTCALL zts_netloop_get_bound_udp_ports(uint16_t* primary, uint16_t* secondary);
++
+ /**
+  * @brief Notify the node that the host's physical network changed.
+  *
+diff --git a/src/Controls.cpp b/src/Controls.cpp
+index 6ddb7a3..07f6a3f 100644
+--- a/src/Controls.cpp
++++ b/src/Controls.cpp
+@@ -633,6 +633,15 @@ int zts_node_get_port()
+     return zts_service->getPrimaryPort();
+ }
+ 
++int zts_netloop_get_bound_udp_ports(uint16_t* primary, uint16_t* secondary)
++{
++    if (!primary || !secondary)
++        return ZTS_ERR_ARG;
++    ACQUIRE_SERVICE(ZTS_ERR_SERVICE);
++    zts_service->getBoundUdpPorts(primary, secondary);
++    return ZTS_ERR_OK;
++}
++
+ int zts_node_network_changed()
+ {
+     ACQUIRE_SERVICE(ZTS_ERR_SERVICE);
+diff --git a/src/NodeService.cpp b/src/NodeService.cpp
+index 32a11c7..3925158 100644
+--- a/src/NodeService.cpp
++++ b/src/NodeService.cpp
+@@ -421,6 +421,22 @@ NodeService::ReasonForTermination NodeService::run()
+                     _binder.refresh(_phy, p, pc, explicitBind, *this);
+                 }
+ 
++                // Observe the binder itself: _secondaryPort stays zero for
++                // dynamic rotation and cannot describe the real UDP binding.
++                unsigned int primaryBound = 0;
++                unsigned int secondaryBound = 0;
++                std::vector<InetAddress> bound(_binder.allBoundLocalInterfaceAddresses());
++                for (std::vector<InetAddress>::const_iterator i(bound.begin()); i != bound.end(); ++i) {
++                    const unsigned int port = i->port();
++                    if (port == _ports[0])
++                        primaryBound = port;
++                    if (_ports[1] && port == _ports[1])
++                        secondaryBound = port;
++                }
++                _boundUdpPortSnapshot.store(
++                    ((primaryBound & 0xffff) << 16) | (secondaryBound & 0xffff),
++                    std::memory_order_release);
++
+                 // Keep the core's view of local physical interfaces in sync
+                 // with the freshly rebound sockets. This mirrors ZeroTierOne
+                 // 1.12's faster physical-network-change recovery.
+@@ -2217,6 +2233,14 @@ unsigned short NodeService::getPrimaryPort() const
+     return _primaryPort;
+ }
+ 
++void NodeService::getBoundUdpPorts(
++    unsigned short* primary, unsigned short* secondary) const
++{
++    const unsigned int ports = _boundUdpPortSnapshot.load(std::memory_order_acquire);
++    *primary = (unsigned short)((ports >> 16) & 0xffff);
++    *secondary = (unsigned short)(ports & 0xffff);
++}
++
+ int NodeService::allowPortMapping(unsigned int allowed)
+ {
+     Mutex::Lock _lr(_run_m);
+diff --git a/src/NodeService.hpp b/src/NodeService.hpp
+index 1c3b199..c33e823 100644
+--- a/src/NodeService.hpp
++++ b/src/NodeService.hpp
+@@ -31,6 +31,7 @@
+ #include "version.h"
+ 
+ #include <string>
++#include <atomic>
+ #include <vector>
+ 
+ #define ZTS_SERVICE_THREAD_NAME        "ZTServiceThread"
+@@ -193,6 +194,9 @@ class NodeService {
+      * build.
+      */
+     unsigned int _ports[3] = { 0 };
++    // Atomic snapshot: primary high 16 bits, secondary low 16 bits.
++    // Never read the mutable _ports from the managed callback thread.
++    std::atomic<unsigned int> _boundUdpPortSnapshot{ 0 };
+     Binder _binder;
+ 
+     // Time we last received a packet from a global address
+@@ -441,6 +445,9 @@ class NodeService {
+     /** Get the primary port */
+     unsigned short getPrimaryPort() const;
+ 
++    /** Get actually bound physical UDP ports, not configured port values. */
++    void getBoundUdpPorts(unsigned short* primary, unsigned short* secondary) const;
++
+     /** Allow or disallow port-mapping */
+     int allowPortMapping(unsigned int allowed);
+ 

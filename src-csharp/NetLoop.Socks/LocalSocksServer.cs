@@ -9,6 +9,8 @@ public sealed class LocalSocksServer : IAsyncDisposable
     private readonly TcpListener _listener;
     private readonly Socks5ConnectionHandler _handler;
     private readonly SemaphoreSlim _capacity;
+    private readonly TcpSessionTracker _sessions;
+    private readonly int _maxConnections;
     private readonly CancellationTokenSource _stop = new();
     private readonly object _clientsGate = new();
     private readonly HashSet<Task> _clients = [];
@@ -20,17 +22,21 @@ public sealed class LocalSocksServer : IAsyncDisposable
     public LocalSocksServer(
         IPEndPoint listenEndPoint,
         Socks5ConnectionHandler handler,
+        SemaphoreSlim capacity,
+        TcpSessionTracker sessions,
         int maxConnections)
     {
-        if (maxConnections <= 0)
-            throw new ArgumentOutOfRangeException(nameof(maxConnections));
-
         _listener = new TcpListener(listenEndPoint);
         _handler = handler;
-        _capacity = new SemaphoreSlim(maxConnections, maxConnections);
+        _capacity = capacity;
+        _sessions = sessions;
+        _maxConnections = maxConnections;
     }
 
     public IPEndPoint EndPoint => (IPEndPoint)_listener.LocalEndpoint;
+
+    public Task Completion => _loop
+        ?? throw new InvalidOperationException("SOCKS5 server has not started.");
 
     public void Start()
     {
@@ -60,8 +66,22 @@ public sealed class LocalSocksServer : IAsyncDisposable
                 break;
             }
 
-            if (!await _capacity.WaitAsync(0, cancellationToken).ConfigureAwait(false))
+            bool accepted;
+            try
             {
+                accepted = await _capacity.WaitAsync(0, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                client.Dispose();
+                break;
+            }
+            if (!accepted)
+            {
+                var source = (client.Client.RemoteEndPoint as IPEndPoint)?
+                    .Address.ToString() ?? "unknown";
+                _sessions.Reject("local", source, _maxConnections);
                 client.Dispose();
                 continue;
             }
@@ -97,12 +117,18 @@ public sealed class LocalSocksServer : IAsyncDisposable
 
     private async Task HandleClientAsync(TcpClient client, CancellationToken cancellationToken)
     {
+        using var usage = _sessions.Track(
+            "local",
+            (client.Client.RemoteEndPoint as IPEndPoint)?
+                .Address.ToString() ?? "unknown",
+            _capacity);
         await using var connection = new SystemTcpConnection(
             client,
             $"local:{client.Client.RemoteEndPoint}");
         try
         {
-            await _handler.HandleAsync(connection, cancellationToken).ConfigureAwait(false);
+            await _handler.HandleAsync(
+                connection, cancellationToken, usage.SetPhase).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -110,10 +136,6 @@ public sealed class LocalSocksServer : IAsyncDisposable
         catch (Exception ex)
         {
             JsonLog.Error("local_socks_client_failed", new { error = ex.Message });
-        }
-        finally
-        {
-            _capacity.Release();
         }
     }
 
@@ -157,6 +179,6 @@ public sealed class LocalSocksServer : IAsyncDisposable
             await Task.WhenAll(activeClients).ConfigureAwait(false);
 
         _stop.Dispose();
-        _capacity.Dispose();
+        // The runtime owns the capacity shared with the overlay listener.
     }
 }

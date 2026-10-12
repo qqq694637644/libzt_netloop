@@ -26,7 +26,16 @@ public sealed class Socks5UdpAssociationFactory : ISocks5UdpAssociationFactory, 
     private readonly TimeSpan _idleTimeout;
     private readonly SemaphoreSlim _capacity;
     private readonly ConcurrentDictionary<Socks5UdpAssociation, byte> _active = new();
+    private readonly CancellationTokenSource _stop = new();
+    private readonly object _creationGate = new();
+    private TaskCompletionSource _createsDrained = new(
+        TaskCreationOptions.RunContinuationsAsynchronously);
+    private int _creating;
     private int _disposed;
+    private readonly TaskCompletionSource _factoryDisposed = new(
+        TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public int ActiveAssociations => _active.Count;
 
     public Socks5UdpAssociationFactory(
         IProxyUdpTransportFactory transportFactory,
@@ -48,46 +57,85 @@ public sealed class Socks5UdpAssociationFactory : ISocks5UdpAssociationFactory, 
         ProxyTarget declaredClientEndpoint,
         CancellationToken cancellationToken)
     {
-        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-
-        if (!await _capacity.WaitAsync(0, cancellationToken).ConfigureAwait(false))
-            throw new IOException("SOCKS5 UDP association capacity is exhausted.");
-
-        UdpClient? relay = null;
-        IProxyUdpTransport? transport = null;
+        lock (_creationGate)
+        {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+            if (_creating++ == 0)
+                _createsDrained = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
         try
         {
-            var controlLocal = controlConnection.LocalEndPoint as IPEndPoint
-                ?? throw new InvalidOperationException("UDP ASSOCIATE requires a TCP local endpoint.");
-            var controlRemote = controlConnection.RemoteEndPoint as IPEndPoint
-                ?? throw new InvalidOperationException("UDP ASSOCIATE requires a TCP remote endpoint.");
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken, _stop.Token);
+            if (!await _capacity.WaitAsync(0, linked.Token).ConfigureAwait(false))
+                throw new IOException("SOCKS5 UDP association capacity is exhausted.");
 
-            relay = new UdpClient(new IPEndPoint(controlLocal.Address, 0));
-            transport = await _transportFactory.CreateAsync(cancellationToken).ConfigureAwait(false);
+            UdpClient? relay = null;
+            IProxyUdpTransport? transport = null;
+            try
+            {
+                var controlLocal = controlConnection.LocalEndPoint as IPEndPoint
+                    ?? throw new InvalidOperationException("UDP ASSOCIATE requires a TCP local endpoint.");
+                var controlRemote = controlConnection.RemoteEndPoint as IPEndPoint
+                    ?? throw new InvalidOperationException("UDP ASSOCIATE requires a TCP remote endpoint.");
 
-            var expectedClient = GetExpectedClientUdpEndpoint(
-                declaredClientEndpoint,
-                controlRemote);
+                relay = new UdpClient(new IPEndPoint(controlLocal.Address, 0));
+                transport = await _transportFactory.CreateAsync(linked.Token).ConfigureAwait(false);
 
-            var association = new Socks5UdpAssociation(
-                relay,
-                transport,
-                controlRemote,
-                expectedClient,
-                _idleTimeout,
-                cancellationToken,
-                () => _capacity.Release());
-            _active.TryAdd(association, 0);
-            _ = ObserveAssociationAsync(association);
-            return association;
+                linked.Token.ThrowIfCancellationRequested();
+                var expectedClient = GetExpectedClientUdpEndpoint(
+                    declaredClientEndpoint, controlRemote);
+                var association = new Socks5UdpAssociation(
+                    relay,
+                    transport,
+                    controlRemote,
+                    expectedClient,
+                    _idleTimeout,
+                    cancellationToken,
+                    () => _capacity.Release());
+                _active.TryAdd(association, 0);
+                _ = ObserveAssociationAsync(association);
+                return association;
+            }
+            catch
+            {
+                // Always return the acquired permit, even if cleanup itself
+                // fails. Preserve the original creation error for diagnosis.
+                try
+                {
+                    relay?.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    JsonLog.Error("socks_udp_failed_creation_relay_dispose", new {
+                        error = ex.Message
+                    });
+                }
+                try
+                {
+                    if (transport is not null)
+                        await transport.DisposeAsync().ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    JsonLog.Error("socks_udp_failed_creation_transport_dispose", new {
+                        error = ex.Message
+                    });
+                }
+                finally
+                {
+                    _capacity.Release();
+                }
+                throw;
+            }
         }
-        catch
+        finally
         {
-            relay?.Dispose();
-            if (transport is not null)
-                await transport.DisposeAsync().ConfigureAwait(false);
-            _capacity.Release();
-            throw;
+            lock (_creationGate)
+            {
+                if (--_creating == 0)
+                    _createsDrained.TrySetResult();
+            }
         }
     }
 
@@ -97,9 +145,32 @@ public sealed class Socks5UdpAssociationFactory : ISocks5UdpAssociationFactory, 
         {
             await association.Completion.ConfigureAwait(false);
         }
+        catch (Exception ex)
+        {
+            JsonLog.Error("socks_udp_association_completion_failed", new {
+                error_type = ex.GetType().Name,
+                error = ex.Message
+            });
+        }
         finally
         {
-            _active.TryRemove(association, out _);
+            try
+            {
+                await association.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                // This observer is fire-and-forget; never leave an unobserved
+                // fault when the child transport rejects disposal.
+                JsonLog.Error("socks_udp_association_observer_dispose_failed", new {
+                    error_type = ex.GetType().Name,
+                    error = ex.Message
+                });
+            }
+            finally
+            {
+                _active.TryRemove(association, out _);
+            }
         }
     }
 
@@ -130,9 +201,56 @@ public sealed class Socks5UdpAssociationFactory : ISocks5UdpAssociationFactory, 
 
     public ValueTask DisposeAsync()
     {
-        if (Interlocked.Exchange(ref _disposed, 1) == 0)
+        return new ValueTask(DisposeCoreAsync());
+    }
+
+    private async Task DisposeCoreAsync()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            await _factoryDisposed.Task.ConfigureAwait(false);
+            return;
+        }
+
+        Exception? disposalError = null;
+        try
+        {
+            _stop.Cancel();
+            Task pendingCreates;
+            lock (_creationGate)
+                pendingCreates = _creating == 0
+                    ? Task.CompletedTask
+                    : _createsDrained.Task;
+            await pendingCreates.ConfigureAwait(false);
+
+            var active = _active.Keys.ToArray();
+            foreach (var association in active)
+                association.Abort();
+            foreach (var association in active)
+            {
+                try
+                {
+                    await association.DisposeAsync().ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    disposalError ??= ex;
+                    JsonLog.Error("socks_udp_factory_association_dispose_failed", new {
+                        error_type = ex.GetType().Name,
+                        error = ex.Message
+                    });
+                }
+            }
+            _active.Clear();
+        }
+        finally
+        {
             _capacity.Dispose();
-        return ValueTask.CompletedTask;
+            _stop.Dispose();
+            _factoryDisposed.TrySetResult();
+        }
+        if (disposalError is not null)
+            throw new IOException("SOCKS5 UDP factory cleanup failed.", disposalError);
     }
 }
 
@@ -151,6 +269,8 @@ internal sealed class Socks5UdpAssociation : ISocks5UdpAssociation
     private long _lastActivity;
     private int _aborted;
     private int _disposed;
+    private readonly TaskCompletionSource _disposeFinished = new(
+        TaskCreationOptions.RunContinuationsAsynchronously);
 
     internal Socks5UdpAssociation(
         UdpClient relay,
@@ -313,42 +433,48 @@ internal sealed class Socks5UdpAssociation : ISocks5UdpAssociation
 
         _stop.Cancel();
         _relay.Dispose();
-        _ = DisposeTransportNoThrowAsync();
-    }
-
-    private async Task DisposeTransportNoThrowAsync()
-    {
-        try
-        {
-            await _transport.DisposeAsync().ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            JsonLog.Error("socks_udp_abort_transport_failed", new {
-                error_type = ex.GetType().Name,
-                error = ex.Message
-            });
-        }
     }
 
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            await _disposeFinished.Task.ConfigureAwait(false);
             return;
-
-        Abort();
-        await _transport.DisposeAsync().ConfigureAwait(false);
+        }
 
         try
         {
-            await Completion.ConfigureAwait(false);
+            Abort();
+            try
+            {
+                await _transport.DisposeAsync().ConfigureAwait(false);
+            }
+            finally
+            {
+                // Cancellation must drain loop tasks even if the transport's
+                // DisposeAsync throws. Releasing capacity is the final step.
+                try
+                {
+                    await Completion.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                }
+            }
         }
-        catch (OperationCanceledException)
+        finally
         {
+            try
+            {
+                _stop.Dispose();
+                _releaseCapacity();
+            }
+            finally
+            {
+                _disposeFinished.TrySetResult();
+            }
         }
-
-        _stop.Dispose();
-        _releaseCapacity();
 
         JsonLog.Info("socks_udp_association_closed", new {
             relay = RelayEndPoint.ToString()

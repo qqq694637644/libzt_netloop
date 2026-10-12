@@ -15,19 +15,67 @@ ROOT = Path(__file__).resolve().parents[1]
 STUN_MAGIC_COOKIE = 0x2112A442
 
 
-def wait_for_json(path: Path, timeout: float, phase: str = "ready") -> dict:
+def wait_for_netloop_ready(
+    path: Path,
+    timeout: float,
+    *,
+    process_id: int,
+    reset_count: int = 0,
+    expected_node_id: str | None = None,
+    start_offset: int = 0,
+) -> dict:
+    """Observe an existing runtime_phase JSONL event, never a status file.
+
+    The process log is already captured by the manual E2E runner. Starting
+    at an explicit byte offset prevents a previous run's Ready event from
+    being mistaken for the newly launched process.
+    """
     deadline = time.monotonic() + timeout
-    last_error: Exception | None = None
+    offset = start_offset
+    partial = b""
     while time.monotonic() < deadline:
         if path.exists():
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                if data.get("phase") == phase:
-                    return data
-            except Exception as exc:
-                last_error = exc
-        time.sleep(0.25)
-    raise TimeoutError(f"timed out waiting for {path}; last_error={last_error}")
+            with path.open("rb") as stream:
+                stream.seek(offset)
+                block = stream.read()
+            if block:
+                offset += len(block)
+                lines = (partial + block).split(b"\n")
+                partial = lines.pop()
+                for raw in lines:
+                    try:
+                        event = json.loads(raw)
+                        if event.get("event") != "runtime_phase":
+                            continue
+                        data = event.get("data") or {}
+                        if (
+                            data.get("phase") != "ready"
+                            or int(data.get("reset_count", -1)) != reset_count
+                        ):
+                            continue
+                        node_id = data.get("node")
+                        overlay_address = data.get("bind_address")
+                        if not node_id or not overlay_address:
+                            continue
+                        if expected_node_id and node_id != expected_node_id:
+                            raise AssertionError(
+                                "Node ID changed across business Runtime restart: "
+                                f"{expected_node_id} -> {node_id}"
+                            )
+                        return {
+                            "phase": "ready",
+                            "node_id": node_id,
+                            "primary_overlay_address": overlay_address,
+                            "reset_count": reset_count,
+                            "process_id": process_id,
+                        }
+                    except (ValueError, TypeError, json.JSONDecodeError):
+                        continue
+        time.sleep(0.05)
+    raise TimeoutError(
+        f"timed out waiting for runtime_phase ready in {path}; "
+        f"reset_count={reset_count}, byte_offset={start_offset}"
+    )
 
 
 def wait_for_tcp(host: str, port: int, timeout: float = 20.0) -> None:

@@ -7,10 +7,12 @@ namespace NetLoop.Libzt;
 
 public sealed class LibztNode : IAsyncDisposable
 {
+    private static readonly TimeSpan NetworkRevalidationInterval = TimeSpan.FromSeconds(30);
     private readonly ulong _networkId;
     private readonly string _stateDirectory;
     private readonly TimeSpan _startupTimeout;
     private readonly LibztNative.EventCallback _eventCallback;
+    private readonly LibztUnderlayDiagnostics _underlayDiagnostics = new();
     private readonly TaskCompletionSource _nodeUp = new(
         TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly object _stateSync = new();
@@ -25,6 +27,10 @@ public sealed class LibztNode : IAsyncDisposable
     private Task? _networkConfigWorker;
     private LibztNetworkState? _state;
     private long _stateGeneration;
+    private int _configAvailable;
+    private int _joinRequested;
+    private long _failedPhysicalRefreshAttempts;
+    private int _boundUdpPortPair;
     private bool _started;
     private bool _freed;
 
@@ -39,6 +45,11 @@ public sealed class LibztNode : IAsyncDisposable
     public ulong NetworkId => _networkId;
 
     public LibztNetworkState? State => Volatile.Read(ref _state);
+    public bool NetworkConfigurationAvailable => Volatile.Read(ref _configAvailable) != 0;
+    public ushort BoundUdpPrimaryPort
+        => (ushort)((uint)Volatile.Read(ref _boundUdpPortPair) >> 16);
+    public ushort BoundUdpSecondaryPort
+        => (ushort)(Volatile.Read(ref _boundUdpPortPair) & 0xffff);
 
     /// <summary>
     /// Raised on the background config worker, never from the native event
@@ -46,6 +57,13 @@ public sealed class LibztNode : IAsyncDisposable
     /// the Node or abort existing connections.
     /// </summary>
     public event Action<LibztNetworkState>? NetworkStateChanged;
+
+    /// <summary>
+    /// The ZeroTier core cannot currently supply a complete configuration.
+    /// Keep the last verified state for diagnostics, but callers must fail
+    /// closed for new routing decisions until the next successful query.
+    /// </summary>
+    public event Action<string>? NetworkConfigurationUnavailable;
 
     public async Task<LibztNetworkState> StartAsync(CancellationToken cancellationToken)
     {
@@ -71,6 +89,7 @@ public sealed class LibztNode : IAsyncDisposable
         {
             ThrowIfError("zts_node_start", LibztNative.NodeStart());
             Volatile.Write(ref _started, true);
+            SampleBoundUdpPorts("node_started");
             return await JoinAndWaitAsync(cancellationToken).ConfigureAwait(false);
         }
         catch
@@ -88,9 +107,18 @@ public sealed class LibztNode : IAsyncDisposable
 
         lock (_stateSync)
         {
-            var state = QueryNetworkState();
-            Volatile.Write(ref _state, state);
-            return state;
+            try
+            {
+                var state = QueryNetworkState();
+                Volatile.Write(ref _state, state);
+                Volatile.Write(ref _configAvailable, 1);
+                return state;
+            }
+            catch
+            {
+                Volatile.Write(ref _configAvailable, 0);
+                throw;
+            }
         }
     }
 
@@ -107,39 +135,91 @@ public sealed class LibztNode : IAsyncDisposable
 
     public bool TryNotifyPhysicalNetworkChanged()
     {
-        if (!Volatile.Read(ref _started))
+        // A NodeStart return does not imply NetJoin has been submitted.
+        // Keep the owner's pending refresh until native network join begins,
+        // otherwise an early successful refresh can be consumed too soon.
+        if (!Volatile.Read(ref _started)
+            || Volatile.Read(ref _joinRequested) == 0)
             return false;
 
         var result = LibztNative.NodeNetworkChanged();
         if (result != LibztNative.Ok)
         {
-            JsonLog.Error("libzt_physical_network_refresh_failed", new {
-                network = _networkId.ToString("x16"),
-                api_rc = result,
-                socket_error = LibztNative.GetErrno()
-            });
+            // A down native service might reject a refresh repeatedly. Keep
+            // the full exact counter without filling JSONL with 2 logs/sec.
+            var errors = Interlocked.Increment(ref _failedPhysicalRefreshAttempts);
+            if ((errors & (errors - 1)) == 0)
+                JsonLog.Error("libzt_physical_network_refresh_failed", new {
+                    network = _networkId.ToString("x16"),
+                    api_rc = result,
+                    socket_error = LibztNative.GetErrno(),
+                    failures_since_success = errors
+                });
             return false;
         }
 
+        Interlocked.Exchange(ref _failedPhysicalRefreshAttempts, 0);
         LogPhysicalNetworkRefreshRequested();
         return true;
     }
 
     private void LogPhysicalNetworkRefreshRequested()
     {
+        _underlayDiagnostics.RecordPhysicalRefresh();
+        SampleBoundUdpPorts("before_native_path_refresh");
         JsonLog.Info("libzt_physical_network_refresh_requested", new {
             network = _networkId.ToString("x16"),
             node = State?.NodeId.ToString("x10")
         });
     }
 
+    private void SampleBoundUdpPorts(string source)
+    {
+        if (!Volatile.Read(ref _started))
+            return;
+
+        // The patched native ABI reads a single atomic pair published by the
+        // binder thread. It reports ports in its actual bound address set,
+        // including a rotating secondary port, not configured defaults.
+        var rc = LibztNative.GetBoundUdpPorts(
+            out var primary, out var secondary);
+        if (rc != LibztNative.Ok)
+        {
+            JsonLog.Error("libzt_udp_binding_query_failed", new {
+                network = _networkId.ToString("x16"),
+                api_rc = rc,
+                source
+            });
+            return;
+        }
+
+        Volatile.Write(
+            ref _boundUdpPortPair, (primary << 16) | secondary);
+        var change = _underlayDiagnostics.ObservePorts(primary, secondary);
+        if (change is not null)
+            JsonLog.Info("libzt_udp_bound_ports_changed", new {
+                network = _networkId.ToString("x16"),
+                source,
+                primary_port = change.Primary,
+                secondary_port = change.Secondary,
+                previous_primary_port = change.PreviousPrimary,
+                previous_secondary_port = change.PreviousSecondary,
+                since_network_refresh_ms = change.SinceRefreshMs,
+                // Observed on this sample, not necessarily at the instant
+                // the native binder made the change.
+                observation = "sampled_native_bound_ports"
+            });
+    }
+
     private async Task<LibztNetworkState> JoinAndWaitAsync(CancellationToken cancellationToken)
     {
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeoutCts.CancelAfter(_startupTimeout);
-        var token = timeoutCts.Token;
 
-        await _nodeUp.Task.WaitAsync(token).ConfigureAwait(false);
+        // The startup timeout guards native Node initialization ONLY.
+        // Once the Node is up, an unavailable Controller/transport must not
+        // make an otherwise healthy, non-daemon process exit permanently.
+        await _nodeUp.Task.WaitAsync(timeoutCts.Token).ConfigureAwait(false);
         var nodeId = LibztNative.NodeGetId();
         JsonLog.Info("libzt_network_join_start", new {
             network = _networkId.ToString("x16"),
@@ -147,6 +227,7 @@ public sealed class LibztNode : IAsyncDisposable
             node_online = LibztNative.NodeIsOnline() == 1
         });
         ThrowIfError("zts_net_join", LibztNative.NetJoin(_networkId));
+        Volatile.Write(ref _joinRequested, 1);
 
         while (LibztNative.NetTransportIsReady(_networkId) != 1)
         {
@@ -154,17 +235,29 @@ public sealed class LibztNode : IAsyncDisposable
             if (IsTerminalNetworkStatus(status))
                 throw new LibztException($"network join status={status}", status);
 
-            await Task.Delay(250, token).ConfigureAwait(false);
+            await Task.Delay(250, cancellationToken).ConfigureAwait(false);
         }
 
         LibztNetworkState state;
         while (true)
         {
-            state = RefreshNetworkState();
-            if (state.ManagedAddresses.Count != 0)
-                break;
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                state = RefreshNetworkState();
+                if (state.ManagedAddresses.Count != 0)
+                    break;
+            }
+            catch (LibztException ex)
+                when (ex.ApiResult == LibztNative.ErrNoResult
+                      && !cancellationToken.IsCancellationRequested)
+            {
+                // The transport can report readiness just before the native
+                // network configuration appears in core. Do not treat this
+                // transient state as a permanent startup failure.
+            }
 
-            await Task.Delay(100, token).ConfigureAwait(false);
+            await Task.Delay(100, cancellationToken).ConfigureAwait(false);
         }
 
         JsonLog.Info("libzt_network_ready", new {
@@ -212,7 +305,8 @@ public sealed class LibztNode : IAsyncDisposable
     {
         var count = LibztNative.CoreQueryAddressCount(_networkId);
         if (count == LibztNative.ErrNoResult)
-            return [];
+            throw new LibztException(
+                "zts_core_query_addr_count(network unavailable)", count);
         if (count < 0)
             throw new LibztException("zts_core_query_addr_count", count);
 
@@ -250,7 +344,8 @@ public sealed class LibztNode : IAsyncDisposable
     {
         var count = LibztNative.CoreQueryRouteCount(_networkId);
         if (count == LibztNative.ErrNoResult)
-            return [];
+            throw new LibztException(
+                "zts_core_query_route_count(network unavailable)", count);
         if (count < 0)
             throw new LibztException("zts_core_query_route_count", count);
 
@@ -301,9 +396,27 @@ public sealed class LibztNode : IAsyncDisposable
     {
         try
         {
-            await foreach (var eventCode in _networkConfigEvents.Reader
-                               .ReadAllAsync(cancellationToken).ConfigureAwait(false))
+            while (!cancellationToken.IsCancellationRequested)
             {
+                short? eventCode = null;
+                using (var heartbeat = CancellationTokenSource
+                           .CreateLinkedTokenSource(cancellationToken))
+                {
+                    heartbeat.CancelAfter(NetworkRevalidationInterval);
+                    try
+                    {
+                        eventCode = await _networkConfigEvents.Reader
+                            .ReadAsync(heartbeat.Token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                        when (!cancellationToken.IsCancellationRequested
+                              && heartbeat.IsCancellationRequested)
+                    {
+                        // Periodic native snapshot revalidation also detects
+                        // a controller state disappearing without an event.
+                    }
+                }
+
                 try
                 {
                     // Native libzt callbacks must not acquire the core lock:
@@ -312,10 +425,13 @@ public sealed class LibztNode : IAsyncDisposable
                         await Task.Delay(50, cancellationToken).ConfigureAwait(false);
 
                     var state = RefreshNetworkState();
+                    SampleBoundUdpPorts("native_config_worker");
                     JsonLog.Info("libzt_network_config_refreshed", new {
                         network = _networkId.ToString("x16"),
                         event_code = eventCode,
+                        source = eventCode is null ? "periodic" : "native_event",
                         generation = state.Generation,
+                        queried_at_utc = state.QueriedAtUtc,
                         assigned_addresses = state.ManagedAddresses.Select(
                             static x => x.ToString()).ToArray(),
                         assigned_prefixes = state.AssignedPrefixes.Select(
@@ -340,6 +456,16 @@ public sealed class LibztNode : IAsyncDisposable
                         error_type = ex.GetType().Name,
                         error = ex.Message
                     });
+                    try
+                    {
+                        NetworkConfigurationUnavailable?.Invoke(ex.Message);
+                    }
+                    catch (Exception notificationError)
+                    {
+                        JsonLog.Error("libzt_network_config_unavailable_callback_failed", new {
+                            error = notificationError.Message
+                        });
+                    }
                 }
             }
         }
@@ -395,10 +521,25 @@ public sealed class LibztNode : IAsyncDisposable
             {
                 try
                 {
-                    JsonLog.Info(
-                        "libzt_peer_status",
-                        LibztPeerEvent.Decode(
-                            native.EventCode, _networkId, native.Peer, native.Length));
+                    var peer = LibztPeerEvent.Decode(
+                        native.EventCode, _networkId, native.Peer, native.Length);
+                    JsonLog.Info("libzt_peer_status", peer);
+                    var peerId = LibztPeerEvent.ReadPeerId(
+                        native.Peer, native.Length);
+                    if (peerId is { } id)
+                    {
+                        var recovery = _underlayDiagnostics.ObservePeer(
+                            native.EventCode, id);
+                        if (recovery is not null)
+                            JsonLog.Info("libzt_peer_recovery_observed", new {
+                                network = _networkId.ToString("x16"),
+                                peer_id = recovery.PeerId.ToString("x10"),
+                                previous = recovery.Previous,
+                                elapsed_ms = recovery.ElapsedMs,
+                                since_network_refresh_ms = recovery.SinceRefreshMs,
+                                observation = "native_peer_event_not_socks_connectivity"
+                            });
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -412,6 +553,20 @@ public sealed class LibztNode : IAsyncDisposable
             else
             {
                 JsonLog.Info("libzt_event", new { event_code = native.EventCode });
+                var nodeChange = _underlayDiagnostics.ObserveNode(
+                    native.EventCode);
+                if (nodeChange is not null)
+                {
+                    JsonLog.Info("libzt_node_cycle_observed", new {
+                        network = _networkId.ToString("x16"),
+                        phase = nodeChange.Phase,
+                        last_phase_duration_ms = nodeChange.LastPhaseDurationMs,
+                        interval_between_offline_events_ms =
+                            nodeChange.TimeSincePreviousOfflineMs,
+                        since_network_refresh_ms = nodeChange.SinceRefreshMs
+                    });
+                    SampleBoundUdpPorts("native_node_status");
+                }
             }
             if (native.EventCode == LibztNative.EventNodeUp)
                 _nodeUp.TrySetResult();
@@ -445,6 +600,7 @@ public sealed class LibztNode : IAsyncDisposable
         }
         finally
         {
+            Volatile.Write(ref _joinRequested, 0);
             Volatile.Write(ref _started, false);
         }
     }

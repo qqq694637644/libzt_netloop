@@ -19,18 +19,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="../NetLoop.Core/NetLoop.Core.csproj" />
-    <ProjectReference Include="../NetLoop.Libzt/NetLoop.Libzt.csproj" />
-    <ProjectReference Include="../NetLoop.Socks/NetLoop.Socks.csproj" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <Compile Include="../NetLoop.Host/HostOptions.cs" Link="SharedRuntime/HostOptions.cs" />
-    <Compile Include="../NetLoop.Host/NetLoopRuntime.cs" Link="SharedRuntime/NetLoopRuntime.cs" />
-    <Compile Include="../NetLoop.Host/OverlaySocksAgent.cs" Link="SharedRuntime/OverlaySocksAgent.cs" />
-    <Compile Include="../NetLoop.Host/OverlayUdpAgent.cs" Link="SharedRuntime/OverlayUdpAgent.cs" />
-    <Compile Include="../NetLoop.Host/RoutingConnector.cs" Link="SharedRuntime/RoutingConnector.cs" />
-    <Compile Include="../NetLoop.Host/RoutingUdpTransport.cs" Link="SharedRuntime/RoutingUdpTransport.cs" />
+    <ProjectReference Include="../NetLoop.Runtime/NetLoop.Runtime.csproj" />
   </ItemGroup>
 
   <ItemGroup Condition="'$(LibztNativePath)' != ''">

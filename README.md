@@ -9,8 +9,10 @@ The repository no longer contains the original NetLoop C++ client/server impleme
 - `src-csharp/NetLoop.Core` — routing, relay, and shared runtime abstractions.
 - `src-csharp/NetLoop.Socks` — SOCKS5 TCP/UDP protocol handling.
 - `src-csharp/NetLoop.Libzt` — P/Invoke bindings and libzt socket wrappers.
+- `src-csharp/NetLoop.Runtime` — one shared business runtime/lifetime implementation for desktop and Android.
 - `src-csharp/NetLoop.Host` — Windows/Linux NetLoop host.
 - `src-csharp/NetLoop.Android` — Android foreground-service application.
+- `src-csharp/NetLoop.Checks` — offline managed regression checks (no real ZeroTier Node).
 
 ## Supported targets
 
@@ -24,13 +26,13 @@ jobs are currently disabled.
 
 ## Overlay addresses
 
-Each runtime chooses one **primary overlay address** for its peer TCP/UDP listeners: the numerically lowest Managed IPv4 address is preferred; if no IPv4 address exists, the numerically lowest Managed IPv6 address is used. The selected value is published as `primary_overlay_address` in the readiness status.
+This personal-use runtime requires **exactly one Controller-assigned IPv4 Managed IP per node**. A missing address leaves the native Node alive while waiting for Controller configuration; multiple Managed IPs or an IPv6-only assignment are explicit configuration errors. It does not silently choose a "primary" address or maintain a second Agent listener. The single address appears in the `runtime_phase` JSONL readiness event.
 
 `--default-exit` is required on every node and selects the exit used for non-overlay destinations; it **does not override ZeroTier's direct-peer routing**. Every direct ZeroTier peer is identified exclusively by matching the Controller-assigned address prefixes and Managed Routes, never by hardcoding a network such as `172.26.0.0/24` or maintaining a manually entered peer list. **The `--peer` CLI argument has been removed: old command lines that include it now fail to start.** The exit node may use its own primary address as `--default-exit`; in that case NetLoop uses local egress instead of connecting to itself.
 
-Controller **direct** routes (no `via` gateway) allow direct peer Agent forwarding. More-specific routes with a `via` gateway are **rejected explicitly**: the NetLoop Agent SOCKS5 protocol does not implement ZeroTier gateway/multihop routing. ZeroTier `/0` default routes are not treated as Overlay Peer networks; ordinary internet traffic still uses the configured NetLoop default exit. Missing Controller prefixes are never guessed. This behavior includes IPv6. Desktop SOCKS always binds to loopback; `--socks-host` is intentionally unsupported.
+Controller **direct** routes (no `via` gateway) allow direct peer Agent forwarding. More-specific routes with a `via` gateway are **rejected explicitly**: the NetLoop Agent SOCKS5 protocol does not implement ZeroTier gateway/multihop routing. ZeroTier `/0` default routes are not treated as Overlay Peer networks; ordinary internet traffic uses the configured NetLoop default exit **only when B has a current Controller-derived direct route**. Missing Controller prefixes are never guessed. Desktop SOCKS always binds to loopback; `--socks-host` is intentionally unsupported.
 
-Only the primary Managed IP is bound for the NetLoop TCP/UDP Agent listeners. A configuration update that revokes that listener IP is logged as `overlay_bind_address_no_longer_assigned`; it cannot transparently move an existing listening socket to a different IP without rebinding. Existing TCP sessions are not aborted by **route-only** configuration updates. See [dynamic ZeroTier routing](docs/zerotier-network-routes.md).
+**Route-only** Controller updates atomically replace routing state without disconnecting existing TCP. A real change/revocation of the sole Managed IP closes and recreates the **business Runtime** (including local UDP associations) while keeping the native libzt Node and identity intact. Ordinary Wi-Fi/hotspot switches only request an underlying libzt network-path refresh, not an unconditional Runtime reset. See [dynamic ZeroTier routing](docs/zerotier-network-routes.md).
 
 ## Peer P2P / relay diagnostics
 
@@ -43,8 +45,8 @@ peer transport/path event (codes 240–244). The entry includes:
 - `physical_paths`: IP:port endpoints, preferred/expired flags and latency
 - `change`: the underlying libzt event, e.g. `PEER_PATH_DEAD`
 
-To identify the A→B link, compare `peer_id` in A's log with `node_id` in
-B's `server-status.json` (or B's `libzt_network_ready` log). **Do not** infer
+To identify the A→B link, compare `peer_id` in A's log with `data.node` in
+B's `libzt_network_ready` or `runtime_phase` JSONL event. **Do not** infer
 the physical P2P state from `route: "OverlayPeer"`: that is the logical
 NetLoop route, not ZeroTier's direct/relay underlay.
 
@@ -74,7 +76,7 @@ waiting in libzt's blocking `zts_connect` helper. To diagnose failures,
 inspect `libzt_connect_retry` (including `elapsed_ms`),
 `libzt_connect_cancelled`, and `socks_peer_negotiation_retry` in the A-node
 log. When troubleshooting identity mismatches, compare both nodes'
-`status-file` `node_id` values to the actual authorized members in the
+`libzt_network_ready.data.node` values to the actual authorized members in the
 ZeroTier controller; Managed IP alone does not identify a peer.
 
 ### TCP connect / accept correlation
@@ -133,6 +135,61 @@ failure. Keep the NetLoop logs for correlation and **do not delete identity
 or state directories**. See [the Chinese probe guide](docs/connection-probe.md).
 
 ## Build
+
+### Long-running reliability (PR #3, based on PR #2)
+
+The runtime now limits the incoming SOCKS5 handshake (default 15 seconds)
+and the upstream CONNECT reply / UDP ASSOCIATE setup (default 25 seconds).
+Unexpected termination of local SOCKS, Overlay TCP, or Overlay UDP listener
+tasks triggers a business-runtime rebuild. Temporary missing Controller
+configuration keeps the same libzt Node running in degraded mode until
+the single Managed IPv4 appears; invalid local configuration and bind errors
+fail explicitly instead of adding retry/compatibility layers.
+
+Windows/Linux hosts can optionally rotate JSONL logs instead of relying on
+unbounded shell redirection. For example:
+
+```powershell
+netloop.exe --network <network-id> --state-dir .\state `
+  --default-exit <zt-managed-ip> `
+  --log-file .\logs\netloop.jsonl --log-max-mb 16 --log-retain 5
+```
+
+Logging uses a bounded asynchronous queue. If overloaded, look for
+`json_log_records_dropped`. See the
+[long-running reliability guide](docs/reliability-hardening.md) for
+recovery limitations, event names, and parameter details.
+
+Further PR #3 hardening includes 30-second native Controller config
+revalidation (new routing rejects requests while configuration is missing),
+in-memory Runtime health and event-driven `runtime_phase` JSONL records,
+opt-in inbound Agent source-IP/CIDR and destination-port ACLs,
+and resource-budget/UDP queue-drop counters.
+The unvalidated shared Poller and its CLI switch have been removed. Only the
+known per-socket Poller remains while idle CPU, RDP, native fd ownership and
+handover performance await actual A/B/C device measurements.
+
+To diagnose multi-request floods and slow physical path recovery, the runtime
+keeps TCP phases/sources and per-Peer dial usage in memory, emits
+`tcp_session_phases` / `peer_dials` snapshots when `runtime_phase` changes
+and detailed `tcp_accept_rejected` / `peer_dial_rejected` JSONL events,
+alongside observed native UDP ports and
+RELAY/DIRECT/NODE_OFFLINE events. These do **not** claim to eliminate native
+70–110s Peer recovery or the observed ~226s Node cycle. See
+[the manual handover diagnosis guide](docs/network-handover-diagnostics.md)
+for the exact JSONL fields, limits and A/B/C tests.
+The dialing limit ends immediately after the Peer TCP connection and SOCKS
+greeting: destination CONNECT failures/timeouts never mark a healthy Peer
+as failed, and two slow targets do not block a third new connection.
+
+For new versions, download the relevant build directly from
+[GitHub Releases](https://github.com/qqq694637644/libzt_netloop/releases)
+and replace the application manually. No custom updater, previous-version
+snapshot, compatibility fallback, or rollback tool is provided.
+For offline JSONL probe statistics, see the
+[operations guide](docs/long-term-operations.md). This project intentionally
+does **not** install a watchdog, Windows service, process auto-restart or
+scheduled background task.
 
 Desktop builds are orchestrated by:
 

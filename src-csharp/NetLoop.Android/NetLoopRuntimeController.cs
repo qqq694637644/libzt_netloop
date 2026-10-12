@@ -1,4 +1,5 @@
 using Android.Content;
+using NetLoop.Host;
 
 namespace NetLoop.Android;
 
@@ -6,13 +7,18 @@ internal enum NetLoopPublicState
 {
     Stopped,
     Starting,
-    Ready
+    Ready,
+    Degraded,
+    Resetting
 }
 
 internal sealed record NetLoopPublicStatus(
     NetLoopPublicState State,
     string? NodeId,
-    string? PrimaryOverlayAddress);
+    string? PrimaryOverlayAddress,
+    string? Reason,
+    long? RouteGeneration,
+    DateTimeOffset UpdatedAtUtc);
 
 internal sealed record NetLoopControlResult(
     bool Success,
@@ -22,11 +28,13 @@ internal sealed record NetLoopControlResult(
 internal static class NetLoopRuntimeController
 {
     private static readonly object Gate = new();
-
     private static NetLoopPublicState _state = NetLoopPublicState.Stopped;
     private static ControlledRuntimeConfig? _controlledConfig;
     private static string? _nodeId;
-    private static string? _primaryOverlayAddress;
+    private static string? _address;
+    private static string? _reason;
+    private static long? _generation;
+    private static DateTimeOffset _updatedAtUtc = DateTimeOffset.UtcNow;
 
     internal static NetLoopPublicStatus GetStatus()
     {
@@ -40,27 +48,17 @@ internal static class NetLoopRuntimeController
     {
         lock (Gate)
         {
-            if (_state is NetLoopPublicState.Starting or NetLoopPublicState.Ready)
+            if (_state != NetLoopPublicState.Stopped)
             {
                 if (_controlledConfig is not null
                     && _controlledConfig.IsEquivalentTo(desired))
-                {
-                    return new NetLoopControlResult(
-                        true,
-                        SnapshotLocked(),
-                        null);
-                }
+                    return new NetLoopControlResult(true, SnapshotLocked(), null);
 
                 return new NetLoopControlResult(
-                    false,
-                    SnapshotLocked(),
-                    "stop before changing configuration");
+                    false, SnapshotLocked(), "stop before changing configuration");
             }
-
             _controlledConfig = desired;
-            _state = NetLoopPublicState.Starting;
-            _nodeId = null;
-            _primaryOverlayAddress = null;
+            UpdateLocked(NetLoopPublicState.Starting, null, null, null, null);
         }
 
         try
@@ -71,78 +69,54 @@ internal static class NetLoopRuntimeController
                 context.StartForegroundService(intent);
             else
                 context.StartService(intent);
-
-            return new NetLoopControlResult(
-                true,
-                GetStatus(),
-                null);
+            return new NetLoopControlResult(true, GetStatus(), null);
         }
         catch (Exception ex)
         {
             ReportStopped();
-            return new NetLoopControlResult(
-                false,
-                GetStatus(),
-                ex.Message);
+            return new NetLoopControlResult(false, GetStatus(), ex.Message);
         }
     }
 
     internal static bool Stop(Context context)
     {
-        lock (Gate)
-        {
-            _state = NetLoopPublicState.Stopped;
-            _controlledConfig = null;
-            _nodeId = null;
-            _primaryOverlayAddress = null;
-        }
-
+        ReportStopped();
         return context.StopService(new Intent(context, typeof(NetLoopService)));
     }
 
     internal static void ReportRuntimeStarting()
     {
         lock (Gate)
-        {
-            _state = NetLoopPublicState.Starting;
-            _nodeId = null;
-            _primaryOverlayAddress = null;
-        }
+            UpdateLocked(NetLoopPublicState.Starting, null, null, null, null);
     }
 
     internal static ControlledRuntimeConfig GetControlledConfigForService()
     {
         lock (Gate)
-        {
-            if (_controlledConfig is null)
-            {
-                throw new InvalidOperationException(
+            return _controlledConfig
+                ?? throw new InvalidOperationException(
                     "Controlled NetLoop runtime configuration is unavailable.");
-            }
-
-            return _controlledConfig;
-        }
     }
 
-    internal static void ReportRuntimeRestarting()
+    internal static void ReportRuntimeStatus(RuntimeStatus status)
     {
         lock (Gate)
         {
-            _state = NetLoopPublicState.Starting;
-            _nodeId = null;
-            _primaryOverlayAddress = null;
-        }
-    }
-
-    internal static void ReportReady(
-        ulong nodeId,
-        string primaryOverlayAddress)
-    {
-        lock (Gate)
-        {
-            _state = NetLoopPublicState.Ready;
-            _nodeId = nodeId.ToString("x10");
-            _primaryOverlayAddress = primaryOverlayAddress;
+            if (_state == NetLoopPublicState.Stopped)
+                return;
+            var next = status.Phase switch {
+                RuntimePhase.Ready => NetLoopPublicState.Ready,
+                RuntimePhase.Degraded => NetLoopPublicState.Degraded,
+                RuntimePhase.Resetting => NetLoopPublicState.Resetting,
+                RuntimePhase.Starting => NetLoopPublicState.Starting,
+                _ => NetLoopPublicState.Stopped
+            };
+            UpdateLocked(
+                next,
+                status.Network?.NodeId.ToString("x10"),
+                status.Runtime?.OverlayBindAddress.ToString(),
+                status.Reason,
+                status.Network?.Generation);
         }
     }
 
@@ -150,16 +124,32 @@ internal static class NetLoopRuntimeController
     {
         lock (Gate)
         {
-            _state = NetLoopPublicState.Stopped;
             _controlledConfig = null;
-            _nodeId = null;
-            _primaryOverlayAddress = null;
+            UpdateLocked(NetLoopPublicState.Stopped, null, null, null, null);
         }
+    }
+
+    private static void UpdateLocked(
+        NetLoopPublicState state,
+        string? nodeId,
+        string? address,
+        string? reason,
+        long? generation)
+    {
+        _state = state;
+        _nodeId = nodeId;
+        _address = address;
+        _reason = reason;
+        _generation = generation;
+        _updatedAtUtc = DateTimeOffset.UtcNow;
     }
 
     private static NetLoopPublicStatus SnapshotLocked()
         => new(
             _state,
             _nodeId,
-            _primaryOverlayAddress);
+            _address,
+            _reason,
+            _generation,
+            _updatedAtUtc);
 }

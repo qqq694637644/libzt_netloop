@@ -15,6 +15,14 @@ internal static class LibztPeerEvent
     internal static bool IsPeerEvent(short code)
         => code is >= LibztNative.EventPeerDirect and <= LibztNative.EventPeerPathDead;
 
+    internal static ulong? ReadPeerId(nint peerPointer, int payloadLength)
+    {
+        if (peerPointer == 0 || payloadLength < HeaderSize)
+            return null;
+        var id = unchecked((ulong)Marshal.ReadInt64(peerPointer));
+        return id is > 0 and <= 0xffffffffffUL ? id : null;
+    }
+
     internal static object Decode(
         short code,
         ulong networkId,

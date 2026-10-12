@@ -17,7 +17,7 @@ from common import (
     public_ip,
     start_detached,
     stun_public_ip,
-    wait_for_json,
+    wait_for_netloop_ready,
     wait_for_tcp,
 )
 from github_artifacts import wait_and_download
@@ -60,7 +60,6 @@ def prepare(args: argparse.Namespace) -> int:
         raise FileNotFoundError(executable)
 
     network_id = adhoc_network_id(args.overlay_port)
-    status_path = EVIDENCE / "server_status.json"
     state_dir = ROOT / "state" / "csharp-ci-server"
 
     http_pid = start_detached(
@@ -118,25 +117,23 @@ def prepare(args: argparse.Namespace) -> int:
             "20",
         ]
 
-        bootstrap_status_path = EVIDENCE / "bootstrap_status.json"
-        bootstrap_status_path.unlink(missing_ok=True)
-        status_path.unlink(missing_ok=True)
+        bootstrap_log_path = EVIDENCE / "netloop_bootstrap.log"
+        bootstrap_log_path.unlink(missing_ok=True)
         bootstrap_pid = start_detached(
             [
                 *netloop_command,
                 "--default-exit",
                 "192.0.2.1",
-                "--status-file",
-                str(bootstrap_status_path),
                 "--egress",
                 "direct",
             ],
-            EVIDENCE / "netloop_bootstrap.log",
+            bootstrap_log_path,
         )
         try:
-            bootstrap_status = wait_for_json(
-                bootstrap_status_path,
+            bootstrap_status = wait_for_netloop_ready(
+                bootstrap_log_path,
                 timeout=200,
+                process_id=bootstrap_pid,
             )
             server_ip = bootstrap_status.get("primary_overlay_address")
             bootstrap_node_id = bootstrap_status.get("node_id")
@@ -152,8 +149,6 @@ def prepare(args: argparse.Namespace) -> int:
             [
                 "--default-exit",
                 server_ip,
-                "--status-file",
-                str(status_path),
             ]
         )
 
@@ -191,9 +186,11 @@ def prepare(args: argparse.Namespace) -> int:
         else:
             netloop_command.extend(["--egress", "direct"])
 
+        netloop_log_path = EVIDENCE / "netloop_process.log"
+        netloop_log_path.unlink(missing_ok=True)
         netloop_pid = start_detached(
             netloop_command,
-            EVIDENCE / "netloop_process.log",
+            netloop_log_path,
         )
 
         PIDS.write_text(
@@ -209,7 +206,12 @@ def prepare(args: argparse.Namespace) -> int:
             encoding="utf-8",
         )
 
-        status = wait_for_json(status_path, timeout=200)
+        status = wait_for_netloop_ready(
+            netloop_log_path,
+            timeout=200,
+            process_id=netloop_pid,
+            expected_node_id=bootstrap_node_id,
+        )
         final_server_ip = status.get("primary_overlay_address")
         if not final_server_ip:
             raise RuntimeError(

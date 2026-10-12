@@ -19,6 +19,7 @@ internal static class Socks5Protocol
 
     internal const byte ReplySucceeded = 0;
     internal const byte ReplyGeneralFailure = 1;
+    internal const byte ReplyConnectionNotAllowed = 2;
     internal const byte ReplyNetworkUnreachable = 3;
     internal const byte ReplyHostUnreachable = 4;
     internal const byte ReplyConnectionRefused = 5;

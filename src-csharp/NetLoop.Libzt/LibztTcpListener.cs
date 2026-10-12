@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Net;
 using NetLoop.Core;
 
 namespace NetLoop.Libzt;
@@ -113,7 +114,10 @@ public sealed class LibztTcpListener : IAsyncDisposable
                         return new LibztTcpConnection(
                             result,
                             $"libzt-accepted:{remote}:{port}",
-                            connectionId);
+                            connectionId,
+                            IPAddress.TryParse(remote, out var remoteIp)
+                                ? new IPEndPoint(remoteIp, port)
+                                : null);
                     }
                     catch (Exception ex)
                     {

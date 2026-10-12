@@ -6,39 +6,49 @@ namespace NetLoop.Socks;
 
 public sealed class Socks5UdpProxyTransportFactory : IProxyUdpTransportFactory
 {
+    private static readonly TimeSpan DefaultSetupTimeout = TimeSpan.FromSeconds(25);
     private readonly IProxyConnector _transportConnector;
     private readonly ProxyTarget _proxyEndpoint;
     private readonly string? _username;
     private readonly string? _password;
+    private readonly TimeSpan _setupTimeout;
 
     public Socks5UdpProxyTransportFactory(
         IProxyConnector transportConnector,
         ProxyTarget proxyEndpoint,
         string? username = null,
-        string? password = null)
+        string? password = null,
+        TimeSpan? setupTimeout = null)
     {
         Socks5Credentials.Validate(username, password);
         _transportConnector = transportConnector;
         _proxyEndpoint = proxyEndpoint;
         _username = username;
         _password = password;
+        _setupTimeout = setupTimeout ?? DefaultSetupTimeout;
+        if (_setupTimeout <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(setupTimeout));
     }
 
     public async ValueTask<IProxyUdpTransport> CreateAsync(CancellationToken cancellationToken)
     {
+        using var setupCts =
+            CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        setupCts.CancelAfter(_setupTimeout);
+        var setupToken = setupCts.Token;
         IProxyConnection? control = null;
         UdpClient? udp = null;
         try
         {
             control = await _transportConnector.ConnectAsync(
                 _proxyEndpoint,
-                cancellationToken).ConfigureAwait(false);
+                setupToken).ConfigureAwait(false);
 
             await Socks5ClientHandshake.NegotiateAsync(
                 control,
                 _username,
                 _password,
-                cancellationToken).ConfigureAwait(false);
+                setupToken).ConfigureAwait(false);
 
             var controlRemote = control.RemoteEndPoint as IPEndPoint
                 ?? throw new InvalidOperationException(
@@ -60,14 +70,14 @@ public sealed class Socks5UdpProxyTransportFactory : IProxyUdpTransportFactory
             await control.WriteAsync(
                 request,
                 request.Length,
-                cancellationToken).ConfigureAwait(false);
+                setupToken).ConfigureAwait(false);
 
             var header = new byte[4];
             await Socks5Protocol.ReadExactlyAsync(
                 control,
                 header,
                 header.Length,
-                cancellationToken).ConfigureAwait(false);
+                setupToken).ConfigureAwait(false);
 
             if (header[0] != Socks5Protocol.Version)
                 throw new ProtocolViolationException(
@@ -81,7 +91,7 @@ public sealed class Socks5UdpProxyTransportFactory : IProxyUdpTransportFactory
             var relayTarget = await Socks5Protocol.ReadTargetAsync(
                 control,
                 header[3],
-                cancellationToken,
+                setupToken,
                 allowZeroPort: true).ConfigureAwait(false);
             if (relayTarget.Port == 0)
                 throw new ProtocolViolationException(
@@ -91,7 +101,7 @@ public sealed class Socks5UdpProxyTransportFactory : IProxyUdpTransportFactory
                 relayTarget,
                 new IPEndPoint(proxyAddress, controlRemote.Port),
                 udp.Client.AddressFamily,
-                cancellationToken).ConfigureAwait(false);
+                setupToken).ConfigureAwait(false);
 
             return new Socks5UdpProxyTransport(
                 control,
@@ -99,11 +109,18 @@ public sealed class Socks5UdpProxyTransportFactory : IProxyUdpTransportFactory
                 relay,
                 cancellationToken);
         }
-        catch
+        catch (Exception ex)
         {
             udp?.Dispose();
             if (control is not null)
                 await control.DisposeAsync().ConfigureAwait(false);
+            if (ex is OperationCanceledException
+                && !cancellationToken.IsCancellationRequested
+                && setupCts.IsCancellationRequested)
+            {
+                throw new TimeoutException(
+                    $"SOCKS5 UDP ASSOCIATE setup exceeded {_setupTimeout.TotalSeconds:0.#} seconds.", ex);
+            }
             throw;
         }
     }

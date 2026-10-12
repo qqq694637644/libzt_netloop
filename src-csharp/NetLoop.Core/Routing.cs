@@ -90,7 +90,9 @@ public sealed class OverlayNetworkSnapshot
         IEnumerable<ManagedOverlayRoute> managedRoutes)
     {
         PrimarySelfAddress = primarySelfAddress;
-        _selfAddresses = new HashSet<IPAddress>(selfAddresses) { primarySelfAddress };
+        // A previously bound listener address must not silently remain a
+        // valid local target after the controller revokes that Managed IP.
+        _selfAddresses = new HashSet<IPAddress>(selfAddresses);
         _assignedPrefixes = assignedPrefixes.Distinct().ToArray();
         _managedRoutes = managedRoutes.ToArray();
     }
@@ -150,23 +152,72 @@ public sealed class OverlayNetworkSnapshot
 
 public sealed class RouteSelector
 {
-    private OverlayNetworkSnapshot _network;
+    private sealed record RouteState(
+        OverlayNetworkSnapshot Network,
+        bool Available,
+        long Generation,
+        DateTimeOffset UpdatedAtUtc,
+        string? UnavailableReason);
+
+    private RouteState _state;
     private readonly IPAddress _defaultExit;
 
-    public RouteSelector(OverlayNetworkSnapshot network, IPAddress defaultExit)
+    public RouteSelector(
+        OverlayNetworkSnapshot network,
+        IPAddress defaultExit,
+        long generation = 0)
     {
-        _network = network;
+        _state = new RouteState(network, true, generation, DateTimeOffset.UtcNow, null);
         _defaultExit = defaultExit;
     }
 
-    public void UpdateNetwork(OverlayNetworkSnapshot network)
-        => Volatile.Write(ref _network, network);
+    public void UpdateNetwork(OverlayNetworkSnapshot network, long generation)
+    {
+        // A native event and a periodic query can finish out of order.
+        // Publish the entire snapshot/availability pair in one CAS.
+        while (true)
+        {
+            var previous = Volatile.Read(ref _state);
+            if (generation <= previous.Generation)
+                return;
+            var next = new RouteState(
+                network, true, generation, DateTimeOffset.UtcNow, null);
+            if (ReferenceEquals(
+                    Interlocked.CompareExchange(ref _state, next, previous),
+                    previous))
+                return;
+        }
+    }
+
+    public void MarkNetworkUnavailable(string reason = "network_configuration_unavailable")
+    {
+        while (true)
+        {
+            var previous = Volatile.Read(ref _state);
+            var next = previous with { Available = false, UnavailableReason = reason };
+            if (ReferenceEquals(
+                    Interlocked.CompareExchange(ref _state, next, previous),
+                    previous))
+                return;
+        }
+    }
+
+    public bool NetworkAvailable => Volatile.Read(ref _state).Available;
+
+    public long Generation => Volatile.Read(ref _state).Generation;
 
     public RouteDecision Select(ProxyTarget target, bool overlayIngress)
     {
-        // One atomic snapshot per new decision; no in-place mutation of the
-        // route table and no disruption to already-established TCP tunnels.
-        var network = Volatile.Read(ref _network);
+        // A routing decision must never combine two different Controller
+        // generations, including the configuration-validity bit.
+        var state = Volatile.Read(ref _state);
+        if (!state.Available)
+        {
+            return new RouteDecision(
+                RouteKind.Reject, null,
+                $"ZeroTier network configuration unavailable ({state.UnavailableReason}); refusing unverified routes");
+        }
+        var network = state.Network;
         if (target.TryGetIPAddress(out var address))
         {
             if (network.IsSelf(address))
@@ -202,6 +253,15 @@ public sealed class RouteSelector
         if (network.IsSelf(_defaultExit))
             return new RouteDecision(RouteKind.LocalEgress, null, "this node is the configured default exit");
 
-        return new RouteDecision(RouteKind.DefaultExit, _defaultExit, "non-overlay target uses configured default exit");
+        // No special treatment for the configured exit: it must currently be
+        // reachable via a direct Controller-derived route, just like C.
+        var exitRoute = network.FindOverlayRoute(_defaultExit);
+        if (!exitRoute.Matches || exitRoute.Via is not null)
+            return new RouteDecision(
+                RouteKind.Reject, null,
+                "configured default exit has no valid direct ZeroTier route");
+
+        return new RouteDecision(RouteKind.DefaultExit, _defaultExit,
+            $"non-overlay target uses direct default exit route {exitRoute.Prefix}");
     }
 }

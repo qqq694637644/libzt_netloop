@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Net;
 using NetLoop.Core;
 
 namespace NetLoop.Libzt;
@@ -10,11 +11,13 @@ public sealed class LibztTcpConnection : IProxyConnection, IConnectionTrace
     private readonly object _nativeGate = new();
     private int _fd;
 
-    internal LibztTcpConnection(int fd, string description, string connectionId)
+    internal LibztTcpConnection(
+        int fd, string description, string connectionId, IPEndPoint? remoteEndPoint = null)
     {
         _fd = fd;
         Description = description;
         ConnectionId = connectionId;
+        RemoteEndPoint = remoteEndPoint;
     }
 
     public string Description { get; }
@@ -23,7 +26,7 @@ public sealed class LibztTcpConnection : IProxyConnection, IConnectionTrace
 
     public System.Net.EndPoint? LocalEndPoint => null;
 
-    public System.Net.EndPoint? RemoteEndPoint => null;
+    public System.Net.EndPoint? RemoteEndPoint { get; }
 
     public async ValueTask<int> ReadAsync(
         byte[] buffer,
@@ -108,71 +111,57 @@ public sealed class LibztTcpConnection : IProxyConnection, IConnectionTrace
         if (count > buffer.Length)
             throw new ArgumentOutOfRangeException(nameof(count));
 
-        var handle = GCHandle.Alloc(buffer, GCHandleType.Pinned);
-        try
+        var offset = 0;
+        while (offset < count)
         {
-            var basePointer = handle.AddrOfPinnedObject();
-            var offset = 0;
-            while (offset < count)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                var fd = GetFd();
-                await LibztSocketPoller.WaitAsync(
-                    fd,
-                    LibztNative.PollOut,
-                    cancellationToken,
-                    _nativeGate,
-                    GetCurrentFd,
-                    nameof(LibztTcpConnection)).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
+            var fd = GetFd();
+            await LibztSocketPoller.WaitAsync(
+                fd, LibztNative.PollOut, cancellationToken,
+                _nativeGate, GetCurrentFd, nameof(LibztTcpConnection))
+                .ConfigureAwait(false);
 
-                var requested = count - offset;
-                int result;
-                int socketError = 0;
-                lock (_nativeGate)
+            int result;
+            int socketError = 0;
+            lock (_nativeGate)
+            {
+                EnsureCurrentFd(fd, cancellationToken);
+                // Keep the buffer pinned only inside the synchronous native
+                // call. Never pin across an idle socket's async poll wait.
+                var handle = GCHandle.Alloc(buffer, GCHandleType.Pinned);
+                try
                 {
-                    EnsureCurrentFd(fd, cancellationToken);
                     result = LibztNative.Write(
-                        fd,
-                        basePointer + offset,
-                        checked((uint)requested));
+                        fd, handle.AddrOfPinnedObject() + offset,
+                        checked((uint)(count - offset)));
                     if (result == LibztNative.ErrSocket)
                         socketError = LibztNative.GetLastSocketError(fd);
                 }
-
-                if (result < 0)
+                finally
                 {
-                    if (cancellationToken.IsCancellationRequested)
-                        throw new OperationCanceledException(cancellationToken);
-
-                    if (result == LibztNative.ErrSocket)
-                    {
-                        if (socketError == 0
-                            || LibztSocketPoller.IsWouldBlock(socketError))
-                        {
-                            continue;
-                        }
-
-                        throw new LibztException(
-                            "zts_bsd_write",
-                            result,
-                            socketError);
-                    }
-
-                    throw new IOException(
-                        $"zts_bsd_write failed: api_rc={result}");
+                    handle.Free();
                 }
-
-                if (result == 0)
-                    throw new IOException("libzt TCP write returned zero.");
-
-                offset += result;
             }
-        }
-        finally
-        {
-            handle.Free();
+
+            if (result < 0)
+            {
+                if (cancellationToken.IsCancellationRequested)
+                    throw new OperationCanceledException(cancellationToken);
+                if (result == LibztNative.ErrSocket)
+                {
+                    if (socketError == 0
+                        || LibztSocketPoller.IsWouldBlock(socketError))
+                        continue;
+                    throw new LibztException("zts_bsd_write", result, socketError);
+                }
+                throw new IOException($"zts_bsd_write failed: api_rc={result}");
+            }
+            if (result == 0)
+                throw new IOException("libzt TCP write returned zero.");
+            offset += result;
         }
     }
+
 
     public ValueTask ShutdownWriteAsync(CancellationToken cancellationToken)
     {

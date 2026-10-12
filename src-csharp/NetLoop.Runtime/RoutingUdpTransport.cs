@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Net;
 using System.Threading.Channels;
 using NetLoop.Core;
@@ -10,38 +9,50 @@ namespace NetLoop.Host;
 internal sealed class RoutingUdpTransportFactory : IProxyUdpTransportFactory
 {
     private readonly RouteSelector _selector;
-    private readonly IPAddress _overlayBindAddress;
+    private IPAddress _overlayBindAddress;
     private readonly ushort _overlayUdpPort;
     private readonly IProxyUdpTransportFactory _egressFactory;
+    private readonly int _queueCapacity;
+    private readonly UdpByteBudget _budget;
 
     internal RoutingUdpTransportFactory(
         RouteSelector selector,
         IPAddress overlayBindAddress,
         ushort overlayUdpPort,
-        IProxyUdpTransportFactory egressFactory)
+        IProxyUdpTransportFactory egressFactory,
+        int queueCapacity,
+        UdpByteBudget budget)
     {
         _selector = selector;
         _overlayBindAddress = overlayBindAddress;
         _overlayUdpPort = overlayUdpPort;
         _egressFactory = egressFactory;
+        _queueCapacity = queueCapacity;
+        _budget = budget;
     }
+
+    internal void UpdateBindAddress(IPAddress address)
+        => Volatile.Write(ref _overlayBindAddress, address);
 
     public async ValueTask<IProxyUdpTransport> CreateAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
 
-        var localTransport = new SystemUdpTransport();
+        var bindAddress = Volatile.Read(ref _overlayBindAddress);
+        var localTransport = new SystemUdpTransport(_queueCapacity, _budget);
         LibztUdpSocket? overlaySocket = null;
         try
         {
-            overlaySocket = LibztUdpSocket.Bind(_overlayBindAddress, 0);
+            overlaySocket = LibztUdpSocket.Bind(bindAddress, 0);
             return new RoutingUdpTransport(
                 _selector,
-                _overlayBindAddress,
+                bindAddress,
                 _overlayUdpPort,
                 localTransport,
                 _egressFactory,
-                overlaySocket);
+                overlaySocket,
+                _queueCapacity,
+                _budget);
         }
         catch
         {
@@ -63,14 +74,9 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
     private readonly IProxyUdpTransport _localTransport;
     private readonly IProxyUdpTransportFactory _egressFactory;
     private readonly LibztUdpSocket _overlaySocket;
-    private readonly ConcurrentDictionary<IPEndPoint, byte> _allowedPeers = new();
-    private readonly Channel<ProxyUdpDatagram> _received = Channel.CreateBounded<ProxyUdpDatagram>(
-        new BoundedChannelOptions(ReceiveQueueCapacity) {
-            SingleReader = false,
-            SingleWriter = false,
-            AllowSynchronousContinuations = false,
-            FullMode = BoundedChannelFullMode.DropOldest
-        });
+    private readonly UdpResponsePeerRegistry _allowedPeers = new();
+    private readonly Channel<ProxyUdpDatagram> _received;
+    private readonly UdpByteBudget _budget;
     private readonly CancellationTokenSource _stop = new();
     private readonly Task[] _receiveLoops;
     private readonly SemaphoreSlim _egressGate = new(1, 1);
@@ -84,7 +90,9 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
         ushort overlayUdpPort,
         IProxyUdpTransport localTransport,
         IProxyUdpTransportFactory egressFactory,
-        LibztUdpSocket overlaySocket)
+        LibztUdpSocket overlaySocket,
+        int queueCapacity,
+        UdpByteBudget budget)
     {
         _selector = selector;
         _primarySelfAddress = primarySelfAddress;
@@ -92,6 +100,14 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
         _localTransport = localTransport;
         _egressFactory = egressFactory;
         _overlaySocket = overlaySocket;
+        _budget = budget;
+        _received = Channel.CreateBounded<ProxyUdpDatagram>(
+            new BoundedChannelOptions(queueCapacity) {
+                SingleReader = false,
+                SingleWriter = false,
+                AllowSynchronousContinuations = false,
+                FullMode = BoundedChannelFullMode.Wait
+            });
 
         _receiveLoops = [
             RunGuardedAsync(
@@ -138,7 +154,7 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
                 var peer = decision.PeerAddress
                     ?? throw new InvalidOperationException("UDP overlay route has no peer address.");
                 var agent = new IPEndPoint(peer, _overlayUdpPort);
-                _allowedPeers.TryAdd(agent, 0);
+                _allowedPeers.Allow(agent);
 
                 var packet = Socks5UdpPacket.Build(target, content.Span);
                 await _overlaySocket.SendToAsync(
@@ -201,7 +217,9 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
     public async ValueTask<ProxyUdpDatagram> ReceiveAsync(CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
-        return await _received.Reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+        var datagram = await _received.Reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+        _budget.Release(datagram.Content.Length);
+        return datagram;
     }
 
     private async Task PumpTransportAsync(
@@ -215,7 +233,16 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
             var response = rewriteLoopbackSource
                 ? RewriteLocalResponse(datagram)
                 : datagram;
-            await _received.Writer.WriteAsync(response, cancellationToken).ConfigureAwait(false);
+            if (!_budget.TryReserve(response.Content.Length))
+            {
+                UdpQueueMetrics.RoutingReceiveDropped();
+                continue;
+            }
+            if (!_received.Writer.TryWrite(response))
+            {
+                _budget.Release(response.Content.Length);
+                UdpQueueMetrics.RoutingReceiveDropped();
+            }
         }
     }
 
@@ -239,7 +266,7 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
         while (!cancellationToken.IsCancellationRequested)
         {
             var datagram = await _overlaySocket.ReceiveFromAsync(cancellationToken).ConfigureAwait(false);
-            if (!_allowedPeers.ContainsKey(datagram.RemoteEndPoint))
+            if (!_allowedPeers.IsAllowed(datagram.RemoteEndPoint))
             {
                 JsonLog.Info("udp_overlay_unexpected_peer_dropped", new {
                     source = datagram.RemoteEndPoint.ToString()
@@ -256,9 +283,18 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
                 continue;
             }
 
-            await _received.Writer.WriteAsync(
-                new ProxyUdpDatagram(packet.Target, packet.Content.ToArray()),
-                cancellationToken).ConfigureAwait(false);
+            if (!_budget.TryReserve(packet.Content.Length))
+            {
+                UdpQueueMetrics.RoutingReceiveDropped();
+                continue;
+            }
+            var response = new ProxyUdpDatagram(
+                packet.Target, packet.Content.ToArray());
+            if (!_received.Writer.TryWrite(response))
+            {
+                _budget.Release(response.Content.Length);
+                UdpQueueMetrics.RoutingReceiveDropped();
+            }
         }
     }
 
@@ -334,6 +370,8 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
         }
 
         _received.Writer.TryComplete();
+        while (_received.Reader.TryRead(out var queued))
+            _budget.Release(queued.Content.Length);
         _egressGate.Dispose();
         _stop.Dispose();
     }
@@ -342,5 +380,71 @@ internal sealed class RoutingUdpTransport : IProxyUdpTransport
     {
         if (Volatile.Read(ref _disposed) != 0)
             throw new ObjectDisposedException(nameof(RoutingUdpTransport));
+    }
+}
+
+/// <summary>
+/// An Association only accepts UDP responses from endpoints it contacted.
+/// A small expiring set replaces the previous grow-only endpoint dictionary.
+/// Evicting an old peer can drop a late response, but never widens access.
+/// </summary>
+internal sealed class UdpResponsePeerRegistry
+{
+    internal const int MaxPeers = 64;
+    internal const long MaxIdleMilliseconds = 120_000;
+
+    private readonly Dictionary<IPEndPoint, long> _lastSent = new();
+    private readonly object _gate = new();
+    private readonly Func<long> _now;
+
+    internal UdpResponsePeerRegistry(Func<long>? clock = null)
+        => _now = clock ?? (() => Environment.TickCount64);
+
+    internal int Count
+    {
+        get
+        {
+            lock (_gate)
+                return _lastSent.Count;
+        }
+    }
+
+    internal void Allow(IPEndPoint peer)
+    {
+        lock (_gate)
+        {
+            var now = _now();
+            if (!_lastSent.ContainsKey(peer))
+            {
+                if (_lastSent.Count >= MaxPeers)
+                {
+                    // Remove stale peers first; with many active destinations
+                    // retain the most recently contacted ones.
+                    foreach (var stale in _lastSent
+                                 .Where(item => now - item.Value > MaxIdleMilliseconds)
+                                 .Select(static item => item.Key).ToArray())
+                        _lastSent.Remove(stale);
+                }
+                if (_lastSent.Count >= MaxPeers)
+                {
+                    var oldest = _lastSent.MinBy(static item => item.Value);
+                    _lastSent.Remove(oldest.Key);
+                }
+            }
+            _lastSent[peer] = now;
+        }
+    }
+
+    internal bool IsAllowed(IPEndPoint peer)
+    {
+        lock (_gate)
+        {
+            if (!_lastSent.TryGetValue(peer, out var lastSent))
+                return false;
+            if (_now() - lastSent <= MaxIdleMilliseconds)
+                return true;
+            _lastSent.Remove(peer);
+            return false;
+        }
     }
 }

@@ -54,9 +54,11 @@ jobs:
           patch1="$(git hash-object patches/libzt/0001-host-network-change-refresh.patch)"
           patch2="$(git hash-object patches/libzt/0002-android-pinvoke.patch)"
           patch3="$(git hash-object patches/libzt/0003-peer-event-details.patch)"
+          patch4="$(git hash-object patches/libzt/0004-network-cidr-queries.patch)"
+          patch5="$(git hash-object patches/libzt/0005-underlay-port-diagnostics.patch)"
           ndk_revision="$(awk -F= '/Pkg.Revision/ {gsub(/ /, "", $2); print $2}' "$ANDROID_NDK_HOME/source.properties")"
           echo "ndk_revision=$ndk_revision" >> "$GITHUB_OUTPUT"
-          echo "key=libzt-pinvoke-android-arm64-${ndk_revision}-${libzt}-${cmake}-${script}-${patch1}-${patch2}-${patch3}" >> "$GITHUB_OUTPUT"
+          echo "key=libzt-pinvoke-android-arm64-${ndk_revision}-${libzt}-${cmake}-${script}-${patch1}-${patch2}-${patch3}-${patch4}-${patch5}" >> "$GITHUB_OUTPUT"
 
       - name: Restore compiled Android libzt bundle
         id: native-cache
@@ -88,9 +90,8 @@ jobs:
           test -f native-cache/android-arm64/libzt.so
           file native-cache/android-arm64/libzt.so | tee native-cache/android-arm64/file.txt
           grep -Eq 'ARM aarch64|ARM64|AArch64' native-cache/android-arm64/file.txt
-          if [[ -f native-cache/android-arm64/libzt.so.manifest.json ]]; then
-            cat native-cache/android-arm64/libzt.so.manifest.json
-          fi
+          test -f native-cache/android-arm64/libzt.so.manifest.json
+          cat native-cache/android-arm64/libzt.so.manifest.json
 
       - name: Save compiled Android libzt bundle immediately
         if: steps.native-cache.outputs.cache-hit != 'true'
