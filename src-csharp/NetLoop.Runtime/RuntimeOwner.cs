@@ -52,6 +52,8 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
     private bool _physicalRefreshPending;
     private long _failedReadyRefreshAttempts;
     private Event? _deferredManualReset;
+    private long _lastPhysicalResetRequestTick;
+    private int _coalescedPhysicalEvents;
 
     internal event Action<RuntimeStatus>? StatusChanged;
 
@@ -60,7 +62,18 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
     internal int ResetCount => _resetCount;
 
     internal void RequestPhysicalNetworkRefresh(string reason)
-        => _events.Writer.TryWrite(new Event(EventKind.Physical, reason));
+    {
+        var now = Environment.TickCount64;
+        var previous = Interlocked.Read(ref _lastPhysicalResetRequestTick);
+        if (previous != 0 && now - previous < 500)
+        {
+            Interlocked.Increment(ref _coalescedPhysicalEvents);
+            return;
+        }
+
+        Interlocked.Exchange(ref _lastPhysicalResetRequestTick, now);
+        _events.Writer.TryWrite(new Event(EventKind.Physical, reason));
+    }
 
     internal void RequestManualReset(string reason)
         => _events.Writer.TryWrite(new Event(EventKind.Manual, reason));
@@ -390,6 +403,23 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
                 if (restart is not null)
                 {
                     Publish(RuntimePhase.Resetting, restart);
+                    if (restart == "physical_network_handover")
+                    {
+                        var sessions = runtime.TcpSessions;
+                        JsonLog.Info("runtime_handover_reset", new {
+                            reason = restart,
+                            tcp_total = sessions.Total,
+                            tcp_handshake = sessions.Handshake,
+                            tcp_connecting = sessions.Connecting,
+                            tcp_relay = sessions.Relay,
+                            tcp_udp_association = sessions.UdpAssociation,
+                            udp_local = runtime.ActiveLocalUdpAssociations,
+                            udp_overlay = runtime.ActiveOverlayUdpAssociations,
+                            peer_dials = runtime.PeerDials.Length,
+                            coalesced_events = Interlocked.Exchange(
+                                ref _coalescedPhysicalEvents, 0)
+                        });
+                    }
                     Volatile.Write(ref _active, null);
                     runtime.Abort();
                     await runtime.DisposeAsync().ConfigureAwait(false);
