@@ -15,4 +15,6 @@ public sealed class LibztException : IOException
     public int ApiResult { get; }
 
     public int SocketError { get; }
+
+    public bool IsNetworkUnavailable => ApiResult == LibztNative.ErrNoResult;
 }

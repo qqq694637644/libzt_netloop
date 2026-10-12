@@ -9,8 +9,10 @@ The repository no longer contains the original NetLoop C++ client/server impleme
 - `src-csharp/NetLoop.Core` — routing, relay, and shared runtime abstractions.
 - `src-csharp/NetLoop.Socks` — SOCKS5 TCP/UDP protocol handling.
 - `src-csharp/NetLoop.Libzt` — P/Invoke bindings and libzt socket wrappers.
+- `src-csharp/NetLoop.Runtime` — one shared business runtime/lifetime implementation for desktop and Android.
 - `src-csharp/NetLoop.Host` — Windows/Linux NetLoop host.
 - `src-csharp/NetLoop.Android` — Android foreground-service application.
+- `src-csharp/NetLoop.Checks` — offline managed regression checks (no real ZeroTier Node).
 
 ## Supported targets
 
@@ -24,13 +26,13 @@ jobs are currently disabled.
 
 ## Overlay addresses
 
-Each runtime chooses one **primary overlay address** for its peer TCP/UDP listeners: the numerically lowest Managed IPv4 address is preferred; if no IPv4 address exists, the numerically lowest Managed IPv6 address is used. The selected value is published as `primary_overlay_address` in the readiness status.
+This personal-use runtime requires **exactly one Controller-assigned IPv4 Managed IP per node**. A missing address leaves the native Node alive while waiting for Controller configuration; multiple Managed IPs or an IPv6-only assignment are explicit configuration errors. It does not silently choose a "primary" address or maintain a second Agent listener. The single address is published in the status.
 
 `--default-exit` is required on every node and selects the exit used for non-overlay destinations; it **does not override ZeroTier's direct-peer routing**. Every direct ZeroTier peer is identified exclusively by matching the Controller-assigned address prefixes and Managed Routes, never by hardcoding a network such as `172.26.0.0/24` or maintaining a manually entered peer list. **The `--peer` CLI argument has been removed: old command lines that include it now fail to start.** The exit node may use its own primary address as `--default-exit`; in that case NetLoop uses local egress instead of connecting to itself.
 
-Controller **direct** routes (no `via` gateway) allow direct peer Agent forwarding. More-specific routes with a `via` gateway are **rejected explicitly**: the NetLoop Agent SOCKS5 protocol does not implement ZeroTier gateway/multihop routing. ZeroTier `/0` default routes are not treated as Overlay Peer networks; ordinary internet traffic still uses the configured NetLoop default exit. Missing Controller prefixes are never guessed. This behavior includes IPv6. Desktop SOCKS always binds to loopback; `--socks-host` is intentionally unsupported.
+Controller **direct** routes (no `via` gateway) allow direct peer Agent forwarding. More-specific routes with a `via` gateway are **rejected explicitly**: the NetLoop Agent SOCKS5 protocol does not implement ZeroTier gateway/multihop routing. ZeroTier `/0` default routes are not treated as Overlay Peer networks; ordinary internet traffic uses the configured NetLoop default exit **only when B has a current Controller-derived direct route**. Missing Controller prefixes are never guessed. Desktop SOCKS always binds to loopback; `--socks-host` is intentionally unsupported.
 
-Only the current primary Managed IP is bound for new NetLoop TCP/UDP Agent connections. If the Controller revokes that address and grants a replacement, the runtime binds replacement Agent listeners first, retires the old TCP acceptor and **drains its established TCP sessions** without restarting libzt. Existing UDP associations on the revoked address are closed; old TCP sessions can be aborted when the 16-retired-listener safety limit is exceeded. **Route-only** configuration updates do not interrupt existing TCP. See [dynamic ZeroTier routing](docs/zerotier-network-routes.md).
+**Route-only** Controller updates atomically replace routing state without disconnecting existing TCP. A real change/revocation of the sole Managed IP closes and recreates the **business Runtime** (including local UDP associations) while keeping the native libzt Node and identity intact. Ordinary Wi-Fi/hotspot switches only request an underlying libzt network-path refresh, not an unconditional Runtime reset. See [dynamic ZeroTier routing](docs/zerotier-network-routes.md).
 
 ## Peer P2P / relay diagnostics
 
@@ -139,9 +141,10 @@ or state directories**. See [the Chinese probe guide](docs/connection-probe.md).
 The runtime now limits the incoming SOCKS5 handshake (default 15 seconds)
 and the upstream CONNECT reply / UDP ASSOCIATE setup (default 25 seconds).
 Unexpected termination of local SOCKS, Overlay TCP, or Overlay UDP listener
-tasks triggers business-runtime recovery. Transient runtime initialization
-failures are retried at most 12 times with capped backoff; the ZeroTier Node
-and identity remain intact.
+tasks triggers a business-runtime rebuild. Temporary missing Controller
+configuration keeps the same libzt Node running in degraded mode until
+the single Managed IPv4 appears; invalid local configuration and bind errors
+fail explicitly instead of adding retry/compatibility layers.
 
 Windows/Linux hosts can optionally rotate JSONL logs instead of relying on
 unbounded shell redirection. For example:
@@ -162,9 +165,9 @@ Further PR #3 hardening includes 30-second native Controller config
 revalidation (new routing rejects requests while configuration is missing),
 15-second health/status-file updates, opt-in inbound Agent source-IP/CIDR and
 destination-port ACLs, and resource-budget/UDP queue-drop counters.
-`--libzt-poll-mode shared` is an **experimental opt-in** batched socket
-poller; the original `per-socket` mode remains the default until real-device
-connection-lifetime testing is available.
+The unvalidated shared Poller and its CLI switch have been removed. Only the
+known per-socket Poller remains while idle CPU, RDP, native fd ownership and
+handover performance await actual A/B/C device measurements.
 
 For new versions, download the relevant build directly from
 [GitHub Releases](https://github.com/qqq694637644/libzt_netloop/releases)

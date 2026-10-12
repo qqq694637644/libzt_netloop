@@ -25,17 +25,20 @@ public interface IProxyUdpTransportFactory
 public sealed class DirectUdpTransportFactory : IProxyUdpTransportFactory
 {
     private readonly int _queueCapacity;
+    private readonly UdpByteBudget? _budget;
 
-    public DirectUdpTransportFactory(int queueCapacity = 256)
+    public DirectUdpTransportFactory(
+        int queueCapacity = 256, UdpByteBudget? budget = null)
     {
         _queueCapacity = queueCapacity;
+        _budget = budget;
     }
 
     public ValueTask<IProxyUdpTransport> CreateAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         return ValueTask.FromResult<IProxyUdpTransport>(
-            new SystemUdpTransport(_queueCapacity));
+            new SystemUdpTransport(_queueCapacity, _budget));
     }
 }
 
@@ -49,14 +52,17 @@ public sealed class SystemUdpTransport : IProxyUdpTransport
     private readonly UdpClient _ipv6;
     private readonly ConcurrentDictionary<IPEndPoint, long> _destinations = new();
     private readonly Channel<ProxyUdpDatagram> _received;
+    private readonly UdpByteBudget _budget;
     private readonly CancellationTokenSource _stop = new();
     private readonly Task[] _receiveLoops;
     private int _disposed;
 
-    public SystemUdpTransport(int queueCapacity = ReceiveQueueCapacity)
+    public SystemUdpTransport(
+        int queueCapacity = ReceiveQueueCapacity, UdpByteBudget? budget = null)
     {
         if (queueCapacity is < 16 or > 4096)
             throw new ArgumentOutOfRangeException(nameof(queueCapacity));
+        _budget = budget ?? new UdpByteBudget(1024 * 1024);
         _received = Channel.CreateBounded<ProxyUdpDatagram>(
             new BoundedChannelOptions(queueCapacity) {
                 SingleReader = false,
@@ -89,7 +95,9 @@ public sealed class SystemUdpTransport : IProxyUdpTransport
     public async ValueTask<ProxyUdpDatagram> ReceiveAsync(CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
-        return await _received.Reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+        var datagram = await _received.Reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+        _budget.Release(datagram.Content.Length);
+        return datagram;
     }
 
     private async Task ReceiveLoopAsync(UdpClient client, CancellationToken cancellationToken)
@@ -109,13 +117,19 @@ public sealed class SystemUdpTransport : IProxyUdpTransport
                 }
 
                 _destinations[result.RemoteEndPoint] = Environment.TickCount64;
-                if (!_received.Writer.TryWrite(
-                    new ProxyUdpDatagram(
-                        new ProxyTarget(
-                            result.RemoteEndPoint.Address.ToString(),
-                            checked((ushort)result.RemoteEndPoint.Port)),
-                        result.Buffer)))
+                if (!_budget.TryReserve(result.Buffer.Length))
                 {
+                    UdpQueueMetrics.SystemReceiveDropped();
+                    continue;
+                }
+                var datagram = new ProxyUdpDatagram(
+                    new ProxyTarget(
+                        result.RemoteEndPoint.Address.ToString(),
+                        checked((ushort)result.RemoteEndPoint.Port)),
+                    result.Buffer);
+                if (!_received.Writer.TryWrite(datagram))
+                {
+                    _budget.Release(datagram.Content.Length);
                     UdpQueueMetrics.SystemReceiveDropped();
                 }
             }
@@ -200,6 +214,8 @@ public sealed class SystemUdpTransport : IProxyUdpTransport
         }
 
         _received.Writer.TryComplete();
+        while (_received.Reader.TryRead(out var queued))
+            _budget.Release(queued.Content.Length);
         _stop.Dispose();
     }
 

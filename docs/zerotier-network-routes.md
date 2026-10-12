@@ -26,15 +26,16 @@ Controller 版本的地址和路由。Android 和 Windows/Linux 的 native
 
 | 目标 | 新连接行为 |
 | --- | --- |
-| 本机任一 Managed IP | 本机 loopback 服务（IPv4/IPv6） |
+| 本机唯一 IPv4 Managed IP | 本机 `127.0.0.1:原端口` 服务（TCP/UDP） |
 | 匹配 Controller 下发的本地直连前缀 / Managed Route（无 `via`） | 直接访问目标 IP 的 NetLoop Agent `:42042` / UDP Agent `:42043` |
 | 匹配需要 `via` 的 Managed Route | **明确拒绝**；不转给 B，不猜测网关上有 NetLoop Agent |
 | 默认出口 B 的 Managed IP 却不匹配有效直连路由 | **明确拒绝**；不会依靠出口配置绕过 Controller 路由 |
-| 其他非 Overlay 目标 | 使用配置的默认出口 B（出口节点使用自身 egress） |
+| 其他非 Overlay 目标 | 只有 B 仍匹配 Controller 当前有效直连路由才使用 B；出口节点使用自身 egress |
 
 **破坏性变更：`--peer` 已彻底移除**。旧 CLI 带这个参数将报
 `Unknown option: --peer`，必须从启动脚本删除。Android 受控 START 的
-`peers` 字段同样移除，继续传递会收到明确的控制协议错误。
+`peers` 字段同样移除；Android Control API 升级为 v2，
+旧 v1 调用者必须同步更新。
 `default_exit` 仍负责非 Overlay 请求的出口选择，但不能用作直连路由兜底。
 
 优先选择**最长匹配前缀**；相同长度时，Controller 的显式
@@ -87,18 +88,17 @@ Managed Routes。遇到查询失败，保留最近一份快照供诊断，同时
 仅仅更新路由时，不会触发 NetLoop reset、
 重启 libzt、关闭 SOCKS5 listener 或强制断开已有 TCP。
 新连接根据更新后的快照选路；已有 TCP 连接继续使用现有 socket。
-**物理网络变化引起的原有 runtime reset 逻辑保持不变**，
-不能将这两类事件混为一谈。
+**物理网络变化只通知 libzt 更新路径，不能因此无条件重建
+Runtime 或断开长时间 RDP/TCP**。
 
-若 Controller 撤销了当前 Agent listener 所绑定的 Managed IP，
-运行时发出 `overlay_bind_address_no_longer_assigned`，优先在
-新的 Managed IP 上创建 TCP/UDP listener，再退役旧 TCP listener，
-让已接受的 TCP 会话尽量自然结束。旧 UDP association 会被终止；
-为了限制地址快速变化导致的资源积累，最多保留 16 个退役 TCP
-Agent，超过上限会主动中断最早的旧会话。
-若新 IP 监听器绑定失败则记录 `overlay_bind_migration_failed`、
-将状态标记为 `degraded` 并在后续配置刷新时重新尝试，**不重启
-libzt Node**。未获 Controller 授权的旧本机 IP 也不会继续被判断成
+每个节点只配置**一个 IPv4 Managed IP**。若 Controller 真实撤销
+唯一 Agent 绑定地址，RuntimeOwner 统一关闭旧业务 Runtime，
+释放 TCP、Overlay UDP 和本地 UDP Association，再用最新有效的
+唯一地址建立业务 Runtime。没有新地址则保持 libzt Node 存活并
+报告 `degraded`；**不重建 Node、不清理身份文件**。
+由于 Managed IP 在个人部署中几乎不会变化，这种罕见事件允许中断
+旧 TCP，而不再维护两个监听器、16 个退役 Agent 和排空队列。
+新建请求必须遵守 Controller 现行路由，失效旧 IP 不再被视为
 `LocalLoopback`。
 
 ## 如何检查
@@ -113,8 +113,8 @@ libzt Node**。未获 Controller 授权的旧本机 IP 也不会继续被判断�
   而不是错误的 `DefaultExit`
 - `libzt_network_config_refresh_failed`：原生配置查询失败；
   保留旧快照仅用于诊断，新路由一律 `Reject`，不静默兜底
-- `overlay_bind_migrated` / `overlay_bind_migration_failed`：
-  Agent IP 替换结果与已连接 TCP 的处理
+- `runtime_phase` / `runtime_replaced`：唯一 Runtime 生命周期，
+  Managed IP 变更或关键 Listener 失效对应的重建原因
 
 在 B/C 的 Agent 日志中可用
 `tcp_accept_completed` 和 `socks_connect_request`

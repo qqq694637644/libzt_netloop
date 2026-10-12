@@ -13,23 +13,26 @@
 用它为**新连接**选路；路由会明确 Reject，不会兜底到 B 的
 `--default-exit`。配置恢复后新请求重新开放。
 
-Controller 撤销当前 Agent Managed IP：
-
-1. 若新地址已分配，先在新 IP 上创建 TCP/UDP Agent 监听器。
-2. 再停止旧 TCP accept，旧 TCP 已建立的会话尽量自然结束。
-3. 原 IP 的 UDP 关联关闭；旧 TCP 监听者保留最多 16 个，超限
-   将中断最早旧会话，以防止 IP 高频变化导致无限占用资源。
-4. 新地址绑定失败时记录 `overlay_bind_migration_failed`，标记
-   `degraded`，等待下一次 Controller 核验重试，**不重新创建 Node**。
+每个节点**恰好一个 Controller 分配的 IPv4 Managed IP**。没有 IP
+时 libzt Node 继续存活并报告 `degraded`；同时出现多个 Managed IP
+或只有 IPv6 属于明确的配置错误，不自动选择“Primary”。
+Controller 仅更新路由时替换原子快照，**不动已有 TCP/RDP**。
+真正撤销/更换这唯一 Managed IP 时，由一个 Runtime 所有者关闭旧
+业务 Runtime（包括**本地 SOCKS UDP Association**），并在重新
+核实唯一新地址后创建新 Runtime；允许此罕见配置事件中断旧 TCP。
+原生 Node/身份文件不重建或覆盖。普通 Wi-Fi/热点切换只通知 libzt
+更新路径，**不能只因网络事件就中断旧 TCP**。
 
 Windows/Linux `--status-file` 每 15 秒原子更新
 `updated_at_utc`、`last_network_query_utc`、`route_generation`、
-`network_config_available`、`overlay_bind_assigned` 和当前
-`phase=ready|degraded`，同时记录 ACL 拒绝与 UDP 丢包计数。
+`network_config_available`、活动绑定地址和当前
+`phase=starting|ready|degraded|resetting|stopped`，同时记录
+全局 TCP 活跃量、UDP 排队字节数、ACL 拒绝与 UDP 丢包计数。
 `ready` 只代表业务端监听器就绪，不代表 A→C RDP 可达。
-Android 复用控制 API v1 的 STARTING/READY/STOPPED 字段；
-配置失效/监听 IP 被撤销时报告 STARTING（保留诊断节点信息），
-配置恢复后才改回 READY；不扩展旧 Binder 协议状态枚举。
+Android 使用**破坏式 Control API v2**，直接输出
+`STARTING / READY / DEGRADED / RESETTING / STOPPED`，
+额外报告 `reason`、`route_generation`、`updated_at_utc`；
+没有 v1/v2 兼容协议，调用应用必须同步更新。
 
 ### Agent 入站 ACL（可选）
 
@@ -62,33 +65,26 @@ ZeroTier Controller 里正确管理。ACL 不生成 Managed Routes，
 
 | CLI 参数 | 默认值 | 允许范围 |
 | --- | --- | --- |
-| `--max-tcp-tunnels` | 每入口 128 | 1–1024 |
+| `--max-tcp-tunnels` | 整个业务 Runtime 共 128 | 1–1024 |
 | `--max-udp-associations` | 每入口 64 | 1–512 |
 | `--relay-buffer-kib` | 每方向 64KiB | 4–256 |
 | `--udp-queue-capacity` | 每个传输接收队列 256 包 | 16–4096 |
 | `--udp-send-timeout` | 30 秒 | 1–120 |
-| `--libzt-poll-mode` | `per-socket` | `per-socket` / `shared` |
 
 Overlay UDP 接收后会交由**每个远端单独的处理队列**异步转发：
 一个上游的慢发送/建连不会阻塞其他远端的原生接收循环。
-每条关联限制总排队数据量约 1MiB，队列满直接丢弃新包，
-不会无期限等待。`system_receive`、`routing_receive`、
+每条关联限制排队数据量约 1MiB；整个 Runtime UDP 队列
+合计还限制为 16MiB，超限直接丢包，不会无期限等待。
+`system_receive`、`routing_receive`、
 `overlay_forward` 累计在状态文件 `udp_queue_dropped` 中。
 `overlay_udp_queue_drop` 有源地址和目标地址方便排障。
 
-大量连接时可**手动**试验：
-
-```text
---libzt-poll-mode shared --relay-buffer-kib 32 --udp-queue-capacity 128
-```
-
-`shared` 使 socket Poll 在一个异步任务里最多 64 个 FD 合批，
-仍采用非阻塞 libzt native poll、保留 fd 锁避免 native socket
-关闭竞态。该模式**仅编译验证、未经真实 Windows/Android
-长连接、改网、并发实测**，所以默认依旧为 `per-socket`。
-出现异常应手动回退为原默认模式。增加 TCP 连接容量、
-UDP association 容量和缓存会增加内存占用，尤其不可将几个
-上限同时调到最大。
+实验性的共享 FD Poller 及其参数已删除，**只维护原有
+per-socket Poller**。原生 fd 批量 poll 的收益与断网安全性
+未经 Windows/Android 实测，不能凭推测替换默认实现。
+native TCP 写入不再跨异步等待固定缓冲区；UDP 接收使用共享缓冲池
+而非每包重新分配约 64KiB 非托管内存。增加容量会放大实际
+内存占用，个人小规模节点先保留默认值。
 
 ## 四：直接从 GitHub Releases 下载
 

@@ -156,9 +156,11 @@ public sealed class LibztNode : IAsyncDisposable
     {
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeoutCts.CancelAfter(_startupTimeout);
-        var token = timeoutCts.Token;
 
-        await _nodeUp.Task.WaitAsync(token).ConfigureAwait(false);
+        // The startup timeout guards native Node initialization ONLY.
+        // Once the Node is up, an unavailable Controller/transport must not
+        // make an otherwise healthy, non-daemon process exit permanently.
+        await _nodeUp.Task.WaitAsync(timeoutCts.Token).ConfigureAwait(false);
         var nodeId = LibztNative.NodeGetId();
         JsonLog.Info("libzt_network_join_start", new {
             network = _networkId.ToString("x16"),
@@ -173,13 +175,13 @@ public sealed class LibztNode : IAsyncDisposable
             if (IsTerminalNetworkStatus(status))
                 throw new LibztException($"network join status={status}", status);
 
-            await Task.Delay(250, token).ConfigureAwait(false);
+            await Task.Delay(250, cancellationToken).ConfigureAwait(false);
         }
 
         LibztNetworkState state;
         while (true)
         {
-            token.ThrowIfCancellationRequested();
+            cancellationToken.ThrowIfCancellationRequested();
             try
             {
                 state = RefreshNetworkState();
@@ -188,14 +190,14 @@ public sealed class LibztNode : IAsyncDisposable
             }
             catch (LibztException ex)
                 when (ex.ApiResult == LibztNative.ErrNoResult
-                      && !token.IsCancellationRequested)
+                      && !cancellationToken.IsCancellationRequested)
             {
                 // The transport can report readiness just before the native
                 // network configuration appears in core. Do not treat this
                 // transient state as a permanent startup failure.
             }
 
-            await Task.Delay(100, token).ConfigureAwait(false);
+            await Task.Delay(100, cancellationToken).ConfigureAwait(false);
         }
 
         JsonLog.Info("libzt_network_ready", new {

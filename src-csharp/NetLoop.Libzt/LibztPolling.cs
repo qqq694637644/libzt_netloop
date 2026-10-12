@@ -1,23 +1,16 @@
 namespace NetLoop.Libzt;
 
 /// <summary>
-/// Explicit opt-in for the shared batched socket poller. Set once before the
-/// Node starts; per-socket polling remains the default pending real-device
-/// long-connection validation.
+/// One maintained per-socket implementation until native fd batching is
+/// demonstrated safe and faster on actual devices. No experimental switch.
 /// </summary>
 public static class LibztPolling
 {
-    public static void ConfigureShared(bool enabled)
-        => LibztSocketPoller.ConfigureShared(enabled);
-
     public static object SnapshotMetrics()
     {
-        var metrics = SharedLibztSocketPoller.Metrics;
         return new {
-            mode = LibztSocketPoller.SharedMode ? "shared" : "per-socket",
-            shared_waiters = metrics.Waiting,
-            shared_poll_calls = metrics.Calls,
-            shared_fd_observations = metrics.FdObservations
+            mode = "per-socket",
+            native_poll_calls = LibztSocketPoller.PollCalls
         };
     }
 }

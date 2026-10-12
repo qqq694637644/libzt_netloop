@@ -18,11 +18,14 @@ internal sealed class OverlayUdpAgent : IAsyncDisposable
     private readonly int _maxAssociations;
     private readonly int _queueCapacity;
     private readonly TimeSpan _sendTimeout;
+    private readonly UdpByteBudget _budget;
     private readonly ConcurrentDictionary<IPEndPoint, OverlayUdpAssociation> _associations = new();
     private readonly CancellationTokenSource _stop = new();
     private readonly Task _receiveLoop;
     private int _aborted;
     private int _disposed;
+    private readonly TaskCompletionSource _disposedFinished = new(
+        TaskCreationOptions.RunContinuationsAsynchronously);
 
     internal Task Completion => _receiveLoop;
 
@@ -35,7 +38,8 @@ internal sealed class OverlayUdpAgent : IAsyncDisposable
         TimeSpan idleTimeout,
         AgentAccessPolicy accessPolicy,
         int queueCapacity,
-        TimeSpan sendTimeout)
+        TimeSpan sendTimeout,
+        UdpByteBudget budget)
     {
         if (maxAssociations <= 0)
             throw new ArgumentOutOfRangeException(nameof(maxAssociations));
@@ -47,6 +51,7 @@ internal sealed class OverlayUdpAgent : IAsyncDisposable
         _maxAssociations = maxAssociations;
         _queueCapacity = queueCapacity;
         _sendTimeout = sendTimeout;
+        _budget = budget;
         _idleTimeout = idleTimeout;
         _socket = LibztUdpSocket.Bind(bindAddress, port);
         _receiveLoop = ReceiveLoopAsync(_stop.Token);
@@ -141,7 +146,6 @@ internal sealed class OverlayUdpAgent : IAsyncDisposable
         if (_associations.TryGetValue(peer, out var existing))
             return existing;
 
-        PruneCompletedAssociations();
         if (_associations.Count >= _maxAssociations)
             return null;
 
@@ -149,11 +153,12 @@ internal sealed class OverlayUdpAgent : IAsyncDisposable
             peer,
             _primarySelfAddress,
             _selector,
-            new SystemUdpTransport(_queueCapacity),
+            new SystemUdpTransport(_queueCapacity, _budget),
             _egressFactory,
             _idleTimeout,
             _queueCapacity,
             _sendTimeout,
+            _budget,
             SendResponseAsync,
             _stop.Token);
 
@@ -181,9 +186,10 @@ internal sealed class OverlayUdpAgent : IAsyncDisposable
         }
         finally
         {
-            if (TryRemoveAssociation(peer, association))
+            var removed = TryRemoveAssociation(peer, association);
+            await association.DisposeAsync().ConfigureAwait(false);
+            if (removed)
             {
-                await association.DisposeAsync().ConfigureAwait(false);
                 JsonLog.Info("overlay_udp_association_removed", new {
                     peer = peer.ToString(),
                     active = _associations.Count
@@ -192,30 +198,22 @@ internal sealed class OverlayUdpAgent : IAsyncDisposable
         }
     }
 
-    private void PruneCompletedAssociations()
-    {
-        foreach (var entry in _associations)
-        {
-            if (!entry.Value.Completion.IsCompleted)
-                continue;
-
-            if (TryRemoveAssociation(entry.Key, entry.Value))
-            {
-                _ = entry.Value.DisposeAsync();
-            }
-        }
-    }
-
     private bool TryRemoveAssociation(
         IPEndPoint peer,
         OverlayUdpAssociation expected)
-    {
-        if (!_associations.TryGetValue(peer, out var current)
-            || !ReferenceEquals(current, expected))
-            return false;
+        => RemoveMatching(_associations, peer, expected);
 
-        return _associations.TryRemove(peer, out var removed)
-            && ReferenceEquals(removed, expected);
+    internal static bool RemoveMatching<TKey, TValue>(
+        ConcurrentDictionary<TKey, TValue> dictionary,
+        TKey key,
+        TValue expected)
+        where TKey : notnull
+        where TValue : class
+    {
+        // ICollection.Remove on ConcurrentDictionary compares key AND value
+        // atomically. Never remove a newer association for a reused endpoint.
+        return ((ICollection<KeyValuePair<TKey, TValue>>)dictionary).Remove(
+            new KeyValuePair<TKey, TValue>(key, expected));
     }
 
     private async ValueTask SendResponseAsync(
@@ -242,24 +240,32 @@ internal sealed class OverlayUdpAgent : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            await _disposedFinished.Task.ConfigureAwait(false);
             return;
-
-        Abort();
+        }
 
         try
         {
-            await _receiveLoop.ConfigureAwait(false);
+            Abort();
+            try
+            {
+                await _receiveLoop.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+
+            var associations = _associations.ToArray();
+            _associations.Clear();
+            foreach (var entry in associations)
+                await entry.Value.DisposeAsync().ConfigureAwait(false);
         }
-        catch (OperationCanceledException)
+        finally
         {
+            _stop.Dispose();
+            _disposedFinished.TrySetResult();
         }
-
-        var associations = _associations.ToArray();
-        _associations.Clear();
-        foreach (var entry in associations)
-            await entry.Value.DisposeAsync().ConfigureAwait(false);
-
-        _stop.Dispose();
     }
 }
 
@@ -274,6 +280,7 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
     private readonly IProxyUdpTransportFactory _egressFactory;
     private readonly TimeSpan _idleTimeout;
     private readonly TimeSpan _sendTimeout;
+    private readonly UdpByteBudget _budget;
     private readonly Channel<ForwardItem> _forwardQueue;
     private readonly Func<IPEndPoint, ProxyUdpDatagram, CancellationToken, ValueTask> _responseSender;
     private readonly CancellationTokenSource _stop;
@@ -287,6 +294,8 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
     private int _queuedBytes;
     private int _aborted;
     private int _disposed;
+    private readonly TaskCompletionSource _disposedFinished = new(
+        TaskCreationOptions.RunContinuationsAsynchronously);
 
     internal OverlayUdpAssociation(
         IPEndPoint peer,
@@ -297,6 +306,7 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
         TimeSpan idleTimeout,
         int queueCapacity,
         TimeSpan sendTimeout,
+        UdpByteBudget budget,
         Func<IPEndPoint, ProxyUdpDatagram, CancellationToken, ValueTask> responseSender,
         CancellationToken cancellationToken)
     {
@@ -307,6 +317,7 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
         _egressFactory = egressFactory;
         _idleTimeout = idleTimeout;
         _sendTimeout = sendTimeout;
+        _budget = budget;
         _forwardQueue = Channel.CreateBounded<ForwardItem>(
             new BoundedChannelOptions(queueCapacity) {
                 SingleReader = true,
@@ -338,11 +349,16 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
             return false;
 
         var bytes = content.Length;
+        if (!_budget.TryReserve(bytes))
+            return false;
         while (true)
         {
             var queued = Volatile.Read(ref _queuedBytes);
             if (queued + bytes > MaxQueuedBytes)
+            {
+                _budget.Release(bytes);
                 return false;
+            }
             if (Interlocked.CompareExchange(
                     ref _queuedBytes, queued + bytes, queued) == queued)
                 break;
@@ -351,6 +367,7 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
         if (!_forwardQueue.Writer.TryWrite(new ForwardItem(target, content.ToArray())))
         {
             Interlocked.Add(ref _queuedBytes, -bytes);
+            _budget.Release(bytes);
             return false;
         }
 
@@ -364,6 +381,7 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
                            .ReadAllAsync(cancellationToken).ConfigureAwait(false))
         {
             Interlocked.Add(ref _queuedBytes, -item.Content.Length);
+            _budget.Release(item.Content.Length);
             using var deadline =
                 CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             deadline.CancelAfter(_sendTimeout);
@@ -556,56 +574,52 @@ internal sealed class OverlayUdpAssociation : IAsyncDisposable
 
         _stop.Cancel();
         _forwardQueue.Writer.TryComplete();
-        _ = DisposeTransportNoThrowAsync(_localTransport);
-        if (_egressTransport is { } egressTransport)
-            _ = DisposeTransportNoThrowAsync(egressTransport);
-    }
-
-    private static async Task DisposeTransportNoThrowAsync(
-        IProxyUdpTransport transport)
-    {
-        try
-        {
-            await transport.DisposeAsync().ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            JsonLog.Error("overlay_udp_abort_transport_failed", new {
-                error_type = ex.GetType().Name,
-                error = ex.Message
-            });
-        }
     }
 
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            await _disposedFinished.Task.ConfigureAwait(false);
             return;
-
-        Abort();
-        await _localTransport.DisposeAsync().ConfigureAwait(false);
-
-        await _egressCreateLock.WaitAsync().ConfigureAwait(false);
-        var egressTransport = _egressTransport;
-        var egressReceiveLoop = _egressReceiveLoop;
-        _egressTransport = null;
-        _egressReceiveLoop = null;
-        _egressCreateLock.Release();
-
-        if (egressTransport is not null)
-            await egressTransport.DisposeAsync().ConfigureAwait(false);
+        }
 
         try
         {
-            await Completion.ConfigureAwait(false);
-            if (egressReceiveLoop is not null)
-                await egressReceiveLoop.ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-        }
+            Abort();
+            await _localTransport.DisposeAsync().ConfigureAwait(false);
 
-        _egressCreateLock.Dispose();
-        _stop.Dispose();
+            await _egressCreateLock.WaitAsync().ConfigureAwait(false);
+            var egressTransport = _egressTransport;
+            var egressReceiveLoop = _egressReceiveLoop;
+            _egressTransport = null;
+            _egressReceiveLoop = null;
+            _egressCreateLock.Release();
+
+            if (egressTransport is not null)
+                await egressTransport.DisposeAsync().ConfigureAwait(false);
+
+            try
+            {
+                await Completion.ConfigureAwait(false);
+                if (egressReceiveLoop is not null)
+                    await egressReceiveLoop.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+
+            while (_forwardQueue.Reader.TryRead(out var queued))
+            {
+                Interlocked.Add(ref _queuedBytes, -queued.Content.Length);
+                _budget.Release(queued.Content.Length);
+            }
+        }
+        finally
+        {
+            _egressCreateLock.Dispose();
+            _stop.Dispose();
+            _disposedFinished.TrySetResult();
+        }
     }
 }

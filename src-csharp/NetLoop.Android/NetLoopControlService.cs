@@ -10,7 +10,7 @@ namespace NetLoop.Android;
     Process = ":netloop")]
 public sealed class NetLoopControlService : Service
 {
-    internal const int ControlApiVersion = 1;
+    internal const int ControlApiVersion = 2;
     internal const int CommandStart = 1;
     internal const int CommandStop = 2;
     internal const int CommandGetStatus = 3;
@@ -67,7 +67,10 @@ public sealed class NetLoopControlService : Service
                         new NetLoopPublicStatus(
                             NetLoopPublicState.Stopped,
                             null,
-                            null));
+                            null,
+                            null,
+                            null,
+                            DateTimeOffset.UtcNow));
                     new Handler(Looper.MainLooper!).Post(
                         () =>
                         {
@@ -109,12 +112,6 @@ public sealed class NetLoopControlService : Service
 
         var networkId = data.GetString("network_id") ?? string.Empty;
         var defaultExit = data.GetString("default_exit") ?? string.Empty;
-        if (data.ContainsKey("peers"))
-        {
-            ReplyError(message, "START no longer supports 'peers'; remove it from the request.");
-            return;
-        }
-
         var config = ControlledRuntimeConfig.Parse(
             networkId,
             defaultExit);
@@ -189,12 +186,17 @@ public sealed class NetLoopControlService : Service
             status.State switch {
                 NetLoopPublicState.Starting => "STARTING",
                 NetLoopPublicState.Ready => "READY",
+                NetLoopPublicState.Degraded => "DEGRADED",
+                NetLoopPublicState.Resetting => "RESETTING",
                 _ => "STOPPED"
             });
         data.PutString("node_id", status.NodeId);
         data.PutString(
             "primary_overlay_address",
             status.PrimaryOverlayAddress);
+        data.PutString("reason", status.Reason);
+        data.PutLong("route_generation", status.RouteGeneration ?? -1);
+        data.PutString("updated_at_utc", status.UpdatedAtUtc.ToString("O"));
         data.PutString("error", error);
         return data;
     }

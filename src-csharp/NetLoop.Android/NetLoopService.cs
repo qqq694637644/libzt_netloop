@@ -1,4 +1,3 @@
-using System.Threading.Channels;
 using Android.App;
 using Android.Content;
 using Android.Content.PM;
@@ -27,9 +26,7 @@ public sealed class NetLoopService : Service
 
     private CancellationTokenSource? _stop;
     private Task? _runner;
-#if NETLOOP_CI
-    private Channel<string>? _ciResets;
-#endif
+    private RuntimeOwner? _owner;
     public override void OnCreate()
     {
         base.OnCreate();
@@ -47,7 +44,7 @@ public sealed class NetLoopService : Service
                 ActionCiReset,
                 StringComparison.Ordinal))
         {
-            _ciResets?.Writer.TryWrite("android_ci_reset");
+            Volatile.Read(ref _owner)?.RequestManualReset("android_ci_reset");
             return StartCommandResult.NotSticky;
         }
 #endif
@@ -115,209 +112,56 @@ public sealed class NetLoopService : Service
         CancellationToken cancellationToken)
     {
         NetLoopRuntimeController.ReportRuntimeStarting();
-        LibztPolling.ConfigureShared(options.LibztPollMode == "shared");
 
         await using var node = new LibztNode(
-            options.NetworkId,
-            options.StateDirectory,
-            options.StartupTimeout);
+            options.NetworkId, options.StateDirectory, options.StartupTimeout);
+        await using var owner = new RuntimeOwner(node, options);
+        Volatile.Write(ref _owner, owner);
 
-        var resets = Channel.CreateBounded<string>(
-            new BoundedChannelOptions(1) {
-                SingleReader = true,
-                SingleWriter = false,
-                AllowSynchronousContinuations = false,
-                FullMode = BoundedChannelFullMode.DropOldest
-            });
-        var resetRuntimeOnNetworkChange = 0;
-
-        void OnNetworkChanged(string reason)
-        {
-            if (Volatile.Read(ref resetRuntimeOnNetworkChange) == 0)
+        owner.StatusChanged += status => {
+            NetLoopRuntimeController.ReportRuntimeStatus(status);
+            switch (status.Phase)
             {
-                node.TryNotifyPhysicalNetworkChanged();
-                return;
-            }
-
-            resets.Writer.TryWrite(reason);
-        }
+                case RuntimePhase.Ready when status.Runtime is not null:
+                    UpdateNotification(
+                        $"Ready • node {status.Runtime.State.NodeId:x10} • SOCKS 127.0.0.1:{options.SocksPort}");
 #if NETLOOP_CI
-        _ciResets = resets;
+                    CiAutomationStatus.WriteReady(
+                        this,
+                        status.Runtime.State,
+                        status.Runtime.OverlayBindAddress.ToString(),
+                        status.ResetCount,
+                        status.Reason);
 #endif
+                    break;
+                case RuntimePhase.Degraded:
+                    UpdateNotification($"Waiting for ZeroTier: {status.Reason}");
+                    break;
+                case RuntimePhase.Resetting:
+                    UpdateNotification($"Resetting NetLoop: {status.Reason}");
+                    break;
+                case RuntimePhase.Stopped:
+                    UpdateNotification("NetLoop stopped");
+                    break;
+            }
+        };
 
         await using var networkMonitor = new AndroidNetworkMonitor(
             this,
             options.ResetEventDebounce,
-            OnNetworkChanged);
-
-        NetLoopRuntime? runtime = null;
-        NetLoopRuntime? activeRuntime = null;
-        node.NetworkStateChanged += updated =>
-        {
-            var current = Volatile.Read(ref activeRuntime);
-            if (current is null)
-                return;
-
-            current.UpdateNetworkState(updated);
-            if (current.IsHealthy)
-                NetLoopRuntimeController.ReportReady(
-                    current.State.NodeId,
-                    current.OverlayBindAddress.ToString());
-            else
-                NetLoopRuntimeController.ReportConfigurationDegraded(
-                    current.State.NodeId,
-                    current.OverlayBindAddress.ToString());
-        };
-        node.NetworkConfigurationUnavailable += reason =>
-        {
-            var current = Volatile.Read(ref activeRuntime);
-            if (current is null)
-                return;
-            current.MarkNetworkConfigurationUnavailable(reason);
-            NetLoopRuntimeController.ReportConfigurationDegraded(
-                current.State.NodeId,
-                current.OverlayBindAddress.ToString());
-        };
-        var resetCount = 0;
+            reason => owner.RequestPhysicalNetworkRefresh(reason));
 
         try
         {
             networkMonitor.Start();
-            await node.StartAsync(cancellationToken).ConfigureAwait(false);
-            Volatile.Write(ref resetRuntimeOnNetworkChange, 1);
-            runtime = await RuntimeRecovery.CreateAsync(
-                    node, options, resetCount, cancellationToken)
-                .ConfigureAwait(false);
-            Volatile.Write(ref activeRuntime, runtime);
-            runtime.UpdateNetworkState(node.State ?? runtime.State);
-            NetLoopRuntimeController.ReportReady(
-                runtime.State.NodeId,
-                runtime.OverlayBindAddress.ToString());
-#if NETLOOP_CI
-            CiAutomationStatus.WriteReady(
-                this,
-                runtime.State,
-                runtime.OverlayBindAddress.ToString(),
-                resetCount,
-                null);
-#endif
-
-            while (!cancellationToken.IsCancellationRequested)
-            {
-                UpdateNotification(
-                    $"Ready • node {runtime.State.NodeId:x10} • SOCKS 127.0.0.1:{options.SocksPort}");
-
-                string reason;
-                try
-                {
-                    using (var supervision =
-                           CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
-                    {
-                        var resetRequested = resets.Reader.ReadAsync(supervision.Token).AsTask();
-                        var criticalFailure = runtime.WaitForCriticalServiceFailureAsync(
-                            supervision.Token);
-                        try
-                        {
-                            var completed = await Task.WhenAny(resetRequested, criticalFailure)
-                                .ConfigureAwait(false);
-                            if (ReferenceEquals(completed, criticalFailure))
-                            {
-                                try
-                                {
-                                    await criticalFailure.ConfigureAwait(false);
-                                }
-                                catch (IOException ex) when (!cancellationToken.IsCancellationRequested)
-                                {
-                                    JsonLog.Error("runtime_critical_service_failed", new {
-                                        platform = "android",
-                                        error_type = ex.GetType().Name,
-                                        error = ex.Message,
-                                        inner_error = ex.InnerException?.Message
-                                    });
-                                }
-                                reason = "critical_service_failure";
-                            }
-                            else
-                            {
-                                reason = await resetRequested.ConfigureAwait(false);
-                            }
-                        }
-                        finally
-                        {
-                            await supervision.CancelAsync().ConfigureAwait(false);
-                            try
-                            {
-                                await Task.WhenAll(resetRequested, criticalFailure)
-                                    .ConfigureAwait(false);
-                            }
-                            catch (Exception) when (supervision.IsCancellationRequested)
-                            {
-                            }
-                        }
-                    }
-                }
-                catch (System.OperationCanceledException)
-                    when (cancellationToken.IsCancellationRequested)
-                {
-                    break;
-                }
-
-                var started = System.Diagnostics.Stopwatch.GetTimestamp();
-                JsonLog.Info("android_runtime_reset_start", new {
-                    reason,
-                    reset_count = resetCount
-                });
-
-                NetLoopRuntimeController.ReportRuntimeRestarting();
-                Volatile.Write(ref resetRuntimeOnNetworkChange, 0);
-                Volatile.Write(ref activeRuntime, null);
-                var discarded = runtime;
-                runtime = null;
-                discarded.Abort();
-                await discarded.DisposeAsync().ConfigureAwait(false);
-
-                if (reason != "critical_service_failure")
-                    node.TryNotifyPhysicalNetworkChanged();
-                Volatile.Write(ref resetRuntimeOnNetworkChange, 1);
-                resetCount++;
-
-                runtime = await RuntimeRecovery.CreateAsync(
-                        node, options, resetCount, cancellationToken)
-                    .ConfigureAwait(false);
-                Volatile.Write(ref activeRuntime, runtime);
-                runtime.UpdateNetworkState(node.State ?? runtime.State);
-                NetLoopRuntimeController.ReportReady(
-                    runtime.State.NodeId,
-                    runtime.OverlayBindAddress.ToString());
-
-#if NETLOOP_CI
-                CiAutomationStatus.WriteReady(
-                    this,
-                    runtime.State,
-                    runtime.OverlayBindAddress.ToString(),
-                    resetCount,
-                    reason);
-#endif
-
-                JsonLog.Info("android_runtime_reset_ready", new {
-                    reason,
-                    reset_count = resetCount,
-                    elapsed_ms = System.Diagnostics.Stopwatch
-                        .GetElapsedTime(started)
-                        .TotalMilliseconds
-                });
-            }
+            await owner.RunAsync(cancellationToken).ConfigureAwait(false);
         }
         finally
         {
-            Volatile.Write(ref activeRuntime, null);
-#if NETLOOP_CI
-            _ciResets = null;
-#endif
-            if (runtime is not null)
-                await runtime.DisposeAsync().ConfigureAwait(false);
+            Volatile.Write(ref _owner, null);
         }
     }
+
 
     private async Task ObserveRunnerAsync(Task runner)
     {

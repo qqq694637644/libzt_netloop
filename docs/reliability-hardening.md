@@ -34,18 +34,18 @@ Windows/Linux Host 以及 Android Service 同时观察：
 `runtime_critical_service_failed`，然后重新创建**业务 Runtime**。
 Overlay TCP accept 连续失败 30 次（每次间隔约 100ms）也视作
 监听器不可用，不会一直悄悄重试而继续呈现 Ready。
-这个过程可能会中断已有 TCP/UDP；但**只有 Controller 路由配置变化**
-仍只更新快照，不会触发 Runtime 重置。
+这个过程可能会中断已有 TCP/UDP；但**仅有 Controller 路由配置变化**
+则只更新一个原子 RouteState，不会触发 Runtime 重置。
+Wi-Fi/热点变化只通知 libzt 刷新底层网络路径，不无条件丢弃 RDP 会话。
+Controller 真正撤销/替换节点**唯一 Managed IPv4**时，只有单一
+RuntimeOwner 能关闭并创建业务 Runtime；旧本地 UDP Association
+同样被关闭。没有新地址时原生 Node 保持存活并进入 `degraded`。
 
-在暂时没有 Managed IP、socket/native I/O 错误或 listener 无法
-立即创建时，`RuntimeRecovery` 每轮重新查询最新网络配置，
-最多重试 12 次，使用 250ms、500ms、1s、2s、4s、
-之后上限 5s 的退避。不中止或重新初始化 libzt Node。
-期间记录 `runtime_creation_retry`，并在指定了 `--status-file`
-时写入 `phase=degraded`、`attempt` 与 `max_attempts`。
-重建成功写 `runtime_creation_recovered` 以及新的 ready 状态。
-
-永久配置错误不应无限重试；12 次仍不能恢复则记录终态错误并退出。
+`LibztNode.JoinAndWaitAsync` 中 native Node 启动有截止时间，
+Controller 暂时不可用则继续等待；明确拒绝加入是终态错误。
+`RuntimeRecovery` 只等待原生网络配置查询 `ErrNoResult` 或暂时
+没有 Managed IP；端口被占用、多个地址、不支持地址族等错误直接
+报错，**不增加自动兼容或无限重试**。
 **按用户要求，不提供 Windows 服务、进程守护、自动重启或任务计划。**
 需要人工诊断后手动重新启动程序；不要求删除 ZeroTier state 文件。
 
@@ -92,17 +92,18 @@ manifest 对应的 libzt submodule SHA、CMake、build script、
 ## PR #3 的第二、第三、第四阶段
 
 第二阶段实现：30 秒周期性 native Controller 配置核验、查询失败
-`Reject`（而非空路由或 B 兜底）、监听地址撤销后的 Agent 热迁移、
-15 秒 status-file 心跳、可选来源 CIDR / 目标 TCP/UDP 端口 ACL。
+`Reject`（而非空路由或 B 兜底），唯一 Managed IPv4 变化时
+重建业务 Runtime、不执行 Agent 热迁移；15 秒 status-file 心跳、
+可选来源 CIDR / 目标 TCP/UDP 端口 ACL。
 来源 ACL 基于 ZeroTier socket 已呈现的来源 IP，**不是独立的
 ZeroTier Node ID 加密认证**；不能用它选择 Overlay 路由。
 
 第三阶段实现：可配置 TCP / UDP association 容量、relay 缓冲大小、
 UDP 接收队列、单包发送时限、每个 UDP 远端独立的有界队列
-（最多 1MiB，满时直接丢弃新包）、`udp_queue_dropped` 计数器。
-默认 `--libzt-poll-mode per-socket` 不变；`shared` 使用 native
-多 FD 批量 poll，但**尚未完成真实设备上 socket 保活及切网实测**，
-因此仅作试验选项。不要盲目把容量提升到最大值。
+（最多 1MiB），整个业务 Runtime 共 16MiB 的队列字节预算，
+超限丢包计数 `udp_queue_dropped`。删除未完成原生 fd 生命周期
+验证的 shared Poller 和切换开关，保留单一 per-socket 实现。
+不要盲目把容量提升到最大值。
 
 第四阶段只保留已有的日志轮转和离线 JSONL 探测日志的
 小时/72h/7天统计。需要更新应用时直接从 GitHub Releases 下载，

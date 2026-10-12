@@ -20,14 +20,11 @@ public sealed class LocalSocksServer : IAsyncDisposable
     public LocalSocksServer(
         IPEndPoint listenEndPoint,
         Socks5ConnectionHandler handler,
-        int maxConnections)
+        SemaphoreSlim capacity)
     {
-        if (maxConnections <= 0)
-            throw new ArgumentOutOfRangeException(nameof(maxConnections));
-
         _listener = new TcpListener(listenEndPoint);
         _handler = handler;
-        _capacity = new SemaphoreSlim(maxConnections, maxConnections);
+        _capacity = capacity;
     }
 
     public IPEndPoint EndPoint => (IPEndPoint)_listener.LocalEndpoint;
@@ -63,7 +60,18 @@ public sealed class LocalSocksServer : IAsyncDisposable
                 break;
             }
 
-            if (!await _capacity.WaitAsync(0, cancellationToken).ConfigureAwait(false))
+            bool accepted;
+            try
+            {
+                accepted = await _capacity.WaitAsync(0, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                client.Dispose();
+                break;
+            }
+            if (!accepted)
             {
                 client.Dispose();
                 continue;
@@ -160,6 +168,6 @@ public sealed class LocalSocksServer : IAsyncDisposable
             await Task.WhenAll(activeClients).ConfigureAwait(false);
 
         _stop.Dispose();
-        _capacity.Dispose();
+        // The runtime owns the capacity shared with the overlay listener.
     }
 }

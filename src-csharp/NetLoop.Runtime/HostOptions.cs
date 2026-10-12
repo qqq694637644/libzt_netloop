@@ -34,7 +34,6 @@ internal sealed class HostOptions
             "--relay-buffer-kib",
             "--udp-queue-capacity",
             "--udp-send-timeout",
-            "--libzt-poll-mode",
             "--udp-idle-timeout",
             "--reset-debounce-ms",
             "--reset-command-file"
@@ -69,7 +68,6 @@ internal sealed class HostOptions
     internal int RelayBufferKiB { get; init; } = 64;
     internal int UdpQueueCapacity { get; init; } = 256;
     internal TimeSpan UdpSendTimeout { get; init; } = TimeSpan.FromSeconds(30);
-    internal string LibztPollMode { get; init; } = "per-socket";
     internal TimeSpan ResetEventDebounce { get; init; } = TimeSpan.FromMilliseconds(250);
     internal string? ResetCommandFile { get; init; }
     internal bool ShowHelp { get; init; }
@@ -147,9 +145,6 @@ internal sealed class HostOptions
             Socks5Credentials.Validate(upstreamUsername, upstreamPassword);
 
         var logFile = Optional(values, "--log-file");
-        var pollMode = Optional(values, "--libzt-poll-mode") ?? "per-socket";
-        if (pollMode is not ("per-socket" or "shared"))
-            throw new ArgumentException("--libzt-poll-mode must be per-socket or shared.");
         var logMaxMb = ParsePositiveInt(Optional(values, "--log-max-mb") ?? "16", "--log-max-mb");
         var logRetain = ParsePositiveInt(Optional(values, "--log-retain") ?? "5", "--log-retain");
         if (logFile is null && (values.ContainsKey("--log-max-mb") || values.ContainsKey("--log-retain")))
@@ -188,7 +183,6 @@ internal sealed class HostOptions
             UdpQueueCapacity = ParseBoundedInt(values, "--udp-queue-capacity", 256, 16, 4096),
             UdpSendTimeout = TimeSpan.FromSeconds(
                 ParseBoundedInt(values, "--udp-send-timeout", 30, 1, 120)),
-            LibztPollMode = pollMode,
             ResetEventDebounce = TimeSpan.FromMilliseconds(ParsePositiveInt(Optional(values, "--reset-debounce-ms") ?? "250", "--reset-debounce-ms")),
             ResetCommandFile = Optional(values, "--reset-command-file")
         };
@@ -245,7 +239,7 @@ internal sealed class HostOptions
           --overlay-udp-port <port>   NetLoop peer Agent UDP port (default 42043)
           --agent-allow-source <IP/CIDR> Repeatable inbound Agent source ACL (default all network members)
           --agent-allow-target-port <PORT|START-END> Repeatable Agent destination port ACL
-          --default-exit <managed-ip> Required primary Managed IP of default egress peer
+          --default-exit <managed-ip> Required sole IPv4 Managed IP of default egress peer
           --egress <mode>             direct | upstream-socks5 (default direct)
           --upstream-host <host>      Upstream SOCKS5 host
           --upstream-port <port>      Upstream SOCKS5 port (default 1080; upstream mode only)
@@ -264,7 +258,6 @@ internal sealed class HostOptions
           --relay-buffer-kib <KiB>   Buffer per relay direction (default 64; 4..256)
           --udp-queue-capacity <count> Per-transport UDP receive queue cap (default 256; 16..4096)
           --udp-send-timeout <sec>   Overlay UDP per-datagram forwarding deadline (default 30; 1..120)
-          --libzt-poll-mode <mode>   per-socket (default) | shared (opt-in, requires validation)
           --udp-idle-timeout <sec>    UDP association idle timeout (default 60)
           --reset-debounce-ms <ms>    Coalesce OS network-change events (default 250)
           --reset-command-file <path> Optional deterministic reset trigger input

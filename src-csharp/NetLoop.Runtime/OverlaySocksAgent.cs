@@ -26,11 +26,12 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
         ushort port,
         Socks5ConnectionHandler handler,
         int maxConnections,
+        SemaphoreSlim capacity,
         AgentAccessPolicy accessPolicy)
     {
         _handler = handler;
         _accessPolicy = accessPolicy;
-        _capacity = new SemaphoreSlim(maxConnections, maxConnections);
+        _capacity = capacity;
         _listener = LibztTcpListener.Start(bindAddress, port, maxConnections);
         _acceptStop = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token);
         _loop = AcceptLoopAsync(_acceptStop.Token);
@@ -79,7 +80,18 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
                 continue;
             }
 
-            if (!await _capacity.WaitAsync(0, cancellationToken).ConfigureAwait(false))
+            bool accepted;
+            try
+            {
+                accepted = await _capacity.WaitAsync(0, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                await connection.DisposeAsync().ConfigureAwait(false);
+                break;
+            }
+            if (!accepted)
             {
                 JsonLog.Info("tcp_accept_rejected", new {
                     connection_id = connection.ConnectionId,
@@ -92,9 +104,6 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
 
             lock (_clientsGate)
                 _activeClients.Add(connection);
-            // Accept can be stopped when the Controller reassigns our
-            // Managed IP, but existing TCP sessions must keep their original
-            // runtime lifetime until they close naturally.
             TrackClient(HandleClientAsync(connection, _stop.Token), connection);
         }
     }
@@ -157,7 +166,8 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
             return;
 
         _stop.Cancel();
-        StopAccepting();
+        _acceptStop.Cancel();
+        _ = _listener.DisposeAsync();
 
         LibztTcpConnection[] activeClients;
         lock (_clientsGate)
@@ -166,35 +176,13 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
             _ = connection.DisposeAsync();
     }
 
-    /// <summary>
-    /// Retire the old listening IP without canceling already accepted TCP
-    /// connections. The caller may start a replacement Agent on a new IP.
-    /// </summary>
-    internal void StopAccepting()
-    {
-        if (!_acceptStop.IsCancellationRequested)
-            _acceptStop.Cancel();
-        _ = _listener.DisposeAsync();
-    }
-
-    internal async Task DrainAndDisposeAsync()
-    {
-        StopAccepting();
-        await _loop.ConfigureAwait(false);
-        Task[] clients;
-        lock (_clientsGate)
-            clients = [.. _clients];
-        if (clients.Length != 0)
-            await Task.WhenAll(clients).ConfigureAwait(false);
-        await DisposeAsync().ConfigureAwait(false);
-    }
-
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
             return;
 
         Abort();
+        await _listener.DisposeAsync().ConfigureAwait(false);
 
         try
         {
@@ -212,6 +200,6 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
 
         _stop.Dispose();
         _acceptStop.Dispose();
-        _capacity.Dispose();
+        // The Runtime disposes the shared capacity after both listeners stop.
     }
 }

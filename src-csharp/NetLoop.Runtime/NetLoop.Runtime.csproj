@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>NetLoop.Runtime</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../NetLoop.Core/NetLoop.Core.csproj" />
+    <ProjectReference Include="../NetLoop.Libzt/NetLoop.Libzt.csproj" />
+    <ProjectReference Include="../NetLoop.Socks/NetLoop.Socks.csproj" />
+  </ItemGroup>
+</Project>

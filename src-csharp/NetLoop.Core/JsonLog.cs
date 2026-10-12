@@ -87,14 +87,22 @@ public static class JsonLog
                 var processed = 0;
                 while (processed++ < 256 && Queue.Reader.TryRead(out var record))
                 {
-                    if (record.Line is not null)
-                        WriteLine(record.Line, ref sink);
-
-                    if (record.Barrier is not null)
+                    try
                     {
-                        sink?.Flush();
-                        Console.Out.Flush();
-                        record.Barrier.TrySetResult();
+                        if (record.Line is not null)
+                            WriteLine(record.Line, ref sink);
+
+                        if (record.Barrier is not null)
+                        {
+                            sink?.Flush();
+                            Console.Out.Flush();
+                            record.Barrier.TrySetResult();
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        record.Barrier?.TrySetException(ex);
+                        OnWriterFault(ex, ref sink);
                     }
                 }
 
@@ -104,19 +112,33 @@ public static class JsonLog
                 var droppedError = Interlocked.Exchange(ref _droppedError, 0);
                 if (droppedInfo != 0 || droppedError != 0)
                 {
-                    WriteLine(JsonSerializer.Serialize(new {
-                        ts = DateTimeOffset.UtcNow,
-                        level = "error",
-                        @event = "json_log_records_dropped",
-                        data = new {
-                            info = droppedInfo,
-                            error = droppedError,
-                            capacity = QueueCapacity
-                        }
-                    }), ref sink);
+                    try
+                    {
+                        WriteLine(JsonSerializer.Serialize(new {
+                            ts = DateTimeOffset.UtcNow,
+                            level = "error",
+                            @event = "json_log_records_dropped",
+                            data = new {
+                                info = droppedInfo,
+                                error = droppedError,
+                                capacity = QueueCapacity
+                            }
+                        }), ref sink);
+                    }
+                    catch (Exception ex)
+                    {
+                        OnWriterFault(ex, ref sink);
+                    }
                 }
 
-                sink?.Flush();
+                try
+                {
+                    sink?.Flush();
+                }
+                catch (Exception ex)
+                {
+                    OnWriterFault(ex, ref sink);
+                }
             }
         }
         catch (Exception ex)
@@ -131,7 +153,35 @@ public static class JsonLog
         }
         finally
         {
+            try
+            {
+                sink?.Dispose();
+            }
+            catch (Exception)
+            {
+            }
+        }
+    }
+
+    private static void OnWriterFault(Exception ex, ref RotatingFileSink? sink)
+    {
+        try
+        {
             sink?.Dispose();
+        }
+        catch (Exception)
+        {
+        }
+        sink = null;
+        // Do not continuously retry a broken disk path; use best-effort
+        // stdout for future records. A broken stdout is also nonfatal.
+        Volatile.Write(ref _filePath, null);
+        try
+        {
+            Console.Error.WriteLine($"NetLoop log output failed: {ex.Message}");
+        }
+        catch (Exception)
+        {
         }
     }
 
