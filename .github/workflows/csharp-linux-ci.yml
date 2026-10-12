@@ -70,7 +70,8 @@ jobs:
           core_trace_patch="$(git hash-object patches/zerotierone/0001-netloop-core-path-trace.patch)"
           recovery_patch="$(git hash-object patches/libzt/0008-recovery-decision-trace.patch)"
           core_recovery_patch="$(git hash-object patches/zerotierone/0002-netloop-recovery-decision-trace.patch)"
-          echo "key=libzt-pinvoke-linux-${{ matrix.arch }}-${libzt}-${cmake}-${script}-${network_refresh_patch}-${peer_event_patch}-${cidr_patch}-${ports_patch}-${native_trace_patch}-${socket_trace_patch}-${core_trace_patch}-${recovery_patch}-${core_recovery_patch}" >> "$GITHUB_OUTPUT"
+          fingerprint="$(printf '%s' "${libzt}|${cmake}|${script}|${network_refresh_patch}|${peer_event_patch}|${cidr_patch}|${ports_patch}|${native_trace_patch}|${socket_trace_patch}|${core_trace_patch}|${recovery_patch}|${core_recovery_patch}" | git hash-object --stdin)"
+          echo "key=libzt-pinvoke-linux-${{ matrix.arch }}-${fingerprint}" >> "$GITHUB_OUTPUT"
 
       - name: Restore compiled libzt bundle
         id: native-cache

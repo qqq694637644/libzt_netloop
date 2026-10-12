@@ -59,7 +59,10 @@ jobs:
           $coreTracePatch = git hash-object patches/zerotierone/0001-netloop-core-path-trace.patch
           $recoveryPatch = git hash-object patches/libzt/0008-recovery-decision-trace.patch
           $coreRecoveryPatch = git hash-object patches/zerotierone/0002-netloop-recovery-decision-trace.patch
-          "key=libzt-pinvoke-win-x64-$libzt-$cmake-$script-$networkRefreshPatch-$peerEventPatch-$cidrPatch-$portsPatch-$nativeTracePatch-$socketTracePatch-$coreTracePatch-$recoveryPatch-$coreRecoveryPatch" >> $env:GITHUB_OUTPUT
+          $allInputs = @($libzt, $cmake, $script, $networkRefreshPatch, $peerEventPatch, $cidrPatch, $portsPatch, $nativeTracePatch, $socketTracePatch, $coreTracePatch, $recoveryPatch, $coreRecoveryPatch) -join ':'
+          $fingerprint = $allInputs | git hash-object --stdin
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to hash native cache inputs' }
+          "key=libzt-pinvoke-win-x64-$fingerprint" >> $env:GITHUB_OUTPUT
 
       - name: Restore compiled libzt bundle
         id: native-cache
