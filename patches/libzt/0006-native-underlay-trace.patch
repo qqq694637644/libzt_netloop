@@ -2,12 +2,12 @@ diff --git a/include/ZeroTierSockets.h b/include/ZeroTierSockets.h
 index 0bf5401..c17a142 100644
 --- a/include/ZeroTierSockets.h
 +++ b/include/ZeroTierSockets.h
-@@ -1730,6 +1730,33 @@ ZTS_API int ZTCALL zts_node_get_port();
+@@ -1730,6 +1730,35 @@ ZTS_API int ZTCALL zts_node_get_port();
   */
  ZTS_API int ZTCALL zts_netloop_get_bound_udp_ports(uint16_t* primary, uint16_t* secondary);
  
 +/**
-+ * NetLoop read-only underlay trace. Version 1, fixed 112-byte ABI layout.
++ * NetLoop read-only underlay trace. Version 2, fixed 240-byte ABI layout.
 + * Kinds: 1=network-refresh-queued, 2=binder-start, 3=binder-complete,
 + * 4=path-check, 5=wire-tx, 6=wire-rx, 7=node-phase, 8=planet-snapshot.
 + *
@@ -29,6 +29,8 @@ index 0bf5401..c17a142 100644
 +    uint16_t previous_secondary_port;
 +    uint16_t reserved;
 +    char endpoint[64];
++    char local_endpoint[64];
++    char interface_name[64];
 +} zts_netloop_underlay_event_t;
 +ZTS_API int ZTCALL zts_netloop_poll_underlay_event(
 +    zts_netloop_underlay_event_t* event, uint64_t* dropped_total);
@@ -64,8 +66,8 @@ index 3925158..8c8b730 100644
  
  namespace ZeroTier {
  
-+static_assert(sizeof(zts_netloop_underlay_event_t) == 112,
-+              "NetLoop underlay trace ABI size must remain 112 bytes");
++static_assert(sizeof(zts_netloop_underlay_event_t) == 240,
++              "NetLoop underlay trace ABI size must remain 240 bytes");
 +
  static int SnodeVirtualNetworkConfigFunction(
      ZT_Node* node,

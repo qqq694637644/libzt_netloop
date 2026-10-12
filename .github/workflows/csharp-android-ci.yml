@@ -57,9 +57,11 @@ jobs:
           patch4="$(git hash-object patches/libzt/0004-network-cidr-queries.patch)"
           patch5="$(git hash-object patches/libzt/0005-underlay-port-diagnostics.patch)"
           patch6="$(git hash-object patches/libzt/0006-native-underlay-trace.patch)"
+          patch7="$(git hash-object patches/libzt/0007-core-underlay-socket-trace.patch)"
+          core_trace_patch="$(git hash-object patches/zerotierone/0001-netloop-core-path-trace.patch)"
           ndk_revision="$(awk -F= '/Pkg.Revision/ {gsub(/ /, "", $2); print $2}' "$ANDROID_NDK_HOME/source.properties")"
           echo "ndk_revision=$ndk_revision" >> "$GITHUB_OUTPUT"
-          echo "key=libzt-pinvoke-android-arm64-${ndk_revision}-${libzt}-${cmake}-${script}-${patch1}-${patch2}-${patch3}-${patch4}-${patch5}-${patch6}" >> "$GITHUB_OUTPUT"
+          echo "key=libzt-pinvoke-android-arm64-${ndk_revision}-${libzt}-${cmake}-${script}-${patch1}-${patch2}-${patch3}-${patch4}-${patch5}-${patch6}-${patch7}-${core_trace_patch}" >> "$GITHUB_OUTPUT"
 
       - name: Restore compiled Android libzt bundle
         id: native-cache

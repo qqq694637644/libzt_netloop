@@ -15,7 +15,8 @@ B 未发生 `max_connections` 拒绝，已有 Relay 则有成批 Native read 错
 
 ## 实现与边界
 
-Native `0006-native-underlay-trace.patch` 添加只读
+Native `0006-native-underlay-trace.patch`、`0007-core-underlay-socket-trace.patch`
+和独立应用到固定 ZeroTierOne 子模块的 `0001-netloop-core-path-trace.patch` 添加只读
 `zts_netloop_poll_underlay_event` P/Invoke ABI。NodeService 在最多 **512 条**
 的固定上限 FIFO 中记录原生时间戳；C# 每 250ms 最多消费 128 条，
 写入 JSONL `libzt_native_underlay_trace`。
@@ -31,6 +32,22 @@ Native `0006-native-underlay-trace.patch` 添加只读
 | `wire_udp_received` | UDP receive 进入 ZeroTier core 后 | `peer_id` 为报文头中的来源 ID、`endpoint`、`packet_id`、`result` 为 core 的 packet processing 结果 |
 | `node_phase` | 原生 Node ONLINE/OFFLINE 事件产生时 | `reason_flags=1/0`、`result=201/202`、`last_global_receive_native_ms` |
 | `planet_path_snapshot` | 刷新时或处于 OFFLINE 每约 15 秒 | 每个已知 Planet Root 的 Node ID、path_count（`reason_flags`）、最新物理地址、最近 `lastReceive`、`result` 为 Node online 布尔值 |
+| `core_hello_sent` | core 生成 HELLO 并提交发送后 | `peer_id` 为目标 Node、`packet_id`、`endpoint` 为指定发送目标；`result=1/0` 为直接提交成功/失败，`-1` 为 Switch 异步路由发送、结果不可判定 |
+| `core_hello_authenticated` | core 验证 HELLO 身份和 MAC 后 | `peer_id` 为身份已验证的发送方，`packet_id` 与实际物理 `endpoint` |
+| `core_ok_hello_sent` | core 回复 OK(HELLO) 之后 | `hello_request_packet_id` 关联原请求，`result` 为该包的底层发送提交状态 |
+| `core_ok_hello_authenticated` | core 验证 OK(HELLO) 的 MAC 且确认属于已期待的请求后 | `hello_request_packet_id` 关联请求；这是 core 确实处理匹配的 HELLO 回复的证据 |
+| `core_rendezvous_sent` | core 向两端分别发送 RENDEZVOUS 介绍 | `peer_id` 为被介绍的一方，`endpoint` 为实际发送给另一方的物理路径；`result` 为底层提交状态 |
+| `core_rendezvous_authenticated` | core 收到已认证的上游 RENDEZVOUS 指示 | `peer_id` 为被介绍的节点、`endpoint` 为上游通告的候选 IP:port；`result=1` 允许并尝试、`0` 过滤拒绝、`-1` 无已知 Peer、`-2` 地址无效 |
+| `core_upstream_online_decision` | ZeroTierOne 自己计算 ONLINE/OFFLINE，状态变化或离线期间定期记录 | `last_upstream_receive_native_ms` 为 core 收到任一配置上游的最后时刻、`upstream_age_ms` 为计算得到的年龄；`reason_flags` 为 `1=online`、`2=status_transition`、`4=am_upstream`、`8=received_upstream_before` |
+| `core_peer_path_learned` | 身份已验证的 Peer 响应被 core 采用为新的直接路径时 | `peer_id`、`endpoint`、`packet_id`、`result` 为路径槽索引 |
+
+两个 UDP 事件新增 `local_endpoint`、`physical_interface`：
+由 libzt Binder 在**真正选中并操作每个 UDP socket 时**读取，不是由目的地址猜出。
+当 core 要求从所有绑定 UDP socket 发送时，每个 socket 有自己独立的发送记录；
+日志对每个 `peer + 方向 + 对端/本地端点 + 接口` 每秒抽样一次。
+接口名可能为空（例如 Binder 未能枚举、使用通配 `0.0.0.0/::` 绑定）。
+本地绑定不等于 OS 路由的最终出站接口，也不等于 NAT 公网地址，不能据此声称
+报文已抵达网关或对端。
 
 `binder_refresh_*` 的 `reason_flags` 为位组合：
 `1=network_changed`、`2=sleep/wake`、`4=periodic`、
@@ -38,9 +55,12 @@ Native `0006-native-underlay-trace.patch` 添加只读
 原生刷新“收到”不代表 Peer 就绪；`result=1` 也只证明 Binder **主端口在本地地址集合中**，
 不等于外部 NAT 可达。
 
-**协议安全边界：** UDP 事件从 ZeroTier 报文*未验证的固定头*提取
+**协议安全边界：** `wire_udp_*` 从 ZeroTier 报文*未验证的固定头*提取
 40-bit Node ID 与 64-bit Packet ID。报文内容不记录、不解密、不保存；
-无法仅由这些日志证明一个加密包就是 HELLO、OK 或某个 Peer 的认证响应。
+无法仅由这些 UDP 日志证明一个加密包就是 HELLO、OK 或某个 Peer 的认证响应。
+与之不同，`core_hello_authenticated`、`core_ok_hello_authenticated`、
+`core_rendezvous_authenticated` 在原生 core 完成现有认证之后产生，
+不记录身份私钥、MAC、加密负载或任意完整数据包。
 被丢弃/分片/过短的包也可能无法被采样。
 成功的 `wire_udp_sent` 只证明本地 send API 接受，**不证明 B 收到**；
 `wire_udp_received` 只证明 native socket 看到了报文，core 返回码并非
@@ -48,7 +68,11 @@ Native `0006-native-underlay-trace.patch` 添加只读
 但物理端点变化、发送错误可触发额外记录；高流量未被逐包完整取证。
 不同端 Packet ID **恰好都被采样**时可比较，不保证每次 TX 都有 RX 配对。
 
-Planet 快照只提供现有 core Peer 路径信息，**不能直接解释 core 为什么判断 OFFLINE**。
+Planet 快照只提供现有 core Peer 路径信息；新增的
+`core_upstream_online_decision` 则记录 core 本身以“最近一次任一上游接收 +
+超时阈值 / 我是否是上游节点”计算 ONLINE 的实际输入。
+它没有记录远端 Planet 为何没有回复 UDP，所以不能直接断定
+“Planet 服务故障”或“某条公网 IPv6 路由丢包”。
 端口也是本机实际 UDP Binder 地址，而不是路由器公网 NAT 映射。
 因此本 PR 是调查工具，不把“226 秒周期”视为已修复。
 

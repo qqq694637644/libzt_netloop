@@ -517,7 +517,13 @@ public sealed class LibztNode : IAsyncDisposable
                         peer_id = sample.PeerId == 0 ? null : sample.PeerId.ToString("x10"),
                         endpoint = string.IsNullOrEmpty(sample.Endpoint)
                             ? null : sample.Endpoint,
-                        packet_id = sample.Kind is 5 or 6
+                        local_endpoint = string.IsNullOrEmpty(sample.LocalEndpoint)
+                            ? null : sample.LocalEndpoint,
+                        physical_interface = string.IsNullOrEmpty(sample.InterfaceName)
+                            ? null : sample.InterfaceName,
+                        packet_id = sample.Kind is 5 or 6 or 10 or 11 or 14 or 15 or 17
+                            ? sample.Reference.ToString("x16") : null,
+                        hello_request_packet_id = sample.Kind is 12 or 13
                             ? sample.Reference.ToString("x16") : null,
                         binder_start_native_ms = sample.Kind is 2 or 3
                             ? (long?)sample.Reference : null,
@@ -525,6 +531,10 @@ public sealed class LibztNode : IAsyncDisposable
                             ? (long?)sample.Reference : null,
                         last_global_receive_native_ms = sample.Kind == 7
                             ? (long?)sample.Reference : null,
+                        last_upstream_receive_native_ms = sample.Kind == 16
+                            && sample.Reference != 0 ? (long?)sample.Reference : null,
+                        upstream_age_ms = sample.Kind == 16
+                            ? sample.Result : (int?)null,
                         reason_flags = sample.Flags,
                         byte_count = sample.ByteCount,
                         result = sample.Result,
@@ -533,7 +543,11 @@ public sealed class LibztNode : IAsyncDisposable
                         previous_secondary_port = sample.PreviousSecondaryPort,
                         // UDP header identities are unverified observations.
                         wire_header_authenticated = sample.Kind is 5 or 6
-                            ? false : (bool?)null
+                            ? false : (bool?)null,
+                        // Receive-side core protocol records appear only
+                        // after ZeroTier's existing MAC/identity verification.
+                        core_protocol_authenticated = sample.Kind is 11 or 13 or 15
+                            ? true : (bool?)null
                     });
                 }
                 await Task.Delay(250, cancellationToken).ConfigureAwait(false);

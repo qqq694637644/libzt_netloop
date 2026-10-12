@@ -17,6 +17,14 @@ internal sealed class LibztUnderlayDiagnostics(Func<long>? clock = null)
         6 => "wire_udp_received",
         7 => "node_phase",
         8 => "planet_path_snapshot",
+        10 => "core_hello_sent",
+        11 => "core_hello_authenticated",
+        12 => "core_ok_hello_sent",
+        13 => "core_ok_hello_authenticated",
+        14 => "core_rendezvous_sent",
+        15 => "core_rendezvous_authenticated",
+        16 => "core_upstream_online_decision",
+        17 => "core_peer_path_learned",
         _ => "unknown"
     };
 

@@ -141,16 +141,30 @@ internal static class Program
 
     private static void NativeUnderlayTraceAbi()
     {
-        Require(Marshal.SizeOf<LibztNative.UnderlayTraceEvent>() == 112,
-            "Native trace C# ABI must match 112-byte native struct");
+        Require(Marshal.SizeOf<LibztNative.UnderlayTraceEvent>() == 240,
+            "Native trace C# ABI must match 240-byte native struct");
         Require(Marshal.OffsetOf<LibztNative.UnderlayTraceEvent>(
                 nameof(LibztNative.UnderlayTraceEvent.Endpoint)).ToInt64() == 48,
             "Native trace endpoint must start at offset 48");
+        Require(Marshal.OffsetOf<LibztNative.UnderlayTraceEvent>(
+                nameof(LibztNative.UnderlayTraceEvent.LocalEndpoint)).ToInt64() == 112,
+            "Native trace local endpoint must start at offset 112");
+        Require(Marshal.OffsetOf<LibztNative.UnderlayTraceEvent>(
+                nameof(LibztNative.UnderlayTraceEvent.InterfaceName)).ToInt64() == 176,
+            "Native trace interface name must start at offset 176");
         Require(LibztUnderlayDiagnostics.NativeKind(1) == "network_refresh_queued"
                 && LibztUnderlayDiagnostics.NativeKind(3) == "binder_refresh_completed"
                 && LibztUnderlayDiagnostics.NativeKind(5) == "wire_udp_sent"
                 && LibztUnderlayDiagnostics.NativeKind(6) == "wire_udp_received"
-                && LibztUnderlayDiagnostics.NativeKind(8) == "planet_path_snapshot",
+                && LibztUnderlayDiagnostics.NativeKind(8) == "planet_path_snapshot"
+                && LibztUnderlayDiagnostics.NativeKind(10) == "core_hello_sent"
+                && LibztUnderlayDiagnostics.NativeKind(11) == "core_hello_authenticated"
+                && LibztUnderlayDiagnostics.NativeKind(12) == "core_ok_hello_sent"
+                && LibztUnderlayDiagnostics.NativeKind(13) == "core_ok_hello_authenticated"
+                && LibztUnderlayDiagnostics.NativeKind(14) == "core_rendezvous_sent"
+                && LibztUnderlayDiagnostics.NativeKind(15) == "core_rendezvous_authenticated"
+                && LibztUnderlayDiagnostics.NativeKind(16) == "core_upstream_online_decision"
+                && LibztUnderlayDiagnostics.NativeKind(17) == "core_peer_path_learned",
             "Native trace kinds must remain compatible across builds");
         Require(LibztUnderlayDiagnostics.NativeKind(200) == "unknown",
             "Unknown native trace kind must remain safe");

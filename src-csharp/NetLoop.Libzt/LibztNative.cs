@@ -113,7 +113,7 @@ internal static class LibztNative
         CallingConvention = CallingConvention.Cdecl)]
     internal static extern int GetBoundUdpPorts(out ushort primary, out ushort secondary);
 
-    // NetLoop native diagnostics: fixed v1 112-byte POD ABI, no callback
+    // NetLoop native diagnostics: fixed v2 240-byte POD ABI, no callback
     // into managed code from libzt's physical I/O thread.
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
     internal struct UnderlayTraceEvent
@@ -131,6 +131,10 @@ internal static class LibztNative
         internal ushort Reserved;
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]
         internal string Endpoint;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]
+        internal string LocalEndpoint;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]
+        internal string InterfaceName;
     }
 
     [DllImport(

@@ -21,13 +21,17 @@ class UnderlayTraceEvent(ctypes.Structure):
         ("previous_secondary_port", ctypes.c_uint16),
         ("reserved", ctypes.c_uint16),
         ("endpoint", ctypes.c_char * 64),
+        ("local_endpoint", ctypes.c_char * 64),
+        ("interface_name", ctypes.c_char * 64),
     ]
 
 
 def check_layout() -> None:
-    assert ctypes.sizeof(UnderlayTraceEvent) == 112, "ABI size changed"
+    assert ctypes.sizeof(UnderlayTraceEvent) == 240, "ABI size changed"
     assert UnderlayTraceEvent.endpoint.offset == 48, "endpoint offset changed"
     assert UnderlayTraceEvent.primary_port.offset == 40, "port offset changed"
+    assert UnderlayTraceEvent.local_endpoint.offset == 112, "local endpoint offset changed"
+    assert UnderlayTraceEvent.interface_name.offset == 176, "interface name offset changed"
 
 
 def main() -> int:
@@ -50,7 +54,7 @@ def main() -> int:
     assert poll(ctypes.byref(sample), ctypes.byref(dropped)) == -2, (
         "unstarted native service must return ZTS_ERR_SERVICE"
     )
-    print("PASS: Native trace export, argument checks and 112-byte ABI")
+    print("PASS: Native trace export, argument checks and 240-byte ABI")
     return 0
 
 
