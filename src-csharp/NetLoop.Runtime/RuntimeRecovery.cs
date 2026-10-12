@@ -15,8 +15,7 @@ internal static class RuntimeRecovery
         HostOptions options,
         int resetCount,
         Action processWaitingEvents,
-        CancellationToken cancellationToken,
-        bool recoveringAfterPhysicalHandover = false)
+        CancellationToken cancellationToken)
     {
         var waiting = false;
         string? lastTransientIssue = null;
@@ -36,8 +35,7 @@ internal static class RuntimeRecovery
                 else
                 {
                     NetLoopRuntime.ValidateSingleManagedAddress(state.ManagedAddresses);
-                    var runtime = await NetLoopRuntime.CreateAsync(
-                            options, state, recoveringAfterPhysicalHandover)
+                    var runtime = await NetLoopRuntime.CreateAsync(options, state)
                         .ConfigureAwait(false);
                     if (waiting)
                         JsonLog.Info("runtime_controller_configuration_recovered", new {

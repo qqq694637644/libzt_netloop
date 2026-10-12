@@ -133,8 +133,7 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
 
     internal static async Task<NetLoopRuntime> CreateAsync(
         HostOptions options,
-        LibztNetworkState state,
-        bool recoveringAfterPhysicalHandover = false)
+        LibztNetworkState state)
     {
         var overlayBind = ValidateSingleManagedAddress(state.ManagedAddresses);
         var defaultExit = options.DefaultExit
@@ -162,9 +161,7 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
         var tcpCapacity = new SemaphoreSlim(
             options.MaxTcpTunnels, options.MaxTcpTunnels);
         var tcpSessions = new TcpSessionTracker();
-        var peerDials = new PeerDialCoordinator(
-            recoveringAfterHandover: recoveringAfterPhysicalHandover
-                && OperatingSystem.IsWindows());
+        var peerDials = new PeerDialCoordinator();
         Socks5UdpAssociationFactory? udpAssociations = null;
         OverlaySocksAgent? overlayAgent = null;
         OverlayUdpAgent? overlayUdpAgent = null;

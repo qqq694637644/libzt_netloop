@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Net;
 using NetLoop.Core;
 
@@ -21,11 +20,6 @@ internal sealed class PeerDialCoordinator
     private sealed class PeerState
     {
         internal readonly SemaphoreSlim Slots = new(MaxInFlightPerPeer, MaxInFlightPerPeer);
-        // Only used by a Windows Runtime created after a physical handover.
-        // A successful TCP + SOCKS greeting permanently opens this gate for
-        // this Peer; target CONNECT failures never close it again.
-        internal readonly SemaphoreSlim RecoveryTurn = new(1, 1);
-        internal bool Recovering;
         internal int Waiting;
         internal int InFlight;
         internal int Failures;
@@ -37,14 +31,9 @@ internal sealed class PeerDialCoordinator
     private readonly object _gate = new();
     private readonly Dictionary<IPAddress, PeerState> _peers = [];
     private readonly Func<long> _clock;
-    private readonly bool _recoveringAfterHandover;
 
-    internal PeerDialCoordinator(
-        Func<long>? clock = null, bool recoveringAfterHandover = false)
-    {
-        _clock = clock ?? (() => Environment.TickCount64);
-        _recoveringAfterHandover = recoveringAfterHandover;
-    }
+    internal PeerDialCoordinator(Func<long>? clock = null)
+        => _clock = clock ?? (() => Environment.TickCount64);
 
     internal sealed record PeerDialStatus(
         string Peer,
@@ -52,8 +41,7 @@ internal sealed class PeerDialCoordinator
         int Waiting,
         int ConsecutiveFailures,
         int RemainingCooldownMs,
-        long Rejected,
-        bool Recovering);
+        long Rejected);
 
     internal PeerDialStatus[] Snapshot()
     {
@@ -67,24 +55,10 @@ internal sealed class PeerDialCoordinator
         => new(
             peer.ToString(), state.InFlight, state.Waiting, state.Failures,
             (int)Math.Clamp(state.RetryAfter - _clock(), 0, MaxCooldownMilliseconds),
-            state.Rejected, state.Recovering);
+            state.Rejected);
 
     private static bool ShouldLogRejection(long count)
         => count <= 1 || (count & (count - 1)) == 0;
-
-    private TimeoutException AdmissionTimedOut(IPAddress peer, PeerState state)
-    {
-        long count;
-        lock (_gate)
-            count = ++state.Rejected;
-        if (ShouldLogRejection(count))
-            JsonLog.Info("peer_dial_rejected", new {
-                peer = peer.ToString(),
-                reason = "peer_queue_timeout",
-                rejected_total = count
-            });
-        return new TimeoutException($"Overlay Peer {peer} admission waited too long.");
-    }
 
     internal async ValueTask<IProxyConnection> ConnectAsync(
         IPAddress peer,
@@ -118,10 +92,7 @@ internal sealed class PeerDialCoordinator
                     rejectReason = "peer_table_full";
                 else
                 {
-                    state = new PeerState {
-                        LastUsed = now,
-                        Recovering = _recoveringAfterHandover
-                    };
+                    state = new PeerState { LastUsed = now };
                     _peers.Add(peer, state);
                 }
             }
@@ -155,44 +126,24 @@ internal sealed class PeerDialCoordinator
 
         var acquired = false;
         var inFlight = false;
-        var recoveryTurn = false;
-        var admissionTimer = Stopwatch.StartNew();
         try
         {
-            bool recovering;
-            lock (_gate)
-                recovering = state.Recovering;
-
-            if (recovering)
-            {
-                // Wait before taking a normal dial slot: while recovering,
-                // at most one actual TCP + SOCKS greeting may run per Peer.
-                // The existing four-waiter budget also bounds this queue.
-                recoveryTurn = await state.RecoveryTurn.WaitAsync(
-                    TimeSpan.FromMilliseconds(AdmissionWaitMilliseconds),
-                    cancellationToken).ConfigureAwait(false);
-                if (!recoveryTurn)
-                    throw AdmissionTimedOut(peer, state);
-
-                // Another request may have completed the first greeting while
-                // we waited. Do not serialize healthy traffic behind this gate.
-                lock (_gate)
-                    recovering = state.Recovering;
-                if (!recovering)
-                {
-                    state.RecoveryTurn.Release();
-                    recoveryTurn = false;
-                }
-            }
-
-            // Recovery turn + normal capacity share one 3-second admission
-            // deadline, not two consecutive timeouts under heavy load.
             acquired = await state.Slots.WaitAsync(
-                TimeSpan.FromMilliseconds(Math.Max(0,
-                    AdmissionWaitMilliseconds - admissionTimer.Elapsed.TotalMilliseconds)),
+                TimeSpan.FromMilliseconds(AdmissionWaitMilliseconds),
                 cancellationToken).ConfigureAwait(false);
             if (!acquired)
-                throw AdmissionTimedOut(peer, state);
+            {
+                long count;
+                lock (_gate)
+                    count = ++state.Rejected;
+                if (ShouldLogRejection(count))
+                    JsonLog.Info("peer_dial_rejected", new {
+                        peer = peer.ToString(),
+                        reason = "peer_queue_timeout",
+                        rejected_total = count
+                    });
+                throw new TimeoutException($"Overlay Peer {peer} admission waited too long.");
+            }
 
             long remaining;
             lock (_gate)
@@ -239,9 +190,6 @@ internal sealed class PeerDialCoordinator
                 {
                     state.Failures = 0;
                     state.RetryAfter = 0;
-                    // Successful transport + greeting opens normal 2+4
-                    // admission immediately, before target CONNECT runs.
-                    state.Recovering = false;
                 }
                 return connection;
             }
@@ -286,8 +234,6 @@ internal sealed class PeerDialCoordinator
             }
             if (acquired)
                 state.Slots.Release();
-            if (recoveryTurn)
-                state.RecoveryTurn.Release();
         }
     }
 }

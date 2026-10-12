@@ -278,7 +278,6 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
                 () => Publish(RuntimePhase.Degraded, "waiting_for_controller"),
                 token).ConfigureAwait(false);
 
-            var recoveringAfterPhysicalHandover = false;
             while (!token.IsCancellationRequested)
             {
                 var runtime = Current;
@@ -286,8 +285,7 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
                 {
                     Publish(RuntimePhase.Degraded, "waiting_for_runtime_configuration");
                     runtime = await RuntimeRecovery.CreateAsync(
-                            node, options, _resetCount, DrainEventsWhileWaiting,
-                            token, recoveringAfterPhysicalHandover)
+                            node, options, _resetCount, DrainEventsWhileWaiting, token)
                         .ConfigureAwait(false);
 
                     // Runtime creation includes several native binds. Never
@@ -314,7 +312,6 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
                     runtime.UpdateNetworkState(latest);
                     Volatile.Write(ref _active, runtime);
                     Publish(RuntimePhase.Ready, null);
-                    recoveringAfterPhysicalHandover = false;
                     RestoreDeferredManualReset();
                 }
 
@@ -448,13 +445,6 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
 
                 if (restart is not null)
                 {
-                    // Only a Windows physical handover enables the temporary
-                    // one-dial-per-Peer recovery gate in its replacement
-                    // Runtime. Normal startup/manual/Managed IP resets retain
-                    // the usual 2-in-flight/4-waiting admission limits.
-                    recoveringAfterPhysicalHandover =
-                        OperatingSystem.IsWindows()
-                        && restart == "physical_network_handover";
                     Publish(RuntimePhase.Resetting, restart);
                     if (restart == "physical_network_handover")
                     {
