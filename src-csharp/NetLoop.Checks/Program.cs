@@ -41,6 +41,9 @@ internal static class Program
             await CheckAsync("Startup processes physical events while Node waits", StartupPhysicalRefresh);
             Check("Rapid physical events retain the final network notification", RapidPhysicalEventDelivery);
             await CheckAsync("Peer dialing is bounded across simultaneous SOCKS requests", PeerDialAdmission);
+            await CheckAsync("Handover Peer recovery serializes each Peer and reopens normal capacity", PeerRecoverySingleFlight);
+            await CheckAsync("Canceled recovery waiters and failed dials cannot strand a Peer", PeerRecoveryCancellationAndRetry);
+            await CheckAsync("A successful Peer greeting opens recovery even when target CONNECT fails", PeerRecoveryTargetRefusal);
             await CheckAsync("Peer dialing releases canceled waiters and isolates different peers", PeerDialCancellation);
             await CheckAsync("Peer failure backoff does not hold established TCP", PeerDialCooldown);
             await CheckAsync("SOCKS target refused by B/C does not cool down healthy Peer", TargetRefusalDoesNotCooldownPeer);
@@ -447,6 +450,123 @@ internal static class Program
             "The gate exceeded the outgoing dial budget");
         foreach (var connection in established)
             await connection.DisposeAsync();
+    }
+
+    private static async Task PeerRecoverySingleFlight()
+    {
+        var gate = new PeerDialCoordinator(recoveringAfterHandover: true);
+        var releaseFirst = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var dialStarts = 0;
+
+        async ValueTask<IProxyConnection> Dial(CancellationToken token)
+        {
+            if (Interlocked.Increment(ref dialStarts) == 1)
+                await releaseFirst.Task.WaitAsync(token).ConfigureAwait(false);
+            return new FakeControl();
+        }
+
+        var first = gate.ConnectAsync(B, Dial, CancellationToken.None).AsTask();
+        var second = gate.ConnectAsync(B, Dial, CancellationToken.None).AsTask();
+        var third = gate.ConnectAsync(B, Dial, CancellationToken.None).AsTask();
+        var recovering = gate.Snapshot().Single(status => status.Peer == B.ToString());
+        Require(recovering.Recovering && recovering.InFlight == 1
+                && recovering.Waiting == 2 && dialStarts == 1,
+            "Handover recovery started simultaneous Peer greetings");
+
+        await using (var independent = await gate.ConnectAsync(C,
+            _ => ValueTask.FromResult<IProxyConnection>(new FakeControl()),
+            CancellationToken.None))
+        {
+            Require(!gate.Snapshot().Single(status => status.Peer == C.ToString())
+                    .Recovering,
+                "A healthy C greeting did not open C's independent recovery gate");
+            Require(gate.Snapshot().Single(status => status.Peer == B.ToString())
+                    .Recovering,
+                "C's recovery incorrectly opened B's gate");
+        }
+
+        releaseFirst.TrySetResult();
+        var connections = await Task.WhenAll(first, second, third)
+            .WaitAsync(TimeSpan.FromSeconds(2));
+        foreach (var connection in connections)
+            await connection.DisposeAsync();
+        Require(!gate.Snapshot().Single(status => status.Peer == B.ToString())
+                .Recovering,
+            "First B greeting did not unlock normal admission");
+
+        var releaseNormal = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        async ValueTask<IProxyConnection> Hold(CancellationToken token)
+        {
+            await releaseNormal.Task.WaitAsync(token).ConfigureAwait(false);
+            return new FakeControl();
+        }
+        var normal1 = gate.ConnectAsync(B, Hold, CancellationToken.None).AsTask();
+        var normal2 = gate.ConnectAsync(B, Hold, CancellationToken.None).AsTask();
+        Require(gate.Snapshot().Single(status => status.Peer == B.ToString())
+                .InFlight == PeerDialCoordinator.MaxInFlightPerPeer,
+            "Healthy Peer did not restore both normal admission slots");
+        releaseNormal.TrySetResult();
+        foreach (var connection in await Task.WhenAll(normal1, normal2)
+                     .WaitAsync(TimeSpan.FromSeconds(2)))
+            await connection.DisposeAsync();
+    }
+
+    private static async Task PeerRecoveryCancellationAndRetry()
+    {
+        var gate = new PeerDialCoordinator(recoveringAfterHandover: true);
+        using var blocked = new CancellationTokenSource();
+        using var canceledWaiter = new CancellationTokenSource();
+
+        async ValueTask<IProxyConnection> Hung(CancellationToken token)
+        {
+            await Task.Delay(Timeout.InfiniteTimeSpan, token).ConfigureAwait(false);
+            return new FakeControl();
+        }
+
+        var first = gate.ConnectAsync(B, Hung, blocked.Token).AsTask();
+        var second = gate.ConnectAsync(B,
+            _ => ValueTask.FromResult<IProxyConnection>(new FakeControl()),
+            canceledWaiter.Token).AsTask();
+        Require(gate.Snapshot().Single().Waiting == 1,
+            "Recovery follower did not enter bounded waiting queue");
+        canceledWaiter.Cancel();
+        await ThrowsAsync<OperationCanceledException>(() => second);
+        blocked.Cancel();
+        await ThrowsAsync<OperationCanceledException>(() => first);
+        var afterCancellation = gate.Snapshot().Single();
+        Require(afterCancellation.Recovering && afterCancellation.Waiting == 0
+                && afterCancellation.InFlight == 0,
+            "Cancellation leaked a recovery permit or opened the gate");
+
+        await ThrowsAsync<IOException>(async () =>
+            _ = await gate.ConnectAsync(B,
+                _ => ValueTask.FromException<IProxyConnection>(
+                    new IOException("synthetic handover outage")),
+                CancellationToken.None));
+        Require(gate.Snapshot().Single().Recovering,
+            "Failed Peer handshake incorrectly marked recovery healthy");
+
+        await using var recovered = await gate.ConnectAsync(B,
+            _ => ValueTask.FromResult<IProxyConnection>(new FakeControl()),
+            CancellationToken.None);
+        Require(!gate.Snapshot().Single().Recovering,
+            "Next successful Peer handshake could not exit recovery");
+    }
+
+    private static async Task PeerRecoveryTargetRefusal()
+    {
+        var remote = new ScriptedSocksConnector(port =>
+            port == 9001 ? (byte)5 : (byte)0);
+        var gate = new PeerDialCoordinator(recoveringAfterHandover: true);
+        var router = ScriptedRouter(remote, gate);
+        await ThrowsAsync<IOException>(async () =>
+            _ = await router.ConnectAsync(
+                new ProxyTarget("198.51.100.10", 9001), CancellationToken.None));
+        var status = gate.Snapshot().Single();
+        Require(!status.Recovering && status.ConsecutiveFailures == 0,
+            "Target refusal after healthy greeting incorrectly blocked Peer recovery");
     }
 
     private static async Task PeerDialCooldown()

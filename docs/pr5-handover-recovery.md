@@ -30,6 +30,28 @@ preferred until authenticated direct traffic revalidates it. Planet/root/
 upstream paths are retained as potential relay and rendezvous fallback. This
 neither disables relay nor guarantees a direct connection after strict NAT.
 
+## Windows handover Peer recovery admission
+
+When `RuntimeOwner` replaces a Runtime specifically for a **Windows physical
+handover**, `RuntimeRecovery` starts its new `PeerDialCoordinator` in a
+temporary per-Peer recovery mode. Other restarts and normal startup keep the
+existing admission behavior. Every Peer has an independent recovery turn:
+
+- At most **one actual Overlay TCP + SOCKS greeting** may run at a time for
+  each recovering Peer. The regular two native dial slots and four bounded
+  waiters are **not increased**. Pending recovery turns share the original
+  three-second admission deadline; overflow still fails fast.
+- A successful TCP + SOCKS greeting marks **that Peer** healthy immediately;
+  queued requests then proceed under the normal 2-in-flight/4-waiting budget.
+  A slow/refused **target CONNECT** must not close the newly healthy gate.
+- Failed greetings retain recovering state and the existing bounded cooldown;
+  cancellations and timeouts always release both queue and recovery permits.
+  One negotiated socket still belongs exclusively to its original request.
+
+This is a transient business Runtime admission policy, not a change to
+ZeroTierOne Core routing, Root/Planet fallback, native socket limits or the
+existing `connection_probe.ps1`.
+
 Native trace event `core_handover_peer_paths_revalidated` (kind 30) records:
 `reference` = revalidation timestamp (native monotonic ms), `flags=3` =
 post-binder leaf-only pass, `byte_count` = local Binder address count,
@@ -82,10 +104,13 @@ been demonstrated**.
 
 ## Regression / build boundaries
 
-The episode-only update was requested for Windows PR #5 with **no tests run**;
-the real recovery effect and repeated-reset suppression are not yet measured
-on A/B machines. The existing `connection_probe.ps1` is unchanged, and this
-step does not add Peer Dial single-flight or change ZeroTierOne path policy.
+The earlier episode-only update was committed without running tests. The
+subsequent browser-load logs showed duplicate Runtime resets were suppressed,
+but Peer Dial admission still rejected many concurrent requests. The new
+Windows-only Peer recovery gate is designed to protect the first greeting;
+its impact on real A/B recovery times is **not yet verified**. The existing
+`connection_probe.ps1` is unchanged, and the ZeroTierOne path policy is not
+altered in this step.
 
 Run C# offline checks, Python offline checks and the **Windows x64 CI build**
 from the updated patches. Linux and Android workflows are not part of this PR #5
