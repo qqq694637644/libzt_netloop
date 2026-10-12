@@ -310,6 +310,14 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
                             switch (currentEvent.Kind)
                             {
                                 case EventKind.Physical:
+                                    // A physical handover invalidates the
+                                    // existing underlay. Do not keep old TCP
+                                    // sessions alive while ZeroTier rebuilds
+                                    // paths: they can pin dead Peer state and
+                                    // amplify browser reconnect storms.
+                                    // Runtime recreation preserves the native
+                                    // Node identity but deliberately drops all
+                                    // business connections.
                                     _physicalRefreshPending = true;
                                     if (!TryDeliverPendingPhysicalRefresh(
                                             ref _physicalRefreshPending,
@@ -317,8 +325,7 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
                                         LogFailedReadyRefresh(currentEvent.Reason);
                                     else
                                         _failedReadyRefreshAttempts = 0;
-                                    // Physical handover alone never aborts a
-                                    // potentially healthy long-lived TCP/RDP.
+                                    restart = "physical_network_handover";
                                     break;
                                 case EventKind.Unavailable:
                                     if (!node.NetworkConfigurationAvailable)
