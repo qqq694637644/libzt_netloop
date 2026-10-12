@@ -109,6 +109,9 @@ jobs:
           --output dist-csharp
           --runtime win-x64
 
+      - name: Run deterministic offline C# regressions
+        run: dotnet run --project src-csharp/NetLoop.Checks/NetLoop.Checks.csproj --configuration Release
+
       - name: Upload C# runtime
         uses: actions/upload-artifact@v4
         with:

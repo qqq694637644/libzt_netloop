@@ -120,7 +120,8 @@ public sealed class LocalSocksServer : IAsyncDisposable
         using var usage = _sessions.Track(
             "local",
             (client.Client.RemoteEndPoint as IPEndPoint)?
-                .Address.ToString() ?? "unknown");
+                .Address.ToString() ?? "unknown",
+            _capacity);
         await using var connection = new SystemTcpConnection(
             client,
             $"local:{client.Client.RemoteEndPoint}");
@@ -135,10 +136,6 @@ public sealed class LocalSocksServer : IAsyncDisposable
         catch (Exception ex)
         {
             JsonLog.Error("local_socks_client_failed", new { error = ex.Message });
-        }
-        finally
-        {
-            _capacity.Release();
         }
     }
 

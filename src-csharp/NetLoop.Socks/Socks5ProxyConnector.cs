@@ -44,6 +44,38 @@ public sealed class Socks5ProxyConnector : IProxyConnector
     {
         var connection = await ConnectAndNegotiateAsync(
             cancellationToken).ConfigureAwait(false);
+        return await ConnectTargetAsync(
+            connection, target, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Connects to the SOCKS Peer and completes the greeting only.
+    /// The caller owns the returned connection and must either complete
+    /// CONNECT using ConnectTargetAsync or dispose it.
+    /// </summary>
+    public async ValueTask<IProxyConnection> ConnectAndNegotiateAsync(
+        CancellationToken cancellationToken)
+    {
+        if (_negotiationRetryWindow is null)
+            return await ConnectAndNegotiateOnceAsync(
+                cancellationToken).ConfigureAwait(false);
+
+        return await ConnectAndNegotiateWithRetriesAsync(
+            _negotiationRetryWindow.Value,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Asks a successfully negotiated SOCKS Peer to connect to the target.
+    /// This is target work: a refusal or slow reply does not mean the
+    /// Peer TCP/SOCKS greeting failed. Owns and disposes the connection
+    /// on any target-stage failure.
+    /// </summary>
+    public async ValueTask<IProxyConnection> ConnectTargetAsync(
+        IProxyConnection connection,
+        ProxyTarget target,
+        CancellationToken cancellationToken)
+    {
         try
         {
             using var replyCts =
@@ -80,16 +112,13 @@ public sealed class Socks5ProxyConnector : IProxyConnector
         }
     }
 
-    private async ValueTask<IProxyConnection> ConnectAndNegotiateAsync(
+    private async ValueTask<IProxyConnection> ConnectAndNegotiateWithRetriesAsync(
+        TimeSpan retryWindow,
         CancellationToken cancellationToken)
     {
-        if (_negotiationRetryWindow is null)
-            return await ConnectAndNegotiateOnceAsync(
-                cancellationToken).ConfigureAwait(false);
-
         var negotiationId = ConnectionTrace.NewId();
         var inboundId = ConnectionTrace.InboundConnectionId;
-        var deadline = DateTimeOffset.UtcNow + _negotiationRetryWindow.Value;
+        var deadline = DateTimeOffset.UtcNow + retryWindow;
         var attempt = 0;
         Exception? lastError = null;
 

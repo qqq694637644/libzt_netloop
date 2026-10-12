@@ -182,6 +182,7 @@ internal static class Program
     {
         var runtime = status.Runtime;
         var state = runtime?.State ?? status.Network;
+        var tcpUsage = runtime?.TcpSessions;
         return StatusWriter.TryWriteAsync(
             options.StatusFile,
             new {
@@ -211,8 +212,8 @@ internal static class Program
                 agent_target_acl_enabled = runtime?.AccessPolicy.RestrictTargets,
                 agent_source_denied = runtime?.AccessPolicy.RejectedSources,
                 agent_target_denied = runtime?.AccessPolicy.RejectedTargets,
-                active_tcp_tunnels = runtime?.ActiveTcpTunnels,
-                tcp_session_phases = runtime?.TcpSessions,
+                active_tcp_tunnels = tcpUsage?.Total,
+                tcp_session_phases = tcpUsage,
                 peer_dials = runtime?.PeerDials,
                 tcp_tunnel_capacity = options.MaxTcpTunnels,
                 active_local_udp_associations = runtime?.ActiveLocalUdpAssociations,

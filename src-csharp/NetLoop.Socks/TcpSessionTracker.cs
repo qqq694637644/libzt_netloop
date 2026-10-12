@@ -43,7 +43,8 @@ public sealed record TcpSessionUsage(
 
 /// <summary>
 /// Tracks the stage and ZeroTier source of every accepted TCP control
-/// connection. The existing Runtime semaphore remains the only permit owner.
+/// connection. The Runtime semaphore enforces the shared capacity and
+/// the session lease owns returning its acquired permit on final disposal.
 /// No long-lived relay is ended by this diagnostic.
 /// </summary>
 public sealed class TcpSessionTracker
@@ -56,12 +57,18 @@ public sealed class TcpSessionTracker
     private long _rejectedOverlay;
     private long _rejectedOther;
 
-    public Lease Track(string ingress, string source)
+    /// <summary>
+    /// Takes ownership of the permit already acquired by the TCP listener.
+    /// Disposing the lease removes the session and returns that permit once,
+    /// after the connection's asynchronous disposal has completed.
+    /// </summary>
+    public Lease Track(string ingress, string source, SemaphoreSlim capacity)
     {
         if (ingress is not ("local" or "overlay"))
             throw new ArgumentOutOfRangeException(nameof(ingress));
+        ArgumentNullException.ThrowIfNull(capacity);
 
-        var lease = new Lease(this, ingress, source);
+        var lease = new Lease(this, capacity, ingress, source);
         lock (_gate)
             _active.Add(lease);
         return lease;
@@ -156,11 +163,17 @@ public sealed class TcpSessionTracker
     public sealed class Lease : IDisposable
     {
         private readonly TcpSessionTracker _owner;
+        private readonly SemaphoreSlim _capacity;
         private bool _disposed;
 
-        internal Lease(TcpSessionTracker owner, string ingress, string source)
+        internal Lease(
+            TcpSessionTracker owner,
+            SemaphoreSlim capacity,
+            string ingress,
+            string source)
         {
             _owner = owner;
+            _capacity = capacity;
             Ingress = ingress;
             Source = source;
         }
@@ -186,6 +199,10 @@ public sealed class TcpSessionTracker
                     return;
                 _disposed = true;
                 _owner._active.Remove(this);
+                // Keep the tracker snapshot and permit return synchronized:
+                // a fresh accepted client cannot be counted until the old
+                // session has been removed under the same tracker lock.
+                _capacity.Release();
             }
         }
     }

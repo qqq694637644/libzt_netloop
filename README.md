@@ -176,6 +176,9 @@ RELAY/DIRECT/NODE_OFFLINE events. These do **not** claim to eliminate native
 70–110s Peer recovery or the observed ~226s Node cycle. See
 [the manual handover diagnosis guide](docs/network-handover-diagnostics.md)
 for the exact JSONL fields, limits and A/B/C tests.
+The dialing limit ends immediately after the Peer TCP connection and SOCKS
+greeting: destination CONNECT failures/timeouts never mark a healthy Peer
+as failed, and two slow targets do not block a third new connection.
 
 For new versions, download the relevant build directly from
 [GitHub Releases](https://github.com/qqq694637644/libzt_netloop/releases)

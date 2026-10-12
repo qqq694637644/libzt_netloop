@@ -94,7 +94,8 @@ manifest 对应的 libzt submodule SHA、CMake、build script、
 全部 native 补丁哈希与当前 checkout 相同；缺失或不一致则
 终止构建，避免缓存复用旧 ABI 的 libzt.dll/libzt.so。
 
-此 PR 按约定只核对 Windows 编译 CI，不运行跨平台 E2E。
+此 PR 按约定只使用 Windows x64 CI（构建+纯 C# 离线回归），
+不运行跨平台 E2E。
 编译成功不能代替真实节点上 A→B / A→C 的新建 TCP 与旧 TCP
 会话保活验证。
 
@@ -142,8 +143,19 @@ UDP 接收队列、单包发送时限、每个 UDP 远端独立的有界队列
 Managed IP 统计；当额度耗尽时保留每来源拒绝计数，但密集
 JSONL 拒绝事件进行指数采样，避免二次日志风暴。
 `peer_dials` 对同 Peer（包括默认出口 B）最多允许 2 个
-正在建连协商、4 个等待；短暂失败冷却最多 2 秒，已经建立的
-RDP Relay **不受建连上限影响**，同时不盲目扩大 B 的 128 名额。
+正在进行 Peer TCP + SOCKS greeting、4 个等待；短暂失败冷却
+最多 2 秒，**不等待最终目标 CONNECT 成功才释放名额**。
+目标服务端拒绝/慢速响应/超时不会触发对健康 B/C Peer 的退避；
+真实 Peer TCP/greeting 故障仍会冷却。已建立的 RDP Relay
+**不受建连上限影响**，同时不盲目扩大 B 的 128 名额；
+慢目标仍然会占 B 的普通 TCP 会话容量，直到其 CONNECT 终止。
+
+入站 TCP 结束时，先完成本地/Overlay 连接异步 Dispose，
+随后由单个 `TcpSessionTracker.Lease` 同步移除阶段统计、释放
+共享 `SemaphoreSlim` 名额，避免在关闭中的连接上提前归还名额；
+状态文件的 `active_tcp_tunnels` 和 `tcp_session_phases.Total`
+共用同一采样结果。并发退出、异常退出和重复 Dispose 已有离线
+回归检查。
 
 Node Ready 后通知 libzt 更新物理路径时，若原生 API 返回失败，
 唯一 RuntimeOwner 保留请求并在原进程内稍后重试，成功后停止重试；

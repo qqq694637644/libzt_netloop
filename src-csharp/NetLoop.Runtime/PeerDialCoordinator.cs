@@ -5,8 +5,9 @@ namespace NetLoop.Host;
 
 /// <summary>
 /// Small per-Peer admission limit across independent inbound SOCKS requests.
-/// Holds a permit only through overlay TCP connect and SOCKS5 negotiation,
-/// never through an established relay or RDP stream. No background tasks.
+/// Holds a permit only through overlay TCP connect and SOCKS5 greeting,
+/// never through the target CONNECT reply or established RDP stream.
+/// No background tasks.
 /// </summary>
 internal sealed class PeerDialCoordinator
 {
@@ -165,8 +166,8 @@ internal sealed class PeerDialCoordinator
                     .ConfigureAwait(false);
             }
 
-            // Returning from ConnectAsync means the SOCKS CONNECT reply was
-            // accepted; the established relay is no longer rate-limited.
+            // Returning from ConnectAsync means the Peer transport and SOCKS
+            // greeting succeeded, not the final target CONNECT reply.
             try
             {
                 var connection = await connect(cancellationToken).ConfigureAwait(false);

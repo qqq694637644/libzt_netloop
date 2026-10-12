@@ -142,7 +142,8 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
         using var usage = _sessions.Track(
             "overlay",
             (connection.RemoteEndPoint as System.Net.IPEndPoint)?
-                .Address.ToString() ?? "unknown");
+                .Address.ToString() ?? "unknown",
+            _capacity);
         await using var client = connection;
         try
         {
@@ -160,10 +161,6 @@ internal sealed class OverlaySocksAgent : IAsyncDisposable
                 error_type = ex.GetType().Name,
                 error = ex.Message
             });
-        }
-        finally
-        {
-            _capacity.Release();
         }
     }
 

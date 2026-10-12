@@ -16,13 +16,27 @@ A 可通过 Controller 直连 C 的 SOCKS5 Agent。以下只解释新的诊断�
   记录容量拒绝来源；大量连续拒绝的 JSONL 日志采用指数采样，
   **状态文件中的计数保持精确**。空闲、已关闭的连接不会继续计入。
 - **A/C 侧 Peer 拨号**：整个业务 Runtime 中，对同一个 B/C
-  Managed IP 同时最多 2 个 TCP + SOCKS5 建连协商，另可排队
+  Managed IP 同时最多 2 个 TCP 连接 + SOCKS5 greeting 协商，
+  另可排队
   最多 4 个、最长等待 3 秒。队列满时明确拒绝，不无限积累；
-  失败时相同 Peer 采用 250/500/1000/2000ms 上限的短暂冷却，
-  成功后清零。**已经完成 CONNECT 的 RDP/SSH 长连接立刻释放
-  建连名额，不限制 Relay 时长或带宽**。其他 Peer 分开计数，
+  **仅 Peer TCP 建连或 greeting 失败**才采用
+  250/500/1000/2000ms 上限的短暂冷却，Peer greeting 成功后清零。
+  此时立即归还 Peer 拨号名额，**不等待 B/C 最终目标的 CONNECT
+  回复**。目标端口关闭、拒绝访问、DNS/连接超时以及慢目标
+  均不触发 Peer 失败退避，也不占用建连名额；目标 CONNECT
+  仍受原本 25 秒应答超时保护。**已经建立的 RDP/SSH 也不限制
+  Relay 时长或带宽**。其他 Peer 分开计数，
   路由决策和本地 loopback 不经过此限制。`peer_dials` 状态提供
   每个 Peer 的当前正在协商、排队、拒绝及冷却剩余毫秒。
+  即使 Peer 阶段已经结束，目标 CONNECT 等待期间仍占有 B 的
+  一个**普通 TCP 会话额度**；B 的 128 默认全局容量并未扩大，
+  大量真正的慢目标仍可能触及该上限。
+- **TCP 退出计数一致性**：本地/Overlay 入站连接完成异步清理后，
+  同一个 `TcpSessionTracker.Lease` 才移除当前阶段统计并归还
+  全局 `SemaphoreSlim` 容量；重复关闭不会重复释放名额。
+  状态文件的 `active_tcp_tunnels` 与 `tcp_session_phases.Total`
+  取自**同一个统计快照**。极短的“信号量已被 accept 获取、
+  会话尚未注册”窗口仍可能存在，不夸大为整个数据面的原子快照。
 - **物理路径刷新失败**：Node Ready 期间
   `zts_node_network_changed` 返回失败，会在原本的单一
   `RuntimeOwner` 中保留并每 500ms 重试，直到成功接受；
@@ -73,12 +87,15 @@ A 可通过 Controller 直连 C 的 SOCKS5 Agent。以下只解释新的诊断�
 
 ## 验证边界
 
-新增的离线 C# 检查只证明：TCP 额度分类可重现、单 Peer 同时
-拨号/排队/冷却有界、已经连接的流不占拨号名额、物理刷新失败保留
-请求、可重现 226 秒 NODE 周期的计算公式。它们不启动 ZeroTier
+新增的离线 C# 检查只证明：TCP 额度分类、并发退出时的容量归还
+可重现；单 Peer 拨号/排队/冷却有界；目标拒绝连接、
+两个慢目标与目标回复超时**不会导致 Peer 冷却或霸占拨号名额**；
+真实 Peer TCP 失败仍可触发冷却；物理刷新失败保留请求；
+可重现 226 秒 NODE 周期的计算公式。它们不启动 ZeroTier
 Node，也不测真实 UDP NAT、RDP、72h/7 天长稳。
 
-对本项目个人使用场景，CI 仍只要求 **Windows x64 构建**；不要
-自动启用 Android/Linux CI 或远端网络 E2E。Native 补丁与托管
+对本项目个人使用场景，Windows CI 在构建 x64 程序后直接运行
+**不启动 native Node 的 C# 离线回归检查**；不要自动启用
+Android/Linux CI 或远端网络 E2E。Native 补丁与托管
 P/Invoke ABI 必须**同版本构建**，不可把旧版 `libzt.dll`
 与新 C# 程序混用。

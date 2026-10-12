@@ -68,7 +68,6 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
     internal LibztNetworkState State => Volatile.Read(ref _state);
 
     internal IPAddress OverlayBindAddress => _overlayBindAddress;
-    internal int ActiveTcpTunnels => _maxTcpTunnels - _tcpCapacity.CurrentCount;
     internal TcpSessionUsage TcpSessions => _tcpSessions.Snapshot();
     internal PeerDialCoordinator.PeerDialStatus[] PeerDials => _peerDials.Snapshot();
     internal int UdpQueuedBytes => _udpByteBudget.UsedBytes;

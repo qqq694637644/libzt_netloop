@@ -62,7 +62,7 @@ internal sealed class RoutingConnector : IProxyConnector
         };
     }
 
-    private ValueTask<IProxyConnection> ConnectViaPeerAsync(
+    private async ValueTask<IProxyConnection> ConnectViaPeerAsync(
         RouteDecision decision,
         ProxyTarget target,
         CancellationToken cancellationToken)
@@ -76,9 +76,14 @@ internal sealed class RoutingConnector : IProxyConnector
             negotiationRetryWindow: PeerNegotiationRecoveryWindow,
             negotiationAttemptTimeout: PeerNegotiationAttemptTimeout,
             connectReplyTimeout: _connectReplyTimeout);
-        return _peerDials.ConnectAsync(
+        // Admission/backoff covers only transport + SOCKS greeting.
+        // Destination CONNECT can be slow/refused despite a healthy Peer:
+        // do not hold Peer dial slots or cool down B/C for target errors.
+        var negotiated = await _peerDials.ConnectAsync(
             peer,
-            token => proxy.ConnectAsync(target, token),
-            cancellationToken);
+            proxy.ConnectAndNegotiateAsync,
+            cancellationToken).ConfigureAwait(false);
+        return await proxy.ConnectTargetAsync(
+            negotiated, target, cancellationToken).ConfigureAwait(false);
     }
 }
