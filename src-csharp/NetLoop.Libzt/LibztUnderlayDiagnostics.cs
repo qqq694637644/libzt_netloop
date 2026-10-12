@@ -37,6 +37,7 @@ internal sealed class LibztUnderlayDiagnostics(Func<long>? clock = null)
         27 => "core_upstream_probe_scheduler",
         28 => "core_scope_path_invalidated",
         29 => "core_surface_expired",
+        30 => "core_handover_peer_paths_revalidated",
         _ => "unknown"
     };
 

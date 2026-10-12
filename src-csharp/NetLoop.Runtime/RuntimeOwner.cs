@@ -52,8 +52,6 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
     private bool _physicalRefreshPending;
     private long _failedReadyRefreshAttempts;
     private Event? _deferredManualReset;
-    private long _lastPhysicalResetRequestTick;
-    private int _coalescedPhysicalEvents;
 
     internal event Action<RuntimeStatus>? StatusChanged;
 
@@ -63,17 +61,16 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
 
     internal void RequestPhysicalNetworkRefresh(string reason)
     {
-        var now = Environment.TickCount64;
-        var previous = Interlocked.Read(ref _lastPhysicalResetRequestTick);
-        if (previous != 0 && now - previous < 500)
-        {
-            Interlocked.Increment(ref _coalescedPhysicalEvents);
-            return;
-        }
-
-        Interlocked.Exchange(ref _lastPhysicalResetRequestTick, now);
-        _events.Writer.TryWrite(new Event(EventKind.Physical, reason));
+        // The platform monitors already debounce transient address changes.
+        // Never discard a second notification based on its arrival time: it
+        // may describe the final usable interface after an earlier refresh
+        // ran against a not-yet-ready network. The owner coalesces notifications
+        // while waiting for native startup/runtime creation.
+        QueuePhysicalNetworkRefresh(_events.Writer, reason);
     }
+
+    internal static void QueuePhysicalNetworkRefresh(ChannelWriter<Event> writer, string reason)
+        => writer.TryWrite(new Event(EventKind.Physical, reason));
 
     internal void RequestManualReset(string reason)
         => _events.Writer.TryWrite(new Event(EventKind.Manual, reason));
@@ -415,9 +412,7 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
                             tcp_udp_association = sessions.UdpAssociation,
                             udp_local = runtime.ActiveLocalUdpAssociations,
                             udp_overlay = runtime.ActiveOverlayUdpAssociations,
-                            peer_dials = runtime.PeerDials.Length,
-                            coalesced_events = Interlocked.Exchange(
-                                ref _coalescedPhysicalEvents, 0)
+                            peer_dials = runtime.PeerDials.Length
                         });
                     }
                     Volatile.Write(ref _active, null);

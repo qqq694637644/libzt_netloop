@@ -22,10 +22,12 @@ LIBZT_PATCHES = [
     ROOT / "patches" / "libzt" / "0006-native-underlay-trace.patch",
     ROOT / "patches" / "libzt" / "0007-core-underlay-socket-trace.patch",
     ROOT / "patches" / "libzt" / "0008-recovery-decision-trace.patch",
+    ROOT / "patches" / "libzt" / "0009-handover-peer-revalidation.patch",
 ]
 ZERO_TIER_ONE_PATCHES = [
     ROOT / "patches" / "zerotierone" / "0001-netloop-core-path-trace.patch",
     ROOT / "patches" / "zerotierone" / "0002-netloop-recovery-decision-trace.patch",
+    ROOT / "patches" / "zerotierone" / "0003-netloop-handover-peer-revalidation.patch",
 ]
 
 

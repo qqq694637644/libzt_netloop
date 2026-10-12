@@ -548,6 +548,8 @@ public sealed class LibztNode : IAsyncDisposable
                             ? (long?)sample.Reference : null,
                         last_upstream_full_hello_native_ms = sample.Kind == 27
                             ? (long?)sample.Reference : null,
+                        handover_revalidation_native_ms = sample.Kind == 30
+                            ? (long?)sample.Reference : null,
                         reason_flags = sample.Flags,
                         byte_count = sample.ByteCount,
                         result = sample.Result,

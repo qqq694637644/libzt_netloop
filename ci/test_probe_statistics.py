@@ -1,11 +1,31 @@
 """Offline unit checks for the probe analyzer; no socket/network activity."""
 import unittest
 from datetime import datetime, timedelta, timezone
+import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
-from tools.analyze_connection_probes import generate_report, percentile, summarize
+from tools.analyze_connection_probes import generate_report, load_records, percentile, summarize
 
 
 class TestConnectionProbeStatistics(unittest.TestCase):
+    def test_powershell_probe_target_is_not_discarded(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "probe.jsonl"
+            path.write_text(json.dumps({
+                "ts_utc": "2026-10-12T11:28:58Z",
+                "end_utc": "2026-10-12T11:29:00Z",
+                "event": "connection_probe",
+                "node": "A",
+                "target": "http://172.26.0.254:8080/",
+                "status": "failure",
+                "elapsed_ms": 2000,
+            }) + "\n", encoding="utf-8")
+            records, warnings, duplicates = load_records([path])
+            self.assertFalse(warnings)
+            self.assertEqual(duplicates, 0)
+            self.assertEqual(records[0]["target"], "http://172.26.0.254:8080/")
+
     def test_success_percentiles(self):
         self.assertIsNone(percentile([], 95))
         self.assertEqual(percentile([100, 200, 300], 50), 200)

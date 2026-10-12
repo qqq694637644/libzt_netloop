@@ -1,0 +1,91 @@
+diff --git a/include/ZeroTierOne.h b/include/ZeroTierOne.h
+index 3150f53a8..c71f8e4d2 100644
+--- a/include/ZeroTierOne.h
++++ b/include/ZeroTierOne.h
+@@ -2059,6 +2059,14 @@ ZT_SDK_API int ZT_Node_addLocalInterfaceAddress(ZT_Node *node,const struct socka
+  */
+ ZT_SDK_API void ZT_Node_clearLocalInterfaceAddresses(ZT_Node *node);
+ 
++/**
++ * Revalidate active non-upstream peer paths after a confirmed host network
++ * handover. Only the libzt physical-network-change handler should call this,
++ * after rebinding the UDP sockets. Root/relay paths are kept as fallback.
++ * Returns the number of leaf peers scheduled for recovery.
++ */
++ZT_SDK_API unsigned int ZT_Node_revalidatePeerPathsAfterNetworkChange(ZT_Node *node,void *tptr,int64_t now);
++
+ /**
+  * Send a VERB_USER_MESSAGE to another ZeroTier node
+  *
+diff --git a/node/Node.cpp b/node/Node.cpp
+index 0858010d2..214501d60 100644
+--- a/node/Node.cpp
++++ b/node/Node.cpp
+@@ -702,6 +702,39 @@ void Node::clearLocalInterfaceAddresses()
+ 	_directPaths.clear();
+ }
+ 
++unsigned int Node::revalidatePeerPathsAfterNetworkChange(void *tptr,int64_t now)
++{
++	// Snapshot peer references before sending probes: the send callback and
++	// WHOIS may acquire Topology locks. Prioritize most recently heard peers.
++	std::vector< std::pair< Address,SharedPtr<Peer> > > peers(RR->topology->allPeers());
++	std::sort(peers.begin(),peers.end(),
++		[](const std::pair< Address,SharedPtr<Peer> > &a,
++		   const std::pair< Address,SharedPtr<Peer> > &b) {
++			return a.second->lastReceive() > b.second->lastReceive();
++		});
++	unsigned int scheduled = 0;
++	for (std::vector< std::pair< Address,SharedPtr<Peer> > >::const_iterator p(peers.begin());
++		 p!=peers.end() && scheduled < 32;++p) {
++		if (RR->topology->isUpstream(p->second->identity()) || p->second->paths(now).empty())
++			continue;
++		// Do not use isActive(): SDK builds expire its activity flag after 30s,
++		// while a broken peer can have been unreachable for several minutes.
++		// Existing paths identify the peers that need fresh authentication.
++		const InetAddress::IpScope scopes[] = {
++			InetAddress::IP_SCOPE_GLOBAL, InetAddress::IP_SCOPE_PRIVATE
++		};
++		for (unsigned int s=0;s<2;++s) {
++			p->second->resetWithinScope(tptr,scopes[s],AF_INET,now);
++			p->second->resetWithinScope(tptr,scopes[s],AF_INET6,now);
++		}
++		// Keep upstreams/root paths untouched for rendezvous and relay fallback.
++		// The existing WHOIS scheduler bounds repeat requests to each leaf.
++		RR->sw->requestWhois(tptr,now,p->first);
++		++scheduled;
++	}
++	return scheduled;
++}
++
+ int Node::sendUserMessage(void *tptr,uint64_t dest,uint64_t typeId,const void *data,unsigned int len)
+ {
+ 	try {
+@@ -1126,6 +1159,15 @@ void ZT_Node_clearLocalInterfaceAddresses(ZT_Node *node)
+ 	} catch ( ... ) {}
+ }
+ 
++unsigned int ZT_Node_revalidatePeerPathsAfterNetworkChange(ZT_Node *node,void *tptr,int64_t now)
++{
++	try {
++		return reinterpret_cast<ZeroTier::Node *>(node)->revalidatePeerPathsAfterNetworkChange(tptr,now);
++	} catch ( ... ) {
++		return 0;
++	}
++}
++
+ int ZT_Node_sendUserMessage(ZT_Node *node,void *tptr,uint64_t dest,uint64_t typeId,const void *data,unsigned int len)
+ {
+ 	try {
+diff --git a/node/Node.hpp b/node/Node.hpp
+index 2ade52928..854896d77 100644
+--- a/node/Node.hpp
++++ b/node/Node.hpp
+@@ -98,6 +98,7 @@ public:
+ 	void freeQueryResult(void *qr);
+ 	int addLocalInterfaceAddress(const struct sockaddr_storage *addr);
+ 	void clearLocalInterfaceAddresses();
++	unsigned int revalidatePeerPathsAfterNetworkChange(void *tptr,int64_t now);
+ 	int sendUserMessage(void *tptr,uint64_t dest,uint64_t typeId,const void *data,unsigned int len);
+ 	void setNetconfMaster(void *networkControllerInstance);
+ 

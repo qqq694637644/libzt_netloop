@@ -39,6 +39,7 @@ internal static class Program
             await CheckAsync("C Managed IP to local UDP with source rewrite", LoopbackUdp);
             await CheckAsync("UDP Factory concurrent disposal", UdpFactoryDisposal);
             await CheckAsync("Startup processes physical events while Node waits", StartupPhysicalRefresh);
+            Check("Rapid physical events retain the final network notification", RapidPhysicalEventDelivery);
             await CheckAsync("Peer dialing is bounded across simultaneous SOCKS requests", PeerDialAdmission);
             await CheckAsync("Peer dialing releases canceled waiters and isolates different peers", PeerDialCancellation);
             await CheckAsync("Peer failure backoff does not hold established TCP", PeerDialCooldown);
@@ -176,7 +177,8 @@ internal static class Program
                 && LibztUnderlayDiagnostics.NativeKind(26) == "core_switch_route_selected"
                 && LibztUnderlayDiagnostics.NativeKind(27) == "core_upstream_probe_scheduler"
                 && LibztUnderlayDiagnostics.NativeKind(28) == "core_scope_path_invalidated"
-                && LibztUnderlayDiagnostics.NativeKind(29) == "core_surface_expired",
+                && LibztUnderlayDiagnostics.NativeKind(29) == "core_surface_expired"
+                && LibztUnderlayDiagnostics.NativeKind(30) == "core_handover_peer_paths_revalidated",
             "Native trace kinds must remain compatible across builds");
         Require(LibztUnderlayDiagnostics.NativeKind(200) == "unknown",
             "Unknown native trace kind must remain safe");
@@ -674,6 +676,37 @@ internal static class Program
                     ref pending, () => { tries++; return false; })
                 && tries == 2,
             "A successful native refresh unexpectedly triggered another retry");
+    }
+
+    private static void RapidPhysicalEventDelivery()
+    {
+        var events = Channel.CreateBounded<RuntimeOwner.Event>(
+            new BoundedChannelOptions(64) { FullMode = BoundedChannelFullMode.DropOldest });
+
+        // Both platform callbacks may arrive within 500 ms; neither is dropped
+        // here just because the previous notification was recent.
+        RuntimeOwner.QueuePhysicalNetworkRefresh(events.Writer, "network_unavailable");
+        RuntimeOwner.QueuePhysicalNetworkRefresh(events.Writer, "network_available");
+        Require(events.Reader.TryRead(out var first)
+                && first.Kind == RuntimeOwner.EventKind.Physical
+                && first.Reason == "network_unavailable",
+            "First network transition was not queued");
+        Require(events.Reader.TryRead(out var final)
+                && final.Kind == RuntimeOwner.EventKind.Physical
+                && final.Reason == "network_available",
+            "Final usable-network notification was swallowed by the owner");
+
+        // During startup/runtime creation, notifications can be combined into
+        // one native refresh, but that refresh must still be issued.
+        RuntimeOwner.QueuePhysicalNetworkRefresh(events.Writer, "network_unavailable");
+        RuntimeOwner.QueuePhysicalNetworkRefresh(events.Writer, "network_available");
+        var pending = false;
+        RuntimeOwner.Event? deferred = null;
+        var refreshes = 0;
+        RuntimeOwner.DrainPendingWaitingEvents(events.Reader,
+            () => { refreshes++; return true; }, ref pending, ref deferred);
+        Require(refreshes == 1 && !pending && deferred is null,
+            "Startup should coalesce rapid notifications without losing the refresh");
     }
 
     private static async Task StartupPhysicalRefresh()
