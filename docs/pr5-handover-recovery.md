@@ -8,6 +8,18 @@ sessions without restarting ZeroTier identity or rejoining a virtual network.
 second notification in 500 ms: OS monitors already debounce, and the owner
 coalesces events while startup/native configuration is not ready.
 
+On Windows, an OS network handover is treated as an **episode**, not one
+destructive reset per callback. The first physical event resets the existing
+business Runtime immediately (after the monitor's existing debounce); later
+address/availability callbacks in the same episode still request native Binder
+and Peer path refresh, without aborting the replacement Runtime. Events arriving
+during Runtime creation extend that episode and still request native refresh.
+An episode can start again only after **at least 6 seconds since the first
+event and 2 seconds without a further event**, assessed when the next physical
+event is consumed with a ready Runtime. This adds no waiting before the first
+reset. Controller route hot updates, actual Managed IP changes and manual
+resets retain their independent lifecycle behavior.
+
 The private native `zts_node_network_changed()` handler now revalidates peer
 paths **after the Binder rebinding is complete**. It calls
 `ZT_Node_revalidatePeerPathsAfterNetworkChange()` only on explicit physical
@@ -69,6 +81,11 @@ Without A/B real devices and the experiment logs, **no MTTR improvement has
 been demonstrated**.
 
 ## Regression / build boundaries
+
+The episode-only update was requested for Windows PR #5 with **no tests run**;
+the real recovery effect and repeated-reset suppression are not yet measured
+on A/B machines. The existing `connection_probe.ps1` is unchanged, and this
+step does not add Peer Dial single-flight or change ZeroTierOne path policy.
 
 Run C# offline checks, Python offline checks and the **Windows x64 CI build**
 from the updated patches. Linux and Android workflows are not part of this PR #5
