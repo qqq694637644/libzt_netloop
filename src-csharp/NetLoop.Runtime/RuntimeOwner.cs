@@ -317,8 +317,13 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
                                         LogFailedReadyRefresh(currentEvent.Reason);
                                     else
                                         _failedReadyRefreshAttempts = 0;
-                                    // Physical handover alone never aborts a
-                                    // potentially healthy long-lived TCP/RDP.
+                                    // This project intentionally treats a real
+                                    // underlay handover as destructive. Do not
+                                    // wait for ZeroTier's old peer paths to age
+                                    // out. Existing TCP/UDP sessions belong to
+                                    // the previous transport generation and
+                                    // are rebuilt against the new path.
+                                    restart = "physical_network_handover";
                                     break;
                                 case EventKind.Unavailable:
                                     if (!node.NetworkConfigurationAvailable)
