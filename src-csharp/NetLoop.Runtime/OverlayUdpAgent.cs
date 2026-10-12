@@ -28,6 +28,7 @@ internal sealed class OverlayUdpAgent : IAsyncDisposable
         TaskCreationOptions.RunContinuationsAsynchronously);
 
     internal Task Completion => _receiveLoop;
+    internal int ActiveAssociations => _associations.Count;
 
     internal OverlayUdpAgent(
         IPAddress bindAddress,

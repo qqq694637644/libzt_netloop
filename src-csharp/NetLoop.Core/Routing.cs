@@ -156,6 +156,7 @@ public sealed class RouteSelector
         OverlayNetworkSnapshot Network,
         bool Available,
         long Generation,
+        DateTimeOffset UpdatedAtUtc,
         string? UnavailableReason);
 
     private RouteState _state;
@@ -166,7 +167,7 @@ public sealed class RouteSelector
         IPAddress defaultExit,
         long generation = 0)
     {
-        _state = new RouteState(network, true, generation, null);
+        _state = new RouteState(network, true, generation, DateTimeOffset.UtcNow, null);
         _defaultExit = defaultExit;
     }
 
@@ -179,7 +180,8 @@ public sealed class RouteSelector
             var previous = Volatile.Read(ref _state);
             if (generation <= previous.Generation)
                 return;
-            var next = new RouteState(network, true, generation, null);
+            var next = new RouteState(
+                network, true, generation, DateTimeOffset.UtcNow, null);
             if (ReferenceEquals(
                     Interlocked.CompareExchange(ref _state, next, previous),
                     previous))

@@ -213,6 +213,8 @@ internal static class Program
                 agent_target_denied = runtime?.AccessPolicy.RejectedTargets,
                 active_tcp_tunnels = runtime?.ActiveTcpTunnels,
                 tcp_tunnel_capacity = options.MaxTcpTunnels,
+                active_local_udp_associations = runtime?.ActiveLocalUdpAssociations,
+                active_overlay_udp_associations = runtime?.ActiveOverlayUdpAssociations,
                 udp_queued_bytes = runtime?.UdpQueuedBytes,
                 udp_peak_queued_bytes = runtime?.UdpPeakQueuedBytes,
                 udp_queue_byte_limit = runtime?.UdpQueueByteLimit,

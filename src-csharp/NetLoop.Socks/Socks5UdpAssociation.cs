@@ -35,6 +35,8 @@ public sealed class Socks5UdpAssociationFactory : ISocks5UdpAssociationFactory, 
     private readonly TaskCompletionSource _factoryDisposed = new(
         TaskCreationOptions.RunContinuationsAsynchronously);
 
+    public int ActiveAssociations => _active.Count;
+
     public Socks5UdpAssociationFactory(
         IProxyUdpTransportFactory transportFactory,
         int maxAssociations,

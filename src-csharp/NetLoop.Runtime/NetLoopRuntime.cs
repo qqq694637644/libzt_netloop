@@ -66,6 +66,8 @@ internal sealed class NetLoopRuntime : IAsyncDisposable
     internal int UdpQueuedBytes => _udpByteBudget.UsedBytes;
     internal int UdpPeakQueuedBytes => _udpByteBudget.PeakBytes;
     internal int UdpQueueByteLimit => _udpByteBudget.MaxBytes;
+    internal int ActiveLocalUdpAssociations => _udpAssociationFactory.ActiveAssociations;
+    internal int ActiveOverlayUdpAssociations => _overlayUdpAgent.ActiveAssociations;
 
     internal AgentAccessPolicy AccessPolicy => _accessPolicy;
 
