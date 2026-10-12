@@ -521,9 +521,12 @@ public sealed class LibztNode : IAsyncDisposable
                             ? null : sample.LocalEndpoint,
                         physical_interface = string.IsNullOrEmpty(sample.InterfaceName)
                             ? null : sample.InterfaceName,
-                        packet_id = sample.Kind is 5 or 6 or 10 or 11 or 14 or 15 or 17
+                        packet_id = sample.Kind is 5 or 6 or 10 or 11 or 14 or 15
+                            or 17 or 18 or 20 or 25 or 26
                             ? sample.Reference.ToString("x16") : null,
                         hello_request_packet_id = sample.Kind is 12 or 13
+                            ? sample.Reference.ToString("x16") : null,
+                        echo_request_packet_id = sample.Kind == 19
                             ? sample.Reference.ToString("x16") : null,
                         binder_start_native_ms = sample.Kind is 2 or 3
                             ? (long?)sample.Reference : null,
@@ -535,6 +538,16 @@ public sealed class LibztNode : IAsyncDisposable
                             && sample.Reference != 0 ? (long?)sample.Reference : null,
                         upstream_age_ms = sample.Kind == 16
                             ? sample.Result : (int?)null,
+                        peer_path_last_receive_native_ms = sample.Kind is 23 or 28
+                            ? (long?)sample.Reference : null,
+                        surface_observation_native_ms = sample.Kind is 21 or 22
+                            ? (long?)sample.Reference : null,
+                        surface_last_seen_native_ms = sample.Kind == 29
+                            ? (long?)sample.Reference : null,
+                        memorized_lookup_native_ms = sample.Kind == 24
+                            ? (long?)sample.Reference : null,
+                        last_upstream_full_hello_native_ms = sample.Kind == 27
+                            ? (long?)sample.Reference : null,
                         reason_flags = sample.Flags,
                         byte_count = sample.ByteCount,
                         result = sample.Result,
@@ -546,7 +559,8 @@ public sealed class LibztNode : IAsyncDisposable
                             ? false : (bool?)null,
                         // Receive-side core protocol records appear only
                         // after ZeroTier's existing MAC/identity verification.
-                        core_protocol_authenticated = sample.Kind is 11 or 13 or 15
+                        core_protocol_authenticated = sample.Kind is 11 or 13
+                            or 15 or 19 or 20 or 25
                             ? true : (bool?)null
                     });
                 }

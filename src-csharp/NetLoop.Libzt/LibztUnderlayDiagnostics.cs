@@ -25,6 +25,18 @@ internal sealed class LibztUnderlayDiagnostics(Func<long>? clock = null)
         15 => "core_rendezvous_authenticated",
         16 => "core_upstream_online_decision",
         17 => "core_peer_path_learned",
+        18 => "core_echo_sent",
+        19 => "core_ok_echo_authenticated",
+        20 => "core_rendezvous_source",
+        21 => "core_surface_observed",
+        22 => "core_surface_previous",
+        23 => "core_peer_probe_or_path_removed",
+        24 => "core_memorized_path_lookup",
+        25 => "core_unknown_path_confirmation",
+        26 => "core_switch_route_selected",
+        27 => "core_upstream_probe_scheduler",
+        28 => "core_scope_path_invalidated",
+        29 => "core_surface_expired",
         _ => "unknown"
     };
 

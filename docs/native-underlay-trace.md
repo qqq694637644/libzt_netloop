@@ -22,6 +22,11 @@ Native `0006-native-underlay-trace.patch`、`0007-core-underlay-socket-trace.pat
 写入 JSONL `libzt_native_underlay_trace`。
 丢弃时记录 `libzt_native_underlay_records_dropped`，不阻塞 TCP 业务以等待日志。
 
+本 PR 后续增量补丁 `libzt/0008-recovery-decision-trace.patch` 和
+`zerotierone/0002-netloop-recovery-decision-trace.patch` 进一步捕获
+ECHO 往返、RENDEZVOUS 的来源、路由回退和 NAT 映射变化的决策证据。
+**它们不改变定时器、Peer 选路、路径过期规则或发包数量。**
+
 | kind | 捕获点 | 关键字段及含义 |
 | --- | --- | --- |
 | `network_refresh_queued` | Native 收到网络变化请求 | 请求时间，即使被合并亦各自记录 |
@@ -40,12 +45,26 @@ Native `0006-native-underlay-trace.patch`、`0007-core-underlay-socket-trace.pat
 | `core_rendezvous_authenticated` | core 收到已认证的上游 RENDEZVOUS 指示 | `peer_id` 为被介绍的节点、`endpoint` 为上游通告的候选 IP:port；`result=1` 允许并尝试、`0` 过滤拒绝、`-1` 无已知 Peer、`-2` 地址无效 |
 | `core_upstream_online_decision` | ZeroTierOne 自己计算 ONLINE/OFFLINE，状态变化或离线期间定期记录 | `last_upstream_receive_native_ms` 为 core 收到任一配置上游的最后时刻、`upstream_age_ms` 为计算得到的年龄；`reason_flags` 为 `1=online`、`2=status_transition`、`4=am_upstream`、`8=received_upstream_before` |
 | `core_peer_path_learned` | 身份已验证的 Peer 响应被 core 采用为新的直接路径时 | `peer_id`、`endpoint`、`packet_id`、`result` 为路径槽索引 |
+| `core_echo_sent` | `Peer::attemptToContactAt` 在使用 ECHO 而非 HELLO 时 | `peer_id`、`packet_id`、候选 `endpoint`、`result=1/0` 是本机提交成功/失败 |
+| `core_ok_echo_authenticated` | `IncomingPacket::_doOK` 处理已验证且有对应待答请求的 OK(ECHO) | `echo_request_packet_id` 与 ECHO 请求对应；它不等于 Overlay TCP 已连接 |
+| `core_rendezvous_source` | `_doRENDEZVOUS` 处理已验证的介绍报文 | `peer_id` 是**发送介绍的上游 Node**；`endpoint` 是收到介绍的上游物理地址；`reason_flags & 1` 表示该节点被认为是上游。和 `core_rendezvous_authenticated` 通过相同 `packet_id` 关联候选端点 |
+| `core_surface_observed` / `core_surface_previous` | `SelfAwareness::iam` 从 HELLO/OK 学到公网映射新值或变化 | 相同 `surface_observation_native_ms`、`peer_id`（上报者）关联新旧映射。flags 位：`1=trusted`、`2=known_before`、`4=public_IP_changed`、`8=public_port_changed`、`16=scope_path_reset_triggered`；`result` 为旧观测年龄毫秒，首次记录为 -1 |
+| `core_peer_probe_or_path_removed` | `Peer::doPingAndKeepalive` 尝试旧路径、或因过期/优先级删除路径 | `endpoint` 是已知 Peer 路径，`peer_path_last_receive_native_ms` 是最后有效收包时间，`result` 是路径收包年龄；flags `1=full_HELLO`、`2=heartbeat`、`4=expired_removed`、`8=lower_priority_removed`、`16=no_probe_sent`、`32=path_alive`。仅 `16` 表示整轮无探测时，reference 是当前时间而非路径收包时刻 |
+| `core_memorized_path_lookup` | `Peer::tryMemorizedPath` 每到重试期限调用外部地址查询 | `result=1` 命中，`0` 无保存候选；`endpoint` 为命中的候选地址，`memorized_lookup_native_ms` 为调用时刻 |
+| `core_unknown_path_confirmation` | Core 收到已认证的非 OK 报文，但该物理路径尚未获准直接采用 | `reason_flags=0` 本次发起确认 HELLO，`1` 因最近 1 秒对同一路径已经尝试而跳过；`result` 为原始 ZeroTier verb |
+| `core_switch_route_selected` | `Switch::_trySend` 对具体目标选择的物理下一跳 | `peer_id` 是**逻辑目的节点**；`endpoint` 是**真正选择的下一跳地址**；flags `1=nonexpired_peer_path`、`2=upstream_relay`、`4=expired_peer_fallback`、`8=no_route`、`16=unknown_peer`。每个目的约 5 秒一条，路径/选择变化则立即记录；`result` 是 ZeroTier verb |
+| `core_upstream_probe_scheduler` | `Node::_PingPeersThatNeedPing` 判断是否暂缓或尝试上游心跳 | `peer_id` 为 Planet/Root、`last_upstream_full_hello_native_ms` 为上轮 HELLO；flags `1=suppressed_by_timer`、`2=has_remembered_path`、`8=attempted_contact`。若 flag1，`result` 是距下一轮允许探测的毫秒数，否则是 Peer ping 的 IPv4/IPv6 发送位掩码。每 Root 约 15 秒采样 |
+| `core_scope_path_invalidated` | SelfAwareness 确定公网 IP 改变而准备清除同 scope 旧路径 | `endpoint` 为即将失效的旧路径；不涉及强制重建 libzt |
+| `core_surface_expired` | `SelfAwareness::clean` 删除过期的公网映射记录 | `surface_last_seen_native_ms` 是最后的映射更新时间；`result` 是映射年龄毫秒 |
 
 两个 UDP 事件新增 `local_endpoint`、`physical_interface`：
 由 libzt Binder 在**真正选中并操作每个 UDP socket 时**读取，不是由目的地址猜出。
 当 core 要求从所有绑定 UDP socket 发送时，每个 socket 有自己独立的发送记录；
 日志对每个 `peer + 方向 + 对端/本地端点 + 接口` 每秒抽样一次。
 接口名可能为空（例如 Binder 未能枚举、使用通配 `0.0.0.0/::` 绑定）。
+新补丁也修复了 Windows Binder 原先虽然读到 FriendlyName、却存入空字符串的
+诊断缺陷；`physical_interface` 优先展示本地绑定的 Windows 网卡友好名称，
+但不保证是该次 `sendto` 最终经过的外发网卡。
 本地绑定不等于 OS 路由的最终出站接口，也不等于 NAT 公网地址，不能据此声称
 报文已抵达网关或对端。
 
@@ -75,6 +94,33 @@ Planet 快照只提供现有 core Peer 路径信息；新增的
 “Planet 服务故障”或“某条公网 IPv6 路由丢包”。
 端口也是本机实际 UDP Binder 地址，而不是路由器公网 NAT 映射。
 因此本 PR 是调查工具，不把“226 秒周期”视为已修复。
+
+## 2026-10-12 高浏览器负载复现与下一次判定
+
+10:28:59～10:31:57 UTC，A→B 探针首次失败到恢复成功请求相隔约
+175.6 秒，A 独立公网通道此间基本正常。A 的 487 条 SOCKS 请求中
+存在约 370 条准入队列拒绝/等太久，B 无容量拒绝。
+Native 侧 A/B 长时间重复使用旧候选端点，直到 10:31:57 认证路径恢复。
+但仅凭这一轮**不能证明浏览器负载改变了 core 调度速度**，
+也不能认定公共路由器 NAT 或 Planet 一定故障。
+
+下一次同时保留高负载 A 与 B 的 Native 日志，按同一 Peer ID 和
+`native_timestamp_utc` 聚合：
+
+1. `core_switch_route_selected` 的 flag 是否持续为旧 Direct(1)、
+   Root(2) 或过期 Peer(4)；若有无路径(8)，检查上游是否可用。
+2. `core_upstream_probe_scheduler` 是否长期被计时器压制，及
+   `core_peer_probe_or_path_removed` 对旧路径的年龄和删除原因。
+3. 对同一 `packet_id`，按 `core_rendezvous_source` →
+   `core_rendezvous_authenticated`，定位是哪个上游仍然推荐旧端点；
+   查看 `core_surface_observed` 有没有仅公网端口变化、却没触发
+   scope reset（flag8 有、flag16 无）。
+4. `core_echo_sent` → 对端 `wire_udp_received` →
+   `core_ok_echo_authenticated`，并结合已有 HELLO/OK 日志，
+   判断是 UDP 物理丢失还是协议层未采纳回复。**Wire 仍是限频采样，
+   不能把缺失的 Wire 采样等同于未收到任何数据包。**
+
+此版本**仅修复 Windows 网卡名称日志缺失**，没有修改 libzt Peer 恢复算法。
 
 ## 人工观测（A + B）
 

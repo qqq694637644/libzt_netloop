@@ -164,7 +164,19 @@ internal static class Program
                 && LibztUnderlayDiagnostics.NativeKind(14) == "core_rendezvous_sent"
                 && LibztUnderlayDiagnostics.NativeKind(15) == "core_rendezvous_authenticated"
                 && LibztUnderlayDiagnostics.NativeKind(16) == "core_upstream_online_decision"
-                && LibztUnderlayDiagnostics.NativeKind(17) == "core_peer_path_learned",
+                && LibztUnderlayDiagnostics.NativeKind(17) == "core_peer_path_learned"
+                && LibztUnderlayDiagnostics.NativeKind(18) == "core_echo_sent"
+                && LibztUnderlayDiagnostics.NativeKind(19) == "core_ok_echo_authenticated"
+                && LibztUnderlayDiagnostics.NativeKind(20) == "core_rendezvous_source"
+                && LibztUnderlayDiagnostics.NativeKind(21) == "core_surface_observed"
+                && LibztUnderlayDiagnostics.NativeKind(22) == "core_surface_previous"
+                && LibztUnderlayDiagnostics.NativeKind(23) == "core_peer_probe_or_path_removed"
+                && LibztUnderlayDiagnostics.NativeKind(24) == "core_memorized_path_lookup"
+                && LibztUnderlayDiagnostics.NativeKind(25) == "core_unknown_path_confirmation"
+                && LibztUnderlayDiagnostics.NativeKind(26) == "core_switch_route_selected"
+                && LibztUnderlayDiagnostics.NativeKind(27) == "core_upstream_probe_scheduler"
+                && LibztUnderlayDiagnostics.NativeKind(28) == "core_scope_path_invalidated"
+                && LibztUnderlayDiagnostics.NativeKind(29) == "core_surface_expired",
             "Native trace kinds must remain compatible across builds");
         Require(LibztUnderlayDiagnostics.NativeKind(200) == "unknown",
             "Unknown native trace kind must remain safe");
