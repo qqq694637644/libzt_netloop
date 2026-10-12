@@ -1,0 +1,13 @@
+diff --git a/src/NodeService.cpp b/src/NodeService.cpp
+index afb98bc..ef766f3 100644
+--- a/src/NodeService.cpp
++++ b/src/NodeService.cpp
+@@ -369,7 +369,7 @@ void NodeService::nodeNetLoopCoreTrace(
+ {
+     // Distinct event namespace from unverified socket-level wire headers.
+     // No encrypted packet content crosses this callback.
+-    if (kind < 10 || kind > 29)
++    if (kind < 10 || kind > 31)
+         return;
+ 
+     if (kind == 26 || kind == 27) {

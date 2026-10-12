@@ -178,7 +178,8 @@ internal static class Program
                 && LibztUnderlayDiagnostics.NativeKind(27) == "core_upstream_probe_scheduler"
                 && LibztUnderlayDiagnostics.NativeKind(28) == "core_scope_path_invalidated"
                 && LibztUnderlayDiagnostics.NativeKind(29) == "core_surface_expired"
-                && LibztUnderlayDiagnostics.NativeKind(30) == "core_handover_peer_paths_revalidated",
+                && LibztUnderlayDiagnostics.NativeKind(30) == "core_handover_peer_paths_revalidated"
+                && LibztUnderlayDiagnostics.NativeKind(31) == "core_handover_whois_decision",
             "Native trace kinds must remain compatible across builds");
         Require(LibztUnderlayDiagnostics.NativeKind(200) == "unknown",
             "Unknown native trace kind must remain safe");

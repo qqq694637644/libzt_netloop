@@ -1,0 +1,69 @@
+diff --git a/node/Node.cpp b/node/Node.cpp
+index 214501d60..6d0c7981b 100644
+--- a/node/Node.cpp
++++ b/node/Node.cpp
+@@ -729,7 +729,7 @@ unsigned int Node::revalidatePeerPathsAfterNetworkChange(void *tptr,int64_t now)
+ 		}
+ 		// Keep upstreams/root paths untouched for rendezvous and relay fallback.
+ 		// The existing WHOIS scheduler bounds repeat requests to each leaf.
+-		RR->sw->requestWhois(tptr,now,p->first);
++		RR->sw->requestWhois(tptr,now,p->first,true);
+ 		++scheduled;
+ 	}
+ 	return scheduled;
+diff --git a/node/Switch.cpp b/node/Switch.cpp
+index ee18dfcae..03b694d9d 100644
+--- a/node/Switch.cpp
++++ b/node/Switch.cpp
+@@ -946,9 +946,11 @@ void Switch::send(void *tPtr,Packet &packet,bool encrypt,int32_t flowId)
+ 	}
+ }
+ 
+-void Switch::requestWhois(void *tPtr,const int64_t now,const Address &addr)
++void Switch::requestWhois(void *tPtr,const int64_t now,const Address &addr,bool traceHandoverDecision)
+ {
+ 	if (addr == RR->identity.address()) {
++		if (traceHandoverDecision)
++			RR->node->netloopTrace(tPtr,31,addr.toInt(),(uint64_t)now,1U,-2);
+ 		return;
+ 	}
+ 
+@@ -956,6 +958,10 @@ void Switch::requestWhois(void *tPtr,const int64_t now,const Address &addr)
+ 		Mutex::Lock _l(_lastSentWhoisRequest_m);
+ 		int64_t &last = _lastSentWhoisRequest[addr];
+ 		if ((now - last) < ZT_WHOIS_RETRY_DELAY) {
++			// Trace this decision only for the explicit host-handover
++			// caller. Normal WHOIS retries are deliberately not logged.
++			if (traceHandoverDecision)
++				RR->node->netloopTrace(tPtr,31,addr.toInt(),(uint64_t)now,1U,0);
+ 			return;
+ 		} else {
+ 			last = now;
+@@ -964,10 +970,14 @@ void Switch::requestWhois(void *tPtr,const int64_t now,const Address &addr)
+ 
+ 	const SharedPtr<Peer> upstream(RR->topology->getUpstreamPeer());
+ 	if (upstream) {
++		if (traceHandoverDecision)
++			RR->node->netloopTrace(tPtr,31,addr.toInt(),(uint64_t)now,1U,1);
+ 		int32_t flowId = ZT_QOS_NO_FLOW;
+ 		Packet outp(upstream->address(),RR->identity.address(),Packet::VERB_WHOIS);
+ 		addr.appendTo(outp);
+ 		send(tPtr,outp,true,flowId);
++	} else if (traceHandoverDecision) {
++		RR->node->netloopTrace(tPtr,31,addr.toInt(),(uint64_t)now,1U,-1);
+ 	}
+ }
+ 
+diff --git a/node/Switch.hpp b/node/Switch.hpp
+index 83ba306b2..cf78342cc 100644
+--- a/node/Switch.hpp
++++ b/node/Switch.hpp
+@@ -180,7 +180,7 @@ public:
+ 	 * @param now Current time
+ 	 * @param addr Address to look up
+ 	 */
+-	void requestWhois(void *tPtr,const int64_t now,const Address &addr);
++	void requestWhois(void *tPtr,const int64_t now,const Address &addr,bool traceHandoverDecision = false);
+ 
+ 	/**
+ 	 * Run any processes that are waiting for this peer's identity

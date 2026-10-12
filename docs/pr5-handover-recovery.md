@@ -38,6 +38,51 @@ handshake or overlay reachability assertion. Existing
 `core_scope_path_invalidated` (kind 28) and authenticated HELLO/ECHO traces
 supply the more detailed per-path evidence.
 
+### Single-Flight regression and targeted native forensic trace
+
+The Windows Single-Flight experiment in commit `63f8490` was **reverted** after
+an A/B handover with the browser load and probe showed no post-handover A→B
+success during the observed failure window. Local admissions stayed at
+`InFlight=1, Waiting=0, Rejected=0, Recovering=true`; `peer_queue_full` was
+not the failure mode. Single-Flight cannot manufacture a reachable ZeroTier
+Peer path, and its one-dial gate could only reduce connection attempt capacity
+while the underlying route was broken. This observation does **not** prove
+that Single-Flight caused the underlying Peer path failure: it is an unsafe
+recovery policy until a controlled A/B comparison shows a benefit.
+
+Native evidence in that run (2026-10-12 UTC): A observed a new IPv6 surface
+(`240e:b8f:…`) at 23:02:44, but B was still receiving authenticated
+Root/Planet RENDEZVOUS suggestions for A's **previous** `2408:840d:…`
+IPv6 and `116.231.169.84:24746` IPv4 at 23:03:03 and 23:03:34. B kept
+probing these obsolete endpoints while A fell back to upstream relay routing.
+The missing piece is *why* those Root-supplied suggestions remained stale:
+the available leaf logs do not expose Root's internal address record or
+prove if/when Root learned A's new physical endpoint.
+
+To bound the next investigation without increasing wire traffic, native
+`core_handover_whois_decision` **kind 31** logs only WHOIS decisions directly
+requested by the existing post-Binder leaf revalidation call (maximum 32 peers
+per network-change callback). Fields:
+
+| Field | Meaning |
+| --- | --- |
+| `peer_id` | Leaf whose identity WHOIS was requested |
+| `reason_flags=1` | Explicit physical-handover caller |
+| `result=1` | WHOIS packet submitted to Switch for upstream transmission (not proof it arrived) |
+| `result=0` | Suppressed by `ZT_WHOIS_RETRY_DELAY` |
+| `result=-1` | No upstream available |
+| `result=-2` | Self-address (skipped) |
+| `reference` | Native monotonic timestamp of the decision |
+
+WHOIS requests the Peer **identity**, not an immediate physical endpoint
+update or a guaranteed RENDEZVOUS. Interpret kind 31 together with existing
+`core_rendezvous_authenticated` (15, candidate/acceptance),
+`core_rendezvous_source` (20, upstream sender), Root HELLO/OK (10/13),
+`core_surface_observed` (21) and `core_peer_path_learned` (17) on **both** A
+and B. There are **no** new background probes, packet payloads, raw secrets,
+changed timer constants, additional sockets, or modified selection algorithms.
+The underlay ABI remains version 2, 240 bytes.
+
 ## Verify with the existing probe
 
 Use the **existing** `tools/connection_probe.ps1` from the project. Do not
@@ -82,10 +127,11 @@ been demonstrated**.
 
 ## Regression / build boundaries
 
-The episode-only update was requested for Windows PR #5 with **no tests run**;
-the real recovery effect and repeated-reset suppression are not yet measured
-on A/B machines. The existing `connection_probe.ps1` is unchanged, and this
-step does not add Peer Dial single-flight or change ZeroTierOne path policy.
+User A/B logs later confirmed that the Windows episode update suppressed
+repeated destructive Runtime resets; other native link failure remains
+possible. The Single-Flight experiment was reverted. Existing
+`connection_probe.ps1` is unchanged, and this diagnostic addition neither
+changes Core forwarding/path policy nor promises faster real-world recovery.
 
 Run C# offline checks, Python offline checks and the **Windows x64 CI build**
 from the updated patches. Linux and Android workflows are not part of this PR #5
