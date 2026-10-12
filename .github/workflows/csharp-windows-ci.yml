@@ -54,7 +54,8 @@ jobs:
           $peerEventPatch = git hash-object patches/libzt/0003-peer-event-details.patch
           $cidrPatch = git hash-object patches/libzt/0004-network-cidr-queries.patch
           $portsPatch = git hash-object patches/libzt/0005-underlay-port-diagnostics.patch
-          "key=libzt-pinvoke-win-x64-$libzt-$cmake-$script-$networkRefreshPatch-$peerEventPatch-$cidrPatch-$portsPatch" >> $env:GITHUB_OUTPUT
+          $nativeTracePatch = git hash-object patches/libzt/0006-native-underlay-trace.patch
+          "key=libzt-pinvoke-win-x64-$libzt-$cmake-$script-$networkRefreshPatch-$peerEventPatch-$cidrPatch-$portsPatch-$nativeTracePatch" >> $env:GITHUB_OUTPUT
 
       - name: Restore compiled libzt bundle
         id: native-cache
@@ -93,6 +94,9 @@ jobs:
             throw "Native library manifest is missing"
           }
           Get-Content native-cache/libzt.dll.manifest.json
+
+      - name: Validate native underlay trace ABI (no Node start)
+        run: python ci/test_native_underlay_trace.py native-cache/libzt.dll
 
       - name: Save compiled libzt bundle immediately
         if: steps.native-cache.outputs.cache-hit != 'true'

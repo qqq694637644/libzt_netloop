@@ -7,6 +7,19 @@ namespace NetLoop.Libzt;
 /// </summary>
 internal sealed class LibztUnderlayDiagnostics(Func<long>? clock = null)
 {
+    internal static string NativeKind(uint kind) => kind switch
+    {
+        1 => "network_refresh_queued",
+        2 => "binder_refresh_started",
+        3 => "binder_refresh_completed",
+        4 => "peer_path_checked",
+        5 => "wire_udp_sent",
+        6 => "wire_udp_received",
+        7 => "node_phase",
+        8 => "planet_path_snapshot",
+        _ => "unknown"
+    };
+
     private readonly Func<long> _clock = clock ?? (() => Environment.TickCount64);
     private readonly object _gate = new();
     private readonly Dictionary<ulong, (short Change, long When)> _peers = [];

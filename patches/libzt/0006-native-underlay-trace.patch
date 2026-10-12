@@ -1,0 +1,376 @@
+diff --git a/include/ZeroTierSockets.h b/include/ZeroTierSockets.h
+index 0bf5401..c17a142 100644
+--- a/include/ZeroTierSockets.h
++++ b/include/ZeroTierSockets.h
+@@ -1730,6 +1730,33 @@ ZTS_API int ZTCALL zts_node_get_port();
+  */
+ ZTS_API int ZTCALL zts_netloop_get_bound_udp_ports(uint16_t* primary, uint16_t* secondary);
+ 
++/**
++ * NetLoop read-only underlay trace. Version 1, fixed 112-byte ABI layout.
++ * Kinds: 1=network-refresh-queued, 2=binder-start, 3=binder-complete,
++ * 4=path-check, 5=wire-tx, 6=wire-rx, 7=node-phase, 8=planet-snapshot.
++ *
++ * UDP wire IDs are unverified header observations, NOT authenticated peer
++ * identity or decoded protocol verbs. No packet contents are retained.
++ * Returns 1 if an event was read, 0 if empty, negative ZTS_ERR_* on error.
++ * dropped_total is cumulative and also populated when the queue is empty.
++ */
++typedef struct zts_netloop_underlay_event {
++    int64_t timestamp_ms;
++    uint64_t peer_id;
++    uint64_t reference;
++    uint32_t kind;
++    uint32_t flags;
++    uint32_t byte_count;
++    int32_t result;
++    uint16_t primary_port;
++    uint16_t secondary_port;
++    uint16_t previous_secondary_port;
++    uint16_t reserved;
++    char endpoint[64];
++} zts_netloop_underlay_event_t;
++ZTS_API int ZTCALL zts_netloop_poll_underlay_event(
++    zts_netloop_underlay_event_t* event, uint64_t* dropped_total);
++
+ /**
+  * @brief Notify the node that the host's physical network changed.
+  *
+diff --git a/src/Controls.cpp b/src/Controls.cpp
+index 07f6a3f..8e932aa 100644
+--- a/src/Controls.cpp
++++ b/src/Controls.cpp
+@@ -642,6 +642,15 @@ int zts_netloop_get_bound_udp_ports(uint16_t* primary, uint16_t* secondary)
+     return ZTS_ERR_OK;
+ }
+ 
++int zts_netloop_poll_underlay_event(
++    zts_netloop_underlay_event_t* event, uint64_t* dropped_total)
++{
++    if (!event || !dropped_total)
++        return ZTS_ERR_ARG;
++    ACQUIRE_SERVICE(ZTS_ERR_SERVICE);
++    return zts_service->pollUnderlayEvent(event, dropped_total);
++}
++
+ int zts_node_network_changed()
+ {
+     ACQUIRE_SERVICE(ZTS_ERR_SERVICE);
+diff --git a/src/NodeService.cpp b/src/NodeService.cpp
+index 3925158..8c8b730 100644
+--- a/src/NodeService.cpp
++++ b/src/NodeService.cpp
+@@ -41,6 +41,9 @@
+ 
+ namespace ZeroTier {
+ 
++static_assert(sizeof(zts_netloop_underlay_event_t) == 112,
++              "NetLoop underlay trace ABI size must remain 112 bytes");
++
+ static int SnodeVirtualNetworkConfigFunction(
+     ZT_Node* node,
+     void* uptr,
+@@ -211,6 +214,126 @@ NodeService::~NodeService()
+ #endif
+ }
+ 
++// Only the unencrypted ZeroTier header is inspected. Packet IDs and source/
++// destination Node IDs are not authenticated by this trace and must not be
++// treated as verified application or Peer control-plane messages.
++static uint64_t netloopReadWireInteger(const unsigned char* bytes, unsigned int count)
++{
++    uint64_t value = 0;
++    for (unsigned int i = 0; i < count; ++i)
++        value = (value << 8) | bytes[i];
++    return value;
++}
++
++void NodeService::recordUnderlay(
++    uint32_t kind, uint64_t peerId, uint64_t reference, uint32_t flags,
++    uint32_t byteCount, int32_t result, const struct sockaddr_storage* endpoint,
++    uint16_t previousSecondary)
++{
++    zts_netloop_underlay_event_t event = {};
++    event.timestamp_ms = OSUtils::now();
++    event.peer_id = peerId;
++    event.reference = reference;
++    event.kind = kind;
++    event.flags = flags;
++    event.byte_count = byteCount;
++    event.result = result;
++    const unsigned int ports = _boundUdpPortSnapshot.load(std::memory_order_acquire);
++    event.primary_port = static_cast<uint16_t>(ports >> 16);
++    event.secondary_port = static_cast<uint16_t>(ports & 0xffff);
++    event.previous_secondary_port = previousSecondary;
++    if (endpoint)
++        reinterpret_cast<const InetAddress*>(endpoint)->toString(event.endpoint);
++
++    Mutex::Lock _l(_underlayTrace_m);
++    if (_underlayTrace.size() == 512) {
++        _underlayTrace.pop_front();
++        ++_underlayTraceDropped;
++    }
++    _underlayTrace.push_back(event);
++}
++
++int NodeService::pollUnderlayEvent(
++    zts_netloop_underlay_event_t* event, uint64_t* droppedTotal)
++{
++    Mutex::Lock _l(_underlayTrace_m);
++    *droppedTotal = _underlayTraceDropped;
++    if (_underlayTrace.empty())
++        return 0;
++    *event = _underlayTrace.front();
++    _underlayTrace.pop_front();
++    return 1;
++}
++
++void NodeService::traceUnderlayWire(
++    uint32_t kind, const struct sockaddr_storage* endpoint,
++    const void* data, unsigned int len, int32_t result)
++{
++    // Skip ZeroTier fragment headers and malformed/short packets. These are
++    // observations at the physical socket boundary, before authentication.
++    if (!data || !endpoint || len < 28)
++        return;
++    const unsigned char* bytes = static_cast<const unsigned char*>(data);
++    if (bytes[13] == 0xff)
++        return;
++    const uint64_t peer = netloopReadWireInteger(bytes + (kind == 5 ? 8 : 13), 5);
++    if (!peer)
++        return;
++
++    char remote[64] = { 0 };
++    reinterpret_cast<const InetAddress*>(endpoint)->toString(remote);
++    const int64_t now = OSUtils::now();
++    bool logPacket = false;
++    {
++        Mutex::Lock _l(_underlayTrace_m);
++        const uint64_t key = (peer << 1) | (kind == 6 ? 1 : 0);
++        std::map<uint64_t, std::pair<int64_t, std::string> >::iterator last =
++            _underlayWireSamples.find(key);
++        if (last == _underlayWireSamples.end()
++            || last->second.second != remote
++            || now - last->second.first >= 1000
++            || result < 0) {
++            if (last == _underlayWireSamples.end() && _underlayWireSamples.size() >= 64)
++                _underlayWireSamples.clear();
++            _underlayWireSamples[key] = std::make_pair(now, std::string(remote));
++            logPacket = true;
++        }
++    }
++    if (logPacket) {
++        recordUnderlay(
++            kind, peer, netloopReadWireInteger(bytes, 8),
++            bytes[18], len, result, endpoint);
++    }
++}
++
++void NodeService::tracePlanetSnapshot()
++{
++    ZT_PeerList* const peers = _node->peers();
++    unsigned int roots = 0;
++    if (peers) {
++        for (unsigned long i = 0; i < peers->peerCount && roots < 8; ++i) {
++            const ZT_Peer& peer = peers->peers[i];
++            if (peer.role != ZT_PEER_ROLE_PLANET)
++                continue;
++            ++roots;
++            uint64_t newestReceive = 0;
++            const struct sockaddr_storage* newestPath = 0;
++            for (unsigned int p = 0; p < peer.pathCount && p < ZTS_MAX_PEER_NETWORK_PATHS; ++p) {
++                if (peer.paths[p].lastReceive >= newestReceive) {
++                    newestReceive = peer.paths[p].lastReceive;
++                    newestPath = &peer.paths[p].address;
++                }
++            }
++            recordUnderlay(
++                8, peer.address, newestReceive, peer.pathCount, 0,
++                _node->online() ? 1 : 0, newestPath);
++        }
++        _node->freeQueryResult((void*)peers);
++    }
++    if (!roots)
++        recordUnderlay(8, 0, 0, 0, 0, _node->online() ? 1 : 0);
++}
++
+ NodeService::ReasonForTermination NodeService::run()
+ {
+     _run = true;
+@@ -360,6 +483,7 @@ NodeService::ReasonForTermination NodeService::run()
+         int64_t lastTapMulticastGroupCheck = 0;
+         int64_t lastBindRefresh = 0;
+         int64_t lastCleanedPeersDb = 0;
++        int64_t lastPlanetSnapshot = 0;
+         int64_t lastOnline = OSUtils::now();
+         for (;;) {
+             bool networkChanged = false;
+@@ -395,6 +519,18 @@ NodeService::ReasonForTermination NodeService::run()
+             // and also sync routes to update any shadow routes (e.g. shadow
+             // default)
+             if (((now - lastBindRefresh) >= ZT_BINDER_REFRESH_PERIOD) || (restarted)) {
++                // Preserve the reason for this refresh; an OS notification
++                // may coincide with an overdue periodic refresh.
++                uint32_t reason = (networkChanged ? 1U : 0U)
++                    | (restarted && !networkChanged ? 2U : 0U)
++                    | ((now - lastBindRefresh) >= ZT_BINDER_REFRESH_PERIOD ? 4U : 0U)
++                    | (!_node->online() ? 16U : 0U);
++                const unsigned int oldBoundPorts =
++                    _boundUdpPortSnapshot.load(std::memory_order_acquire);
++                const uint16_t oldSecondary = static_cast<uint16_t>(oldBoundPorts & 0xffff);
++                const int64_t binderStart = OSUtils::now();
++                recordUnderlay(2, 0, binderStart, reason, 0, _node->online() ? 1 : 0,
++                               0, oldSecondary);
+                 // ZeroTierOne 5542dbcc0 moved secondary-port rotation into the
+                 // binder refresh cadence so a node does not keep changing
+                 // ports before the new mapping has had a chance to connect.
+@@ -436,6 +572,11 @@ NodeService::ReasonForTermination NodeService::run()
+                 _boundUdpPortSnapshot.store(
+                     ((primaryBound & 0xffff) << 16) | (secondaryBound & 0xffff),
+                     std::memory_order_release);
++                if (oldSecondary != secondaryBound)
++                    reason |= 8U;
++                recordUnderlay(3, 0, binderStart, reason,
++                               static_cast<uint32_t>(bound.size()),
++                               primaryBound ? 1 : 0, 0, oldSecondary);
+ 
+                 // Keep the core's view of local physical interfaces in sync
+                 // with the freshly rebound sockets. This mirrors ZeroTierOne
+@@ -469,6 +610,13 @@ NodeService::ReasonForTermination NodeService::run()
+ 
+             // Generate callback messages for user application
+             generateSyntheticEvents();
++            // Root-path snapshots are observations, not online policy or
++            // additional connectivity probes. Keep the offline cadence low.
++            if ((networkChanged || now - lastPlanetSnapshot >= 15000)
++                && (!_node->online() || networkChanged)) {
++                tracePlanetSnapshot();
++                lastPlanetSnapshot = now;
++            }
+ 
+             // Run background task processor in core if it's time to do so
+             int64_t dl = _nextBackgroundTaskDeadline;
+@@ -608,6 +756,7 @@ void NodeService::networkChanged()
+         _networkChangeRequested = true;
+         _nextBackgroundTaskDeadline = 0;
+     }
++    recordUnderlay(1);
+     _phy.whack();
+ }
+ 
+@@ -696,6 +845,9 @@ void NodeService::phyOnDatagram(
+         data,
+         len,
+         &_nextBackgroundTaskDeadline);
++    traceUnderlayWire(
++        6, reinterpret_cast<const struct sockaddr_storage*>(from), data,
++        static_cast<unsigned int>(len), static_cast<int32_t>(rc));
+     if (ZT_ResultCode_isFatal(rc)) {
+         char tmp[256] = { 0 };
+         OSUtils::ztsnprintf(tmp, sizeof(tmp), "fatal error code from processWirePacket: %d", (int)rc);
+@@ -987,6 +1139,9 @@ void NodeService::nodeEventCallback(enum ZT_Event event, const void* metaData)
+             break;
+     }
+     if (event_code) {
++        if (event == ZT_EVENT_ONLINE || event == ZT_EVENT_OFFLINE)
++            recordUnderlay(7, 0, _lastDirectReceiveFromGlobal,
++                           event == ZT_EVENT_ONLINE ? 1U : 0U, 0, event_code);
+         sendEventToUser(event_code, NULL);
+     }
+ }
+@@ -1918,17 +2073,20 @@ int NodeService::nodeWirePacketSendFunction(
+     // working we can instantly "fail forward" to it and stop using TCP
+     // proxy fallback, which is slow.
+ 
++    int sent = -1;
+     if ((localSocket != -1) && (localSocket != 0) && (_binder.isUdpSocketValid((PhySocket*)((uintptr_t)localSocket)))) {
+         if ((ttl) && (addr->ss_family == AF_INET))
+             _phy.setIp4UdpTtl((PhySocket*)((uintptr_t)localSocket), ttl);
+         const bool r = _phy.udpSend((PhySocket*)((uintptr_t)localSocket), (const struct sockaddr*)addr, data, len);
+         if ((ttl) && (addr->ss_family == AF_INET))
+             _phy.setIp4UdpTtl((PhySocket*)((uintptr_t)localSocket), 255);
+-        return ((r) ? 0 : -1);
++        sent = r ? 0 : -1;
+     }
+     else {
+-        return ((_binder.udpSendAll(_phy, addr, data, len, ttl)) ? 0 : -1);
++        sent = _binder.udpSendAll(_phy, addr, data, len, ttl) ? 0 : -1;
+     }
++    traceUnderlayWire(5, addr, data, len, sent);
++    return sent;
+ }
+ 
+ void NodeService::nodeVirtualNetworkFrameFunction(
+@@ -1964,6 +2122,7 @@ int NodeService::nodePathCheckFunction(
+                 std::vector<InetAddress> ips(n->second.tap->ips());
+                 for (std::vector<InetAddress>::const_iterator i(ips.begin()); i != ips.end(); ++i) {
+                     if (i->containsAddress(*(reinterpret_cast<const InetAddress*>(remoteAddr)))) {
++                        recordUnderlay(4, ztaddr, 0, 0, 0, 0, remoteAddr);
+                         return 0;
+                     }
+                 }
+@@ -1995,6 +2154,7 @@ int NodeService::nodePathCheckFunction(
+         if (l) {
+             for (std::vector<InetAddress>::const_iterator a(l->begin()); a != l->end(); ++a) {
+                 if (a->containsAddress(*reinterpret_cast<const InetAddress*>(remoteAddr))) {
++                    recordUnderlay(4, ztaddr, 0, 0, 0, 0, remoteAddr);
+                     return 0;
+                 }
+             }
+@@ -2003,10 +2163,12 @@ int NodeService::nodePathCheckFunction(
+     if (gbl) {
+         for (std::vector<InetAddress>::const_iterator a(gbl->begin()); a != gbl->end(); ++a) {
+             if (a->containsAddress(*reinterpret_cast<const InetAddress*>(remoteAddr))) {
++                recordUnderlay(4, ztaddr, 0, 0, 0, 0, remoteAddr);
+                 return 0;
+             }
+         }
+     }
++    recordUnderlay(4, ztaddr, 0, 0, 0, 1, remoteAddr);
+     return 1;
+ }
+ 
+diff --git a/src/NodeService.hpp b/src/NodeService.hpp
+index c33e823..75c4897 100644
+--- a/src/NodeService.hpp
++++ b/src/NodeService.hpp
+@@ -32,6 +32,8 @@
+ 
+ #include <string>
+ #include <atomic>
++#include <deque>
++#include <map>
+ #include <vector>
+ 
+ #define ZTS_SERVICE_THREAD_NAME        "ZTServiceThread"
+@@ -199,6 +201,12 @@ class NodeService {
+     std::atomic<unsigned int> _boundUdpPortSnapshot{ 0 };
+     Binder _binder;
+ 
++    // Bounded native trace queue; no managed logging on native I/O callbacks.
++    Mutex _underlayTrace_m;
++    std::deque<zts_netloop_underlay_event_t> _underlayTrace;
++    uint64_t _underlayTraceDropped = 0;
++    std::map<uint64_t, std::pair<int64_t, std::string> > _underlayWireSamples;
++
+     // Time we last received a packet from a global address
+     uint64_t _lastDirectReceiveFromGlobal;
+ 
+@@ -320,6 +328,17 @@ class NodeService {
+ 
+     void nodeEventCallback(enum ZT_Event event, const void* metaData);
+ 
++    void recordUnderlay(
++        uint32_t kind, uint64_t peerId = 0, uint64_t reference = 0,
++        uint32_t flags = 0, uint32_t byteCount = 0, int32_t result = 0,
++        const struct sockaddr_storage* endpoint = 0,
++        uint16_t previousSecondary = 0);
++    void traceUnderlayWire(
++        uint32_t kind, const struct sockaddr_storage* endpoint,
++        const void* data, unsigned int len, int32_t result);
++    void tracePlanetSnapshot();
++    int pollUnderlayEvent(zts_netloop_underlay_event_t* event, uint64_t* droppedTotal);
++
+     zts_net_info_t* prepare_network_details_msg(const NetworkState& n);
+ 
+     void generateSyntheticEvents();

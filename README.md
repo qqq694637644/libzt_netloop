@@ -36,6 +36,11 @@ Controller **direct** routes (no `via` gateway) allow direct peer Agent forwardi
 
 ## Peer P2P / relay diagnostics
 
+For Native Binder timing, sampled physical UDP wire RX/TX, Peer path checks,
+and Planet Root snapshots, see the stacked
+[logPR #4 underlay trace guide](docs/native-underlay-trace.md).
+The native patch is diagnostic-only; it does not accelerate Peer discovery.
+
 NetLoop writes a `libzt_peer_status` JSON log entry whenever libzt reports a
 peer transport/path event (codes 240–244). The entry includes:
 

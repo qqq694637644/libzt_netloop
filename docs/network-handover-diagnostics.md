@@ -1,5 +1,9 @@
 # PR #3：A/B/C 切网与连接风暴的手动定位
 
+PR #4 在此方案之上新增 Native Binder / Wire UDP / Planet
+只读取证时间线，参见 [Native Underlay 诊断日志](native-underlay-trace.md)；
+它不改变本页所述 PR #3 的连接限流和恢复策略。
+
 面向固定个人 ZeroTier 节点：A/C 的本地 SOCKS5 访问 B 默认出口，
 A 可通过 Controller 直连 C 的 SOCKS5 Agent。以下只解释新的诊断和
 人工验收，不安装服务、任务计划或持续探测程序。

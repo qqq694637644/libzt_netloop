@@ -19,6 +19,7 @@ LIBZT_PATCHES = [
     ROOT / "patches" / "libzt" / "0003-peer-event-details.patch",
     ROOT / "patches" / "libzt" / "0004-network-cidr-queries.patch",
     ROOT / "patches" / "libzt" / "0005-underlay-port-diagnostics.patch",
+    ROOT / "patches" / "libzt" / "0006-native-underlay-trace.patch",
 ]
 
 
