@@ -74,6 +74,14 @@ Windows/Linux CLI 可选择：
 --log-file logs/netloop.jsonl --log-max-mb 16 --log-retain 5
 ```
 
+正常长期运行可使用 `--log-level none` 完全禁用 **NetLoop JSONL**
+日志（包括 error）；过滤在 JSON 序列化、入队和控制台/文件写入前执行。
+`--log-level error` 只保留错误；`--log-level info` 为默认，保留全部
+现有诊断。`none` 即使同时指定 `--log-file` 也不会建立该日志文件。
+请同时移除 shell 的 `> A_client.log 2>&1`，否则命令解释器仍会创建
+或截断那个文件。此选项**不禁止** `--state-dir` 中的 ZeroTier identity
+及正常网络状态持久化，也不控制其他进程自身产生的系统日志。
+
 磁盘最多保留一个当前文件和五个后缀文件（`.1` 至 `.5`），
 通常约 96MiB。单条超长记录可轻微超出单文件限制。
 如果磁盘写入失败，会尝试回退至 stdout 并记录错误。

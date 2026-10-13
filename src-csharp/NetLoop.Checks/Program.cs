@@ -51,6 +51,8 @@ internal static class Program
             await CheckAsync("UDP cleanup errors never leak association capacity", UdpFaultyCleanup);
             await CheckAsync("Overlay UDP returns queued bytes after failed Dispose", OverlayFaultyCleanup);
             Check("Removed --status-file CLI is rejected", RemovedStatusOption);
+            Check("CLI log level defaults and invalid values are validated", LogLevelOption);
+            await CheckAsync("JSONL none and error levels suppress unwanted output", JsonLogLevels);
             await CheckAsync("JSONL consumer survives an output failure", JsonLogConsumerSurvives);
             Console.WriteLine($"PASS {_passed} offline tests");
             return 0;
@@ -996,6 +998,97 @@ internal static class Program
             "The supported configuration did not parse after status-file removal");
         Require(!HostOptions.Usage.Contains("--status-file", StringComparison.Ordinal),
             "Removed --status-file is still advertised in --help");
+    }
+
+    private static void LogLevelOption()
+    {
+        string[] common = [
+            "--network", "123456789abcdef0",
+            "--state-dir", "state",
+            "--default-exit", "10.70.0.2"
+        ];
+        Require(HostOptions.Parse(common).LogLevel == JsonLogLevel.Info,
+            "Default log level must preserve existing JSONL behavior");
+        foreach (var (name, level) in new[] {
+            ("none", JsonLogLevel.None),
+            ("error", JsonLogLevel.Error),
+            ("info", JsonLogLevel.Info)
+        })
+        {
+            var options = HostOptions.Parse([..common, "--log-level", name]);
+            Require(options.LogLevel == level,
+                $"CLI --log-level {name} did not parse correctly");
+        }
+        var silentWithFile = HostOptions.Parse([
+            ..common, "--log-level", "none", "--log-file", "ignored.jsonl"
+        ]);
+        Require(silentWithFile.LogLevel == JsonLogLevel.None
+                && silentWithFile.LogFile == "ignored.jsonl",
+            "none must be valid with --log-file; runtime ignores the sink");
+        Throws<ArgumentException>(() => HostOptions.Parse([
+            ..common, "--log-level", "verbose"
+        ]));
+        Throws<ArgumentException>(() => HostOptions.Parse([
+            ..common, "--log-level", "none", "--log-level", "info"
+        ]));
+        Throws<ArgumentException>(() => HostOptions.Parse([
+            ..common, "--log-level"
+        ]));
+        Require(HostOptions.Usage.Contains("--log-level", StringComparison.Ordinal),
+            "--log-level missing from help");
+    }
+
+    private static async Task JsonLogLevels()
+    {
+        var previousOutput = Console.Out;
+        using var capture = new StringWriter();
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        try
+        {
+            await JsonLog.FlushAsync(deadline.Token);
+            Console.SetOut(capture);
+
+            JsonLog.ConfigureLevel(JsonLogLevel.None);
+            Require(!JsonLog.IsEnabled(JsonLogLevel.Info)
+                    && !JsonLog.IsEnabled(JsonLogLevel.Error),
+                "none still enables the JSONL pipeline");
+            JsonLog.Info("hidden_info_none");
+            JsonLog.Error("hidden_error_none");
+            JsonLog.Info("hidden_no_serialization", new ThrowingLogPayload());
+            await JsonLog.FlushAsync(deadline.Token);
+            Require(!capture.ToString().Contains("hidden_", StringComparison.Ordinal),
+                "none emitted JSONL to stdout");
+
+            JsonLog.ConfigureLevel(JsonLogLevel.Error);
+            Require(!JsonLog.IsEnabled(JsonLogLevel.Info)
+                    && JsonLog.IsEnabled(JsonLogLevel.Error),
+                "error filter does not match the expected priority");
+            JsonLog.Info("hidden_info_error", new ThrowingLogPayload());
+            JsonLog.Error("visible_error_only");
+            await JsonLog.FlushAsync(deadline.Token);
+            var errorsOnly = capture.ToString();
+            Require(!errorsOnly.Contains("hidden_info_error", StringComparison.Ordinal)
+                    && errorsOnly.Contains("visible_error_only", StringComparison.Ordinal),
+                "error level did not suppress info or emit error");
+
+            capture.GetStringBuilder().Clear();
+            JsonLog.ConfigureLevel(JsonLogLevel.Info);
+            JsonLog.Info("visible_info_again");
+            await JsonLog.FlushAsync(deadline.Token);
+            Require(capture.ToString().Contains("visible_info_again", StringComparison.Ordinal),
+                "info level did not restore ordinary JSONL output");
+        }
+        finally
+        {
+            JsonLog.ConfigureLevel(JsonLogLevel.Info);
+            Console.SetOut(previousOutput);
+        }
+    }
+
+    private sealed class ThrowingLogPayload
+    {
+        public string Value => throw new InvalidOperationException(
+            "Disabled log levels must not serialize event data");
     }
 
     private static async Task JsonLogConsumerSurvives()

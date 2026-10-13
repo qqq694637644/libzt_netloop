@@ -509,6 +509,11 @@ public sealed class LibztNode : IAsyncDisposable
                         break;
                     }
 
+                    // Keep draining the bounded native ring without
+                    // materializing expensive JSON diagnostics when disabled.
+                    if (!JsonLog.IsEnabled(JsonLogLevel.Info))
+                        continue;
+
                     var kind = LibztUnderlayDiagnostics.NativeKind(sample.Kind);
                     JsonLog.Info("libzt_native_underlay_trace", new {
                         native_timestamp_utc =

@@ -4,6 +4,13 @@ using System.Threading.Channels;
 
 namespace NetLoop.Core;
 
+public enum JsonLogLevel
+{
+    None = 0,
+    Error = 1,
+    Info = 2
+}
+
 public static class JsonLog
 {
     private const int QueueCapacity = 4096;
@@ -21,6 +28,21 @@ public static class JsonLog
     private static long _fileMaxBytes;
     private static int _fileRetained;
     private static int _configured;
+    private static int _level = (int)JsonLogLevel.Info;
+
+    /// <summary>
+    /// Disable routine JSONL output at the source: filtered events are never
+    /// serialized, queued or written to stdout/disk.
+    /// </summary>
+    public static void ConfigureLevel(JsonLogLevel level)
+    {
+        if (level is not (JsonLogLevel.None or JsonLogLevel.Error or JsonLogLevel.Info))
+            throw new ArgumentOutOfRangeException(nameof(level));
+        Volatile.Write(ref _level, (int)level);
+    }
+
+    public static bool IsEnabled(JsonLogLevel level)
+        => level is not JsonLogLevel.None && (int)level <= Volatile.Read(ref _level);
 
     /// <summary>
     /// Optional bounded disk logging. Call before starting libzt. The single
@@ -44,6 +66,9 @@ public static class JsonLog
 
     public static void Write(string level, string eventName, object? data = null)
     {
+        if (!IsEnabled(level == "error" ? JsonLogLevel.Error : JsonLogLevel.Info))
+            return;
+
         var content = new Dictionary<string, object?> {
             ["ts"] = DateTimeOffset.UtcNow,
             ["level"] = level,
@@ -70,6 +95,9 @@ public static class JsonLog
     /// <summary>Drain all queued records written before the flush barrier.</summary>
     public static async Task FlushAsync(CancellationToken cancellationToken = default)
     {
+        if (!IsEnabled(JsonLogLevel.Error))
+            return;
+
         var barrier = new TaskCompletionSource(
             TaskCreationOptions.RunContinuationsAsynchronously);
         await Queue.Writer.WriteAsync(new LogRecord(null, barrier), cancellationToken)

@@ -160,6 +160,14 @@ netloop.exe --network <network-id> --state-dir .\state `
   --log-file .\logs\netloop.jsonl --log-max-mb 16 --log-retain 5
 ```
 
+For normal use after the network has been verified, disable diagnostic JSONL
+completely with `--log-level none` (omit `> A_client.log 2>&1` and
+`--log-file`). `--log-level error` keeps only errors; the default
+`--log-level info` preserves all events. Filtered events are not serialized,
+queued or written by the JSONL logger. `none` also ignores any supplied
+`--log-file`, but **does not** disable necessary libzt Node identity/state
+persistence in `--state-dir` or suppress an external process's logs.
+
 Logging uses a bounded asynchronous queue. If overloaded, look for
 `json_log_records_dropped`. See the
 [long-running reliability guide](docs/reliability-hardening.md) for
