@@ -32,6 +32,37 @@ class NativeCacheKeyTests(unittest.TestCase):
         self.assertEqual(ANDROID_PATCHES[0], LIBZT_PATCHES[0])
         self.assertEqual(len({p.name for p in LIBZT_PATCHES}), len(LIBZT_PATCHES))
 
+    def test_release_native_cache_steps_match_regular_ci(self) -> None:
+        """A release must not hash deleted patches after a patch-chain squash."""
+        workflows = ROOT / ".github" / "workflows"
+        release = (workflows / "release.yml").read_text(encoding="utf-8")
+        windows = (workflows / "csharp-windows-ci.yml").read_text(encoding="utf-8")
+        android = (workflows / "csharp-android-ci.yml").read_text(encoding="utf-8")
+
+        windows_lines = [
+            "$fingerprint = python tools/native_cache_key.py --platform windows --arch x64",
+            "if ($LASTEXITCODE -ne 0) { throw 'Failed to hash native cache inputs' }",
+            '"key=libzt-pinvoke-win-x64-$fingerprint" >> $env:GITHUB_OUTPUT',
+        ]
+        android_lines = [
+            'fingerprint="$(python tools/native_cache_key.py --platform android --arch arm64-v8a --ndk-revision "$ndk_revision")"',
+            'echo "key=libzt-pinvoke-android-arm64-${fingerprint}" >> "$GITHUB_OUTPUT"',
+        ]
+        for line in windows_lines:
+            self.assertIn(line, windows)
+            self.assertIn(line, release)
+        for line in android_lines:
+            self.assertIn(line, android)
+            self.assertIn(line, release)
+
+        for workflow in workflows.glob("*.yml"):
+            source = workflow.read_text(encoding="utf-8")
+            self.assertNotIn("git hash-object patches/", source, workflow.name)
+            for match in re.findall(
+                r"patches/(?:libzt|zerotierone)/[\w-]+\.patch", source
+            ):
+                self.assertTrue((ROOT / match).is_file(), f"{workflow.name}: {match}")
+
 
 if __name__ == "__main__":
     unittest.main()
