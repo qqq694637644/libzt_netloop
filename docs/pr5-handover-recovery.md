@@ -175,6 +175,43 @@ measurements: compare Binder change → Root IPv6 HELLO → authenticated OK →
 B new RENDEZVOUS → successful A→B HTTP using the unchanged probe. Do not
 declare 2-second recovery from offline tests or successful CI alone.
 
+### PR #6 follow-up: Preferred IPv6 and per-Root bounded retry
+
+The first real-world PR #5 fast-HELLO batch attempted four Roots but received
+four `putPacket()` rejections, yet consumed the episode's single fast-probe
+opportunity. Requesting HELLO, accepting a wire send, and **authenticating its
+specific OK(HELLO)** are different milestones. PR #6 fixes that boundary:
+
+- Only **newly bound** global IPv6 IPs (not old unchanged addresses) are
+  eligible. Windows `GetUnicastIpAddressTable(AF_INET6)` must report a matching
+  `IpDadStatePreferred` and `SkipAsSource == false` before the first fast
+  HELLO. A Tentative / Duplicate / Deprecated address, or an IP Helper query
+  failure, defers the fast path rather than guessing the socket is ready.
+  Short-lived local checks (up to 30 seconds after the last OS callback) also
+  catch DAD becoming Preferred without another Binder refresh.
+- `Peer::sendHELLO` now exposes the real `putPacket` acceptance result and
+  outgoing packet ID. Core remembers up to 3 IDs per Root and stops sending
+  to that Root once a **matching, authenticated, direct IPv6 OK(HELLO)**
+  arrives. An accepted send alone cannot establish remote reachability.
+- Per Root (maximum 8 known upstream identities), retry on the initial
+  attempt and at most two bounded opportunities at +500 ms and +1500 ms
+  after the first, stopping at the first matching authentication. An OS
+  address change during the attempts cancels further fast sends; no global
+  HELLO timer, old Root path, Node identity, Relay fallback, or Peer Dial
+  capacity is changed.
+
+| Event | Meaning |
+| --- | --- |
+| `binder_handover_ipv6_dad_state` (37) | `result=4`: preferred and usable source, `1`: Tentative, `2`: Duplicate, `3`: Deprecated, `5`: SkipAsSource; negative values indicate Windows IP Helper error. Only status transitions are logged |
+| `core_handover_root_ipv6_hello_requested` (35) | `result=1/0`: the **actual wire callback** accepted/rejected HELLO; `reference`: packet ID; high `flags` bits encode 1/2/3 attempt |
+| `binder_handover_root_ipv6_hello_batch` (36) | `result`: number of wire-accepted requests in this attempt, `flags` high bits: attempt number, not proof of receipt |
+| `core_handover_root_ipv6_hello_authenticated` (38) | An authenticated direct IPv6 `OK(HELLO)` matched a sent fast-request packet ID and Root identity; this Root is no longer retried |
+
+The existing `core_hello_sent`, surface awareness, RENDEZVOUS and HTTP probe
+complete the evidence chain. This update is **Windows-specific**, keeps the
+underlay trace ABI at 240 bytes, and still requires real A/B validation; the
+root-level Chinese lessons report is `排障经验.md`.
+
 ## Verify with the existing probe
 
 Use the **existing** `tools/connection_probe.ps1` from the project. Do not

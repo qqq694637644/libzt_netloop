@@ -21,6 +21,7 @@ internal sealed class HostOptions
             "--upstream-port",
             "--upstream-user",
             "--upstream-password",
+            "--log-level",
             "--log-file",
             "--log-max-mb",
             "--log-retain",
@@ -53,6 +54,7 @@ internal sealed class HostOptions
     internal ushort UpstreamPort { get; init; } = 1080;
     internal string? UpstreamUsername { get; init; }
     internal string? UpstreamPassword { get; init; }
+    internal JsonLogLevel LogLevel { get; init; } = JsonLogLevel.Info;
     internal string? LogFile { get; init; }
     internal int LogMaxMegabytes { get; init; } = 16;
     internal int LogRetainedFiles { get; init; } = 5;
@@ -142,6 +144,12 @@ internal sealed class HostOptions
         if (egress == "upstream-socks5")
             Socks5Credentials.Validate(upstreamUsername, upstreamPassword);
 
+        var logLevel = Optional(values, "--log-level") switch {
+            null or "info" => JsonLogLevel.Info,
+            "error" => JsonLogLevel.Error,
+            "none" => JsonLogLevel.None,
+            _ => throw new ArgumentException("--log-level must be 'none', 'error', or 'info'.")
+        };
         var logFile = Optional(values, "--log-file");
         var logMaxMb = ParsePositiveInt(Optional(values, "--log-max-mb") ?? "16", "--log-max-mb");
         var logRetain = ParsePositiveInt(Optional(values, "--log-retain") ?? "5", "--log-retain");
@@ -166,6 +174,7 @@ internal sealed class HostOptions
             UpstreamPort = ParsePort(Optional(values, "--upstream-port") ?? "1080", "--upstream-port"),
             UpstreamUsername = upstreamUsername,
             UpstreamPassword = upstreamPassword,
+            LogLevel = logLevel,
             LogFile = logFile,
             LogMaxMegabytes = logMaxMb,
             LogRetainedFiles = logRetain,
@@ -242,7 +251,8 @@ internal sealed class HostOptions
           --upstream-port <port>      Upstream SOCKS5 port (default 1080; upstream mode only)
           --upstream-user <user>      RFC1929 username; requires password
           --upstream-password <pass>  RFC1929 password; requires username
-          --log-file <path>           Optional rotating JSONL file (stdout by default)
+          --log-level <level>         none | error | info (default info; none disables JSONL)
+          --log-file <path>           Optional rotating JSONL file (stdout by default; ignored when none)
           --log-max-mb <MiB>          Maximum file size (default 16, range 1..1024)
           --log-retain <count>        Retained rotated files (default 5, range 1..50)
           --startup-timeout <sec>     libzt startup timeout (default 120)

@@ -23,7 +23,8 @@ internal static class Program
                 return 0;
             }
 
-            if (options.LogFile is not null)
+            JsonLog.ConfigureLevel(options.LogLevel);
+            if (options.LogLevel != JsonLogLevel.None && options.LogFile is not null)
                 JsonLog.ConfigureFile(
                     options.LogFile,
                     options.LogMaxMegabytes,
