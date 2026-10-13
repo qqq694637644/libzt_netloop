@@ -380,7 +380,6 @@ public sealed class LibztNode : IAsyncDisposable
                         await Task.Delay(50, cancellationToken).ConfigureAwait(false);
 
                     var state = RefreshNetworkState();
-                    SampleBoundUdpPorts("native_config_worker");
                     JsonLog.Info("libzt_network_config_refreshed", new {
                         network = _networkId.ToString("x16"),
                         event_code = eventCode,
