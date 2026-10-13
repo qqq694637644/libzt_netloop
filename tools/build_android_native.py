@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import time
+from build_csharp import ZERO_TIER_ONE_PATCHES, apply_zerotierone_patches
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,6 +18,9 @@ PATCHES = [
     ROOT / "patches" / "libzt" / "0003-peer-event-details.patch",
     ROOT / "patches" / "libzt" / "0004-network-cidr-queries.patch",
     ROOT / "patches" / "libzt" / "0005-underlay-port-diagnostics.patch",
+    ROOT / "patches" / "libzt" / "0006-native-underlay-trace.patch",
+    ROOT / "patches" / "libzt" / "0007-core-underlay-socket-trace.patch",
+    ROOT / "patches" / "libzt" / "0008-recovery-decision-trace.patch",
 ]
 
 
@@ -139,6 +143,7 @@ def main() -> int:
 
     ensure_submodules()
     apply_patches()
+    apply_zerotierone_patches()
 
     build_dir = Path(args.build_dir).resolve()
     if args.clean and build_dir.exists():
@@ -203,7 +208,7 @@ def main() -> int:
                 "hash-object",
                 str(patch.relative_to(ROOT)),
             )
-            for patch in PATCHES
+            for patch in [*PATCHES, *ZERO_TIER_ONE_PATCHES]
         },
         "ndk_revision": read_ndk_revision(ndk),
         "android_abi": args.abi,

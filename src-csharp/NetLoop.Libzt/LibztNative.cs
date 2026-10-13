@@ -113,6 +113,37 @@ internal static class LibztNative
         CallingConvention = CallingConvention.Cdecl)]
     internal static extern int GetBoundUdpPorts(out ushort primary, out ushort secondary);
 
+    // NetLoop native diagnostics: fixed v2 240-byte POD ABI, no callback
+    // into managed code from libzt's physical I/O thread.
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
+    internal struct UnderlayTraceEvent
+    {
+        internal long TimestampMs;
+        internal ulong PeerId;
+        internal ulong Reference;
+        internal uint Kind;
+        internal uint Flags;
+        internal uint ByteCount;
+        internal int Result;
+        internal ushort PrimaryPort;
+        internal ushort SecondaryPort;
+        internal ushort PreviousSecondaryPort;
+        internal ushort Reserved;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]
+        internal string Endpoint;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]
+        internal string LocalEndpoint;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]
+        internal string InterfaceName;
+    }
+
+    [DllImport(
+        LibraryName,
+        EntryPoint = "zts_netloop_poll_underlay_event",
+        CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int PollUnderlayTrace(
+        out UnderlayTraceEvent trace, out ulong droppedTotal);
+
     [DllImport(LibraryName, EntryPoint = "CSharp_zts_net_join")]
     internal static extern int NetJoin(ulong networkId);
 

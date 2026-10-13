@@ -54,7 +54,23 @@ jobs:
           $peerEventPatch = git hash-object patches/libzt/0003-peer-event-details.patch
           $cidrPatch = git hash-object patches/libzt/0004-network-cidr-queries.patch
           $portsPatch = git hash-object patches/libzt/0005-underlay-port-diagnostics.patch
-          "key=libzt-pinvoke-win-x64-$libzt-$cmake-$script-$networkRefreshPatch-$peerEventPatch-$cidrPatch-$portsPatch" >> $env:GITHUB_OUTPUT
+          $nativeTracePatch = git hash-object patches/libzt/0006-native-underlay-trace.patch
+          $socketTracePatch = git hash-object patches/libzt/0007-core-underlay-socket-trace.patch
+          $coreTracePatch = git hash-object patches/zerotierone/0001-netloop-core-path-trace.patch
+          $recoveryPatch = git hash-object patches/libzt/0008-recovery-decision-trace.patch
+          $coreRecoveryPatch = git hash-object patches/zerotierone/0002-netloop-recovery-decision-trace.patch
+          $handoverPatch = git hash-object patches/libzt/0009-handover-peer-revalidation.patch
+          $coreHandoverPatch = git hash-object patches/zerotierone/0003-netloop-handover-peer-revalidation.patch
+          $whoisTracePatch = git hash-object patches/libzt/0010-handover-whois-decision-trace.patch
+          $coreWhoisTracePatch = git hash-object patches/zerotierone/0004-handover-whois-decision-trace.patch
+          $rootProbeTracePatch = git hash-object patches/libzt/0011-handover-root-probe-decision-trace.patch
+          $coreRootProbeTracePatch = git hash-object patches/zerotierone/0005-handover-root-probe-decision-trace.patch
+          $fastRootHelloPatch = git hash-object patches/libzt/0012-handover-fast-root-ipv6-hello.patch
+          $coreFastRootHelloPatch = git hash-object patches/zerotierone/0006-handover-fast-root-ipv6-hello.patch
+          $allInputs = @($libzt, $cmake, $script, $networkRefreshPatch, $peerEventPatch, $cidrPatch, $portsPatch, $nativeTracePatch, $socketTracePatch, $coreTracePatch, $recoveryPatch, $coreRecoveryPatch, $handoverPatch, $coreHandoverPatch, $whoisTracePatch, $coreWhoisTracePatch, $rootProbeTracePatch, $coreRootProbeTracePatch, $fastRootHelloPatch, $coreFastRootHelloPatch) -join ':'
+          $fingerprint = $allInputs | git hash-object --stdin
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to hash native cache inputs' }
+          "key=libzt-pinvoke-win-x64-$fingerprint" >> $env:GITHUB_OUTPUT
 
       - name: Restore compiled libzt bundle
         id: native-cache
@@ -94,6 +110,9 @@ jobs:
           }
           Get-Content native-cache/libzt.dll.manifest.json
 
+      - name: Validate native underlay trace ABI (no Node start)
+        run: python ci/test_native_underlay_trace.py native-cache/libzt.dll
+
       - name: Save compiled libzt bundle immediately
         if: steps.native-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
@@ -111,6 +130,9 @@ jobs:
 
       - name: Run deterministic offline C# regressions
         run: dotnet run --project src-csharp/NetLoop.Checks/NetLoop.Checks.csproj --configuration Release
+
+      - name: Run offline Python probe and handover comparison regressions
+        run: python -m unittest discover -s ci -p "test_*.py"
 
       - name: Upload C# runtime
         uses: actions/upload-artifact@v4

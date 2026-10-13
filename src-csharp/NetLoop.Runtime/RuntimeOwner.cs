@@ -29,6 +29,12 @@ internal sealed record RuntimeStatus(
 internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
     : IAsyncDisposable
 {
+    // Windows can report a single Wi-Fi/hotspot handover as address/availability
+    // changes spread across several seconds. Do not delay the first destructive
+    // reset: suppress only subsequent resets within that handover episode.
+    private const long PhysicalEpisodeMinimumMs = 6_000;
+    private const long PhysicalEpisodeQuietMs = 2_000;
+
     internal enum EventKind { Config, Unavailable, Physical, Manual }
     internal sealed record Event(
         EventKind Kind, string Reason, LibztNetworkState? Network = null);
@@ -50,6 +56,9 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
     private int _resetCount;
     private int _running;
     private bool _physicalRefreshPending;
+    private bool _physicalEpisodeActive;
+    private long _physicalEpisodeStartedAt;
+    private long _physicalEpisodeLastEventAt;
     private long _failedReadyRefreshAttempts;
     private Event? _deferredManualReset;
 
@@ -60,7 +69,17 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
     internal int ResetCount => _resetCount;
 
     internal void RequestPhysicalNetworkRefresh(string reason)
-        => _events.Writer.TryWrite(new Event(EventKind.Physical, reason));
+    {
+        // The platform monitors already debounce transient address changes.
+        // Never discard a second notification based on its arrival time: it
+        // may describe the final usable interface after an earlier refresh
+        // ran against a not-yet-ready network. The owner coalesces notifications
+        // while waiting for native startup/runtime creation.
+        QueuePhysicalNetworkRefresh(_events.Writer, reason);
+    }
+
+    internal static void QueuePhysicalNetworkRefresh(ChannelWriter<Event> writer, string reason)
+        => writer.TryWrite(new Event(EventKind.Physical, reason));
 
     internal void RequestManualReset(string reason)
         => _events.Writer.TryWrite(new Event(EventKind.Manual, reason));
@@ -105,13 +124,47 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
             _events.Reader,
             node.TryNotifyPhysicalNetworkChanged,
             ref _physicalRefreshPending,
-            ref _deferredManualReset);
+            ref _deferredManualReset,
+            OnPhysicalEventWhileWaiting);
+
+    private void OnPhysicalEventWhileWaiting()
+    {
+        // Runtime recreation can overlap a burst of OS notifications. They
+        // still refresh the native Binder, but must extend the same episode.
+        if (_physicalEpisodeActive)
+            _physicalEpisodeLastEventAt = Environment.TickCount64;
+    }
+
+    private bool BeginPhysicalEpisodeIfSettled()
+    {
+        // This owner is shared by Windows, Linux and Android. Limit the new
+        // coalescing policy to Windows; preserve other platforms' behavior.
+        if (!OperatingSystem.IsWindows())
+            return true;
+
+        var now = Environment.TickCount64;
+        var isContinuation = _physicalEpisodeActive
+            && (now - _physicalEpisodeStartedAt < PhysicalEpisodeMinimumMs
+                || now - _physicalEpisodeLastEventAt < PhysicalEpisodeQuietMs);
+
+        if (!isContinuation)
+        {
+            _physicalEpisodeActive = true;
+            _physicalEpisodeStartedAt = now;
+        }
+
+        // Never drop a later OS notification: it must still cause native
+        // Binder/Peer revalidation, even when the business Runtime is kept.
+        _physicalEpisodeLastEventAt = now;
+        return !isContinuation;
+    }
 
     internal static void DrainPendingWaitingEvents(
         ChannelReader<Event> events,
         Func<bool> tryNotifyPhysicalNetworkChanged,
         ref bool physicalRefreshPending,
-        ref Event? deferredManualReset)
+        ref Event? deferredManualReset,
+        Action? onPhysicalEvent = null)
     {
         while (events.TryRead(out var notification))
         {
@@ -119,6 +172,7 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
             {
                 case EventKind.Physical:
                     physicalRefreshPending = true;
+                    onPhysicalEvent?.Invoke();
                     break;
                 case EventKind.Manual:
                     deferredManualReset = notification;
@@ -310,6 +364,15 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
                             switch (currentEvent.Kind)
                             {
                                 case EventKind.Physical:
+                                    // One OS handover episode destroys the
+                                    // business Runtime once. Further callbacks
+                                    // refresh the native Binder/Peer paths but
+                                    // must not destroy the replacement Runtime.
+                                    // Check the episode only while Ready: events
+                                    // consumed during Runtime creation extend
+                                    // the episode without creating a new one.
+                                    var destructiveHandover =
+                                        BeginPhysicalEpisodeIfSettled();
                                     _physicalRefreshPending = true;
                                     if (!TryDeliverPendingPhysicalRefresh(
                                             ref _physicalRefreshPending,
@@ -317,8 +380,8 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
                                         LogFailedReadyRefresh(currentEvent.Reason);
                                     else
                                         _failedReadyRefreshAttempts = 0;
-                                    // Physical handover alone never aborts a
-                                    // potentially healthy long-lived TCP/RDP.
+                                    if (destructiveHandover)
+                                        restart = "physical_network_handover";
                                     break;
                                 case EventKind.Unavailable:
                                     if (!node.NetworkConfigurationAvailable)
@@ -383,6 +446,21 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
                 if (restart is not null)
                 {
                     Publish(RuntimePhase.Resetting, restart);
+                    if (restart == "physical_network_handover")
+                    {
+                        var sessions = runtime.TcpSessions;
+                        JsonLog.Info("runtime_handover_reset", new {
+                            reason = restart,
+                            tcp_total = sessions.Total,
+                            tcp_handshake = sessions.Handshake,
+                            tcp_connecting = sessions.Connecting,
+                            tcp_relay = sessions.Relay,
+                            tcp_udp_association = sessions.UdpAssociation,
+                            udp_local = runtime.ActiveLocalUdpAssociations,
+                            udp_overlay = runtime.ActiveOverlayUdpAssociations,
+                            peer_dials = runtime.PeerDials.Length
+                        });
+                    }
                     Volatile.Write(ref _active, null);
                     runtime.Abort();
                     await runtime.DisposeAsync().ConfigureAwait(false);

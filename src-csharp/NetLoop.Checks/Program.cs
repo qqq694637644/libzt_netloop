@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Threading.Channels;
 using NetLoop.Core;
 using NetLoop.Host;
@@ -31,12 +32,14 @@ internal static class Program
             Check("TCP capacity occupancy classified by phase and source", TcpSessionPhases);
             await CheckAsync("TCP permit shutdown and concurrent exits reconcile", TcpSessionPermitShutdown);
             Check("Underlay port and Peer path timeline uses observed events", UnderlayTimeline);
+            Check("Native underlay trace ABI and event kinds are fixed", NativeUnderlayTraceAbi);
             Check("SOCKS5 UDP datagram logical source", UdpPacketRoundTrip);
             Check("Shared UDP byte budget", UdpBudget);
             await CheckAsync("C Managed IP to 127.0.0.1 TCP", LoopbackTcp);
             await CheckAsync("C Managed IP to local UDP with source rewrite", LoopbackUdp);
             await CheckAsync("UDP Factory concurrent disposal", UdpFactoryDisposal);
             await CheckAsync("Startup processes physical events while Node waits", StartupPhysicalRefresh);
+            Check("Rapid physical events retain the final network notification", RapidPhysicalEventDelivery);
             await CheckAsync("Peer dialing is bounded across simultaneous SOCKS requests", PeerDialAdmission);
             await CheckAsync("Peer dialing releases canceled waiters and isolates different peers", PeerDialCancellation);
             await CheckAsync("Peer failure backoff does not hold established TCP", PeerDialCooldown);
@@ -135,6 +138,56 @@ internal static class Program
             "Revoked IP must request one Runtime replacement");
         Require(RuntimeOwner.RequiresManagedIpRebind(C, []),
             "Missing IP must withdraw active Runtime");
+    }
+
+    private static void NativeUnderlayTraceAbi()
+    {
+        Require(Marshal.SizeOf<LibztNative.UnderlayTraceEvent>() == 240,
+            "Native trace C# ABI must match 240-byte native struct");
+        Require(Marshal.OffsetOf<LibztNative.UnderlayTraceEvent>(
+                nameof(LibztNative.UnderlayTraceEvent.Endpoint)).ToInt64() == 48,
+            "Native trace endpoint must start at offset 48");
+        Require(Marshal.OffsetOf<LibztNative.UnderlayTraceEvent>(
+                nameof(LibztNative.UnderlayTraceEvent.LocalEndpoint)).ToInt64() == 112,
+            "Native trace local endpoint must start at offset 112");
+        Require(Marshal.OffsetOf<LibztNative.UnderlayTraceEvent>(
+                nameof(LibztNative.UnderlayTraceEvent.InterfaceName)).ToInt64() == 176,
+            "Native trace interface name must start at offset 176");
+        Require(LibztUnderlayDiagnostics.NativeKind(1) == "network_refresh_queued"
+                && LibztUnderlayDiagnostics.NativeKind(3) == "binder_refresh_completed"
+                && LibztUnderlayDiagnostics.NativeKind(5) == "wire_udp_sent"
+                && LibztUnderlayDiagnostics.NativeKind(6) == "wire_udp_received"
+                && LibztUnderlayDiagnostics.NativeKind(8) == "planet_path_snapshot"
+                && LibztUnderlayDiagnostics.NativeKind(10) == "core_hello_sent"
+                && LibztUnderlayDiagnostics.NativeKind(11) == "core_hello_authenticated"
+                && LibztUnderlayDiagnostics.NativeKind(12) == "core_ok_hello_sent"
+                && LibztUnderlayDiagnostics.NativeKind(13) == "core_ok_hello_authenticated"
+                && LibztUnderlayDiagnostics.NativeKind(14) == "core_rendezvous_sent"
+                && LibztUnderlayDiagnostics.NativeKind(15) == "core_rendezvous_authenticated"
+                && LibztUnderlayDiagnostics.NativeKind(16) == "core_upstream_online_decision"
+                && LibztUnderlayDiagnostics.NativeKind(17) == "core_peer_path_learned"
+                && LibztUnderlayDiagnostics.NativeKind(18) == "core_echo_sent"
+                && LibztUnderlayDiagnostics.NativeKind(19) == "core_ok_echo_authenticated"
+                && LibztUnderlayDiagnostics.NativeKind(20) == "core_rendezvous_source"
+                && LibztUnderlayDiagnostics.NativeKind(21) == "core_surface_observed"
+                && LibztUnderlayDiagnostics.NativeKind(22) == "core_surface_previous"
+                && LibztUnderlayDiagnostics.NativeKind(23) == "core_peer_probe_or_path_removed"
+                && LibztUnderlayDiagnostics.NativeKind(24) == "core_memorized_path_lookup"
+                && LibztUnderlayDiagnostics.NativeKind(25) == "core_unknown_path_confirmation"
+                && LibztUnderlayDiagnostics.NativeKind(26) == "core_switch_route_selected"
+                && LibztUnderlayDiagnostics.NativeKind(27) == "core_upstream_probe_scheduler"
+                && LibztUnderlayDiagnostics.NativeKind(28) == "core_scope_path_invalidated"
+                && LibztUnderlayDiagnostics.NativeKind(29) == "core_surface_expired"
+                && LibztUnderlayDiagnostics.NativeKind(30) == "core_handover_peer_paths_revalidated"
+                && LibztUnderlayDiagnostics.NativeKind(31) == "core_handover_whois_decision"
+                && LibztUnderlayDiagnostics.NativeKind(32) == "core_handover_background_ping_deadline"
+                && LibztUnderlayDiagnostics.NativeKind(33) == "core_handover_root_hello_eligibility"
+                && LibztUnderlayDiagnostics.NativeKind(34) == "binder_handover_ipv6_bindings"
+                && LibztUnderlayDiagnostics.NativeKind(35) == "core_handover_root_ipv6_hello_requested"
+                && LibztUnderlayDiagnostics.NativeKind(36) == "binder_handover_root_ipv6_hello_batch",
+            "Native trace kinds must remain compatible across builds");
+        Require(LibztUnderlayDiagnostics.NativeKind(200) == "unknown",
+            "Unknown native trace kind must remain safe");
     }
 
     private static void UdpConditionalRemove()
@@ -629,6 +682,37 @@ internal static class Program
                     ref pending, () => { tries++; return false; })
                 && tries == 2,
             "A successful native refresh unexpectedly triggered another retry");
+    }
+
+    private static void RapidPhysicalEventDelivery()
+    {
+        var events = Channel.CreateBounded<RuntimeOwner.Event>(
+            new BoundedChannelOptions(64) { FullMode = BoundedChannelFullMode.DropOldest });
+
+        // Both platform callbacks may arrive within 500 ms; neither is dropped
+        // here just because the previous notification was recent.
+        RuntimeOwner.QueuePhysicalNetworkRefresh(events.Writer, "network_unavailable");
+        RuntimeOwner.QueuePhysicalNetworkRefresh(events.Writer, "network_available");
+        Require(events.Reader.TryRead(out var first)
+                && first.Kind == RuntimeOwner.EventKind.Physical
+                && first.Reason == "network_unavailable",
+            "First network transition was not queued");
+        Require(events.Reader.TryRead(out var final)
+                && final.Kind == RuntimeOwner.EventKind.Physical
+                && final.Reason == "network_available",
+            "Final usable-network notification was swallowed by the owner");
+
+        // During startup/runtime creation, notifications can be combined into
+        // one native refresh, but that refresh must still be issued.
+        RuntimeOwner.QueuePhysicalNetworkRefresh(events.Writer, "network_unavailable");
+        RuntimeOwner.QueuePhysicalNetworkRefresh(events.Writer, "network_available");
+        var pending = false;
+        RuntimeOwner.Event? deferred = null;
+        var refreshes = 0;
+        RuntimeOwner.DrainPendingWaitingEvents(events.Reader,
+            () => { refreshes++; return true; }, ref pending, ref deferred);
+        Require(refreshes == 1 && !pending && deferred is null,
+            "Startup should coalesce rapid notifications without losing the refresh");
     }
 
     private static async Task StartupPhysicalRefresh()

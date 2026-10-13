@@ -1,0 +1,291 @@
+diff --git a/node/IncomingPacket.cpp b/node/IncomingPacket.cpp
+index 6a9d6d7..08a26cb 100644
+--- a/node/IncomingPacket.cpp
++++ b/node/IncomingPacket.cpp
+@@ -590,6 +590,12 @@ bool IncomingPacket::_doOK(const RuntimeEnvironment *RR,void *tPtr,const SharedP
+ 
+ 	switch(inReVerb) {
+ 
++		case Packet::VERB_ECHO:
++			// Authenticated OK(ECHO) with an outstanding matching request.
++			RR->node->netloopTrace(tPtr,19,peer->address().toInt(),
++				inRePacketId,hops(),1,&_path->address());
++			break;
++
+ 		case Packet::VERB_HELLO: {
+ 			const uint64_t latency = RR->node->now() - at<uint64_t>(ZT_PROTO_VERB_HELLO__OK__IDX_TIMESTAMP);
+ 			const unsigned int vProto = (*this)[ZT_PROTO_VERB_HELLO__OK__IDX_PROTOCOL_VERSION];
+@@ -742,7 +748,12 @@ bool IncomingPacket::_doWHOIS(const RuntimeEnvironment *RR,void *tPtr,const Shar
+ bool IncomingPacket::_doRENDEZVOUS(const RuntimeEnvironment *RR,void *tPtr,const SharedPtr<Peer> &peer)
+ {
+ 	Metrics::pkt_rendezvous_in++;
+-	if (RR->topology->isUpstream(peer->identity())) {
++	// Existing candidate trace (kind 15) only names the *suggested* peer.
++	// This records which authenticated Root/Planet sent the suggestion.
++	const bool fromUpstream = RR->topology->isUpstream(peer->identity());
++	RR->node->netloopTrace(tPtr,20,peer->address().toInt(),packetId(),
++		fromUpstream ? 1U : 0U,(int)hops(),&_path->address());
++	if (fromUpstream) {
+ 		const Address with(field(ZT_PROTO_VERB_RENDEZVOUS_IDX_ZTADDRESS,ZT_ADDRESS_LENGTH),ZT_ADDRESS_LENGTH);
+ 		const SharedPtr<Peer> rendezvousWith(RR->topology->getPeer(tPtr,with));
+ 		if (rendezvousWith) {
+diff --git a/node/Node.cpp b/node/Node.cpp
+index c52e7e3..0858010 100644
+--- a/node/Node.cpp
++++ b/node/Node.cpp
+@@ -257,7 +257,20 @@ public:
+ 			bool hasPaths = p->paths(RR->node->now()).size() > 0;
+ 			roleBasedTimerScale = (role != ZT_PEER_ROLE_LEAF && !hasPaths) ? 0 : roleBasedTimerScale;
+ 
+-			if ((RR->node->now() - p->lastSentFullHello()) <= (ZT_PATH_HEARTBEAT_PERIOD * roleBasedTimerScale)) {
++			const int64_t priorFullHello = p->lastSentFullHello();
++			const int64_t remainingUntilContact =
++				(ZT_PATH_HEARTBEAT_PERIOD * roleBasedTimerScale)
++				- (RR->node->now() - priorFullHello);
++			if (remainingUntilContact >= 0) {
++				// ZeroTierOne can intentionally postpone Root HELLOs while
++				// retaining a remembered path. Log the *scheduler reason*
++				// without changing its timer or transmitting extra probes.
++				if (role != ZT_PEER_ROLE_LEAF) {
++					RR->node->netloopTrace(_tPtr,27,p->address().toInt(),
++						(uint64_t)priorFullHello,1U | (hasPaths ? 2U : 0U),
++						(int)(remainingUntilContact > 2147483647LL
++							? 2147483647LL : remainingUntilContact));
++				}
+ 				return;
+ 			}
+ 
+@@ -292,6 +305,12 @@ public:
+ 					p->sendHELLO(_tPtr,up->localSocket(),up->address(),_now);
+ 				}
+ 			}
++			if (role != ZT_PEER_ROLE_LEAF) {
++				RR->node->netloopTrace(_tPtr,27,p->address().toInt(),
++					(uint64_t)priorFullHello,
++					(hasPaths ? 2U : 0U) | (contacted ? 8U : 0U),
++					(int)sent);
++			}
+ 
+ 			_alwaysContact.erase(p->address()); // after this we'll WHOIS all upstreams that remain
+ 		} else if (p->isActive(_now)) {
+diff --git a/node/Peer.cpp b/node/Peer.cpp
+index 5392817..997e1fc 100644
+--- a/node/Peer.cpp
++++ b/node/Peer.cpp
+@@ -28,6 +28,16 @@ namespace ZeroTier {
+ 
+ static unsigned char s_freeRandomByteCounter = 0;
+ 
++// Diagnostic-only clamping: preserve native timestamps in reference and
++// keep age/result inside the existing signed 32-bit trace ABI.
++static int netloopPathAgeMs(int64_t now,int64_t lastReceive)
++{
++	if (lastReceive <= 0)
++		return -1;
++	const int64_t age = now - lastReceive;
++	return (age < 0) ? 0 : ((age > 2147483647LL) ? 2147483647 : (int)age);
++}
++
+ Peer::Peer(const RuntimeEnvironment *renv,const Identity &myIdentity,const Identity &peerIdentity)
+ 	: RR(renv)
+ 	, _lastReceive(0)
+@@ -193,10 +203,15 @@ void Peer::received(
+ 				}
+ 
+ 				if (!triedTooRecently) {
++					RR->node->netloopTrace(tPtr,25,_id.address().toInt(),
++						packetId,0U,(int)verb,&path->address());
+ 					_lastTriedPath.push_back(std::pair< Path *, int64_t >(path.ptr(), now));
+ 					attemptToContactAt(tPtr,path->localSocket(),path->address(),now,true);
+ 					path->sent(now);
+ 					RR->t->peerConfirmingUnknownPath(tPtr,networkId,*this,path,packetId,verb);
++				} else {
++					RR->node->netloopTrace(tPtr,25,_id.address().toInt(),
++						packetId,1U,(int)verb,&path->address());
+ 				}
+ 			}
+ 		}
+@@ -476,7 +491,10 @@ void Peer::attemptToContactAt(void *tPtr,const int64_t localSocket,const InetAdd
+ 		outp.armor(_key,true,aesKeysIfSupported());
+ 		Metrics::pkt_echo_out++;
+ 		RR->node->expectReplyTo(outp.packetId());
+-		RR->node->putPacket(tPtr,localSocket,atAddress,outp.data(),outp.size());
++		const bool submitted = RR->node->putPacket(tPtr,localSocket,atAddress,outp.data(),outp.size());
++		// Non-HELLO peer recovery attempts are predominantly encrypted ECHO.
++		RR->node->netloopTrace(tPtr,18,_id.address().toInt(),
++			outp.packetId(),0U,submitted ? 1 : 0,&atAddress);
+ 	} else {
+ 		sendHELLO(tPtr,localSocket,atAddress,now);
+ 	}
+@@ -487,7 +505,10 @@ void Peer::tryMemorizedPath(void *tPtr,int64_t now)
+ 	if ((now - _lastTriedMemorizedPath) >= ZT_TRY_MEMORIZED_PATH_INTERVAL) {
+ 		_lastTriedMemorizedPath = now;
+ 		InetAddress mp;
+-		if (RR->node->externalPathLookup(tPtr,_id.address(),-1,mp)) {
++		const bool found = RR->node->externalPathLookup(tPtr,_id.address(),-1,mp);
++		RR->node->netloopTrace(tPtr,24,_id.address().toInt(),
++			(uint64_t)now,found ? 1U : 0U,found ? 1 : 0,found ? &mp : 0);
++		if (found) {
+ 			attemptToContactAt(tPtr,-1,mp,now,true);
+ 		}
+ 	}
+@@ -540,12 +561,14 @@ void Peer::performMultipathStateCheck(void *tPtr, int64_t now)
+ unsigned int Peer::doPingAndKeepalive(void *tPtr,int64_t now)
+ {
+ 	unsigned int sent = 0;
++	bool fullHelloDue = false;
+ 	{
+ 		Mutex::Lock _l(_paths_m);
+ 
+ 		performMultipathStateCheck(tPtr, now);
+ 
+ 		const bool sendFullHello = ((now - _lastSentFullHello) >= ZT_PEER_PING_PERIOD);
++		fullHelloDue = sendFullHello;
+ 		if (sendFullHello) {
+ 			_lastSentFullHello = now;
+ 		}
+@@ -569,11 +592,19 @@ unsigned int Peer::doPingAndKeepalive(void *tPtr,int64_t now)
+ 				// Clean expired and reduced priority paths
+ 				if ( ((now - _paths[i].lr) < ZT_PEER_PATH_EXPIRATION) && (_paths[i].priority == maxPriority) ) {
+ 					if ((sendFullHello)||(_paths[i].p->needsHeartbeat(now))) {
++						RR->node->netloopTrace(tPtr,23,_id.address().toInt(),
++							(uint64_t)_paths[i].lr,
++							(sendFullHello ? 1U : 2U) | (_paths[i].p->alive(now) ? 32U : 0U),
++							netloopPathAgeMs(now,_paths[i].lr),&_paths[i].p->address());
+ 						attemptToContactAt(tPtr,_paths[i].p->localSocket(),_paths[i].p->address(),now,sendFullHello);
+ 						_paths[i].p->sent(now);
+ 						sent |= (_paths[i].p->address().ss_family == AF_INET) ? 0x1 : 0x2;
+ 					}
+ 				} else {
++					RR->node->netloopTrace(tPtr,23,_id.address().toInt(),
++						(uint64_t)_paths[i].lr,
++						((now - _paths[i].lr) >= ZT_PEER_PATH_EXPIRATION) ? 4U : 8U,
++						netloopPathAgeMs(now,_paths[i].lr),&_paths[i].p->address());
+ 					_paths[i] = _PeerPath();
+ 					deletionOccurred = true;
+ 				}
+@@ -605,6 +636,10 @@ unsigned int Peer::doPingAndKeepalive(void *tPtr,int64_t now)
+ 		_dead_path_count = dead_path_count_tmp;
+ #endif
+ 	}
++	if (sent == 0 && fullHelloDue) {
++		RR->node->netloopTrace(tPtr,23,_id.address().toInt(),
++			(uint64_t)now,16U,0);
++	}
+ #ifndef ZT_NO_PEER_METRICS
+ 	_peer_latency.Observe(latency(now));
+ #endif
+@@ -669,6 +704,10 @@ void Peer::resetWithinScope(void *tPtr,InetAddress::IpScope scope,int inetAddres
+ 	for(unsigned int i=0;i<ZT_MAX_PEER_NETWORK_PATHS;++i) {
+ 		if (_paths[i].p) {
+ 			if ((_paths[i].p->address().ss_family == inetAddressFamily)&&(_paths[i].p->ipScope() == scope)) {
++				RR->node->netloopTrace(tPtr,28,_id.address().toInt(),
++					(uint64_t)_paths[i].lr,
++					((unsigned int)scope << 8) | (inetAddressFamily == AF_INET6 ? 1U : 0U),
++					netloopPathAgeMs(now,_paths[i].lr),&_paths[i].p->address());
+ 				attemptToContactAt(tPtr,_paths[i].p->localSocket(),_paths[i].p->address(),now,false);
+ 				_paths[i].p->sent(now);
+ 				_paths[i].lr = 0; // path will not be used unless it speaks again
+diff --git a/node/SelfAwareness.cpp b/node/SelfAwareness.cpp
+index c87f4e3..5eceb46 100644
+--- a/node/SelfAwareness.cpp
++++ b/node/SelfAwareness.cpp
+@@ -68,6 +68,31 @@ void SelfAwareness::iam(void *tPtr,const Address &reporter,const int64_t receive
+ 	Mutex::Lock _l(_phy_m);
+ 	PhySurfaceEntry &entry = _phy[PhySurfaceKey(reporter,receivedOnLocalSocket,reporterPhysicalAddress,scope)];
+ 
++	const bool hadObservation = (entry.ts != 0);
++	const bool changedIp = hadObservation && !entry.mySurface.ipsEqual(myPhysicalAddress);
++	const bool changedPort = hadObservation && (entry.mySurface.port() != myPhysicalAddress.port());
++	const bool resetEligible = trusted && ((now - entry.ts) < ZT_SELFAWARENESS_ENTRY_TIMEOUT);
++	const bool scopeReset = resetEligible && changedIp;
++	if (!hadObservation || changedIp || changedPort) {
++		const unsigned int flags = (trusted ? 1U : 0U)
++			| (hadObservation ? 2U : 0U)
++			| (changedIp ? 4U : 0U)
++			| (changedPort ? 8U : 0U)
++			| (scopeReset ? 16U : 0U);
++		// The reported public endpoint may change PORT without an IP change.
++		// The upstream SelfAwareness policy deliberately resets paths only
++		// for trusted, recent IP changes. Observe both; do not change policy.
++		const int64_t age = hadObservation ? now - entry.ts : -1;
++		const int priorAge = (age < 0) ? -1 :
++			((age > 2147483647LL) ? 2147483647 : (int)age);
++		if (hadObservation) {
++			RR->node->netloopTrace(tPtr,22,reporter.toInt(),
++				(uint64_t)now,flags,priorAge,&entry.mySurface);
++		}
++		RR->node->netloopTrace(tPtr,21,reporter.toInt(),
++			(uint64_t)now,flags,priorAge,&myPhysicalAddress);
++	}
++
+ 	if ( (trusted) && ((now - entry.ts) < ZT_SELFAWARENESS_ENTRY_TIMEOUT) && (!entry.mySurface.ipsEqual(myPhysicalAddress)) ) {
+ 		// Changes to external surface reported by trusted peers causes path reset in this scope
+ 		RR->t->resettingPathsInScope(tPtr,reporter,reporterPhysicalAddress,myPhysicalAddress,scope);
+@@ -124,6 +149,10 @@ void SelfAwareness::clean(int64_t now)
+ 	PhySurfaceEntry *e = (PhySurfaceEntry *)0;
+ 	while (i.next(k,e)) {
+ 		if ((now - e->ts) >= ZT_SELFAWARENESS_ENTRY_TIMEOUT) {
++			RR->node->netloopTrace((void *)0,29,k->reporter.toInt(),
++				(uint64_t)e->ts,e->trusted ? 1U : 0U,
++				(int)((now - e->ts > 2147483647LL) ? 2147483647LL : now - e->ts),
++				&e->mySurface);
+ 			_phy.erase(*k);
+ 		}
+ 	}
+diff --git a/node/Switch.cpp b/node/Switch.cpp
+index 5ea1653..ee18dfc 100644
+--- a/node/Switch.cpp
++++ b/node/Switch.cpp
+@@ -1108,22 +1108,35 @@ bool Switch::_trySend(void *tPtr,Packet &packet,bool encrypt,int32_t flowId)
+ 			return true;
+ 		} else {
+ 			viaPath = peer->getAppropriatePath(now,false,flowId);
++			unsigned int netloopRoute = 1U; // selected peer's non-expired path
+ 			if (!viaPath) {
+ 				peer->tryMemorizedPath(tPtr,now); // periodically attempt memorized or statically defined paths, if any are known
+ 				const SharedPtr<Peer> relay(RR->topology->getUpstreamPeer());
+ 				if ( (!relay) || (!(viaPath = relay->getAppropriatePath(now,false,flowId))) ) {
+ 					if (!(viaPath = peer->getAppropriatePath(now,true,flowId))) {
++						RR->node->netloopTrace(tPtr,26,destination.toInt(),
++							packet.packetId(),8U,(int)packet.verb());
+ 						return false;
+ 					}
++					netloopRoute = 4U; // fallback to expired peer path
++				} else {
++					netloopRoute = 2U; // forward through a Root/Planet path
+ 				}
+ 			}
+ 			if (viaPath) {
++				// Sampled by libzt bridge: avoid a trace record per frame
++				// when the browser creates many TCP connections.
++				RR->node->netloopTrace(tPtr,26,destination.toInt(),
++					packet.packetId(),netloopRoute,(int)packet.verb(),
++					&viaPath->address());
+ 				uint16_t userSpecifiedMtu = viaPath->mtu();
+ 				_sendViaSpecificPath(tPtr,peer,viaPath,userSpecifiedMtu,now,packet,encrypt,flowId);
+ 				return true;
+ 			}
+ 		}
+ 	}
++	RR->node->netloopTrace(tPtr,26,destination.toInt(),
++		packet.packetId(),16U,(int)packet.verb());
+ 	return false;
+ }
+ 
+diff --git a/osdep/Binder.hpp b/osdep/Binder.hpp
+index 92a94eb..bead1c2 100644
+--- a/osdep/Binder.hpp
++++ b/osdep/Binder.hpp
+@@ -162,7 +162,10 @@ class Binder {
+ 									case InetAddress::IP_SCOPE_PRIVATE:
+ 										for (int x = 0; x < (int)portCount; ++x) {
+ 											ip.setPort(ports[x]);
+-											localIfAddrs.insert(std::pair<InetAddress, std::string>(ip, std::string()));
++											// Preserve the adapter name already used by
++											// shouldBindInterface() for diagnostics. This
++											// does NOT bind to or select a new interface.
++											localIfAddrs.insert(std::pair<InetAddress, std::string>(ip, std::string(strBuf)));
+ 										}
+ 										break;
+ 								}

@@ -78,7 +78,11 @@ def load_records(paths: list[Path]) -> tuple[list[dict], list[str], int]:
                     if not math.isfinite(elapsed) or elapsed < 0:
                         raise ValueError("invalid elapsed_ms")
                     node = str(row.get("node") or "unknown")
-                    target = str(row.get("url") or row.get("target_url") or "unspecified")
+                    # connection_probe.ps1 writes "target"; older callers may
+                    # use "url" or "target_url". Preserve the real target so
+                    # A->B can be compared independently of the public control.
+                    target = str(row.get("url") or row.get("target_url")
+                                 or row.get("target") or "unspecified")
                     key = (node, target, start, finish, status, row.get("sequence"),
                            row.get("curl_exit_code"), row.get("http_code"))
                     if key in seen:

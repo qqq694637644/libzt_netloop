@@ -1,0 +1,94 @@
+diff --git a/include/ZeroTierOne.h b/include/ZeroTierOne.h
+index c71f8e4d2..772feed34 100644
+--- a/include/ZeroTierOne.h
++++ b/include/ZeroTierOne.h
+@@ -2067,6 +2067,15 @@ ZT_SDK_API void ZT_Node_clearLocalInterfaceAddresses(ZT_Node *node);
+  */
+ ZT_SDK_API unsigned int ZT_Node_revalidatePeerPathsAfterNetworkChange(ZT_Node *node,void *tptr,int64_t now);
+ 
++/**
++ * Windows physical handover fast path: send one full HELLO to the configured
++ * global IPv6 endpoint of each known Root (at most eight). Unlike the
++ * ordinary 224-second Root scheduler gate, this is called once per handover
++ * episode only after libzt observes a changed global IPv6 Binder address.
++ * It does not delete or reprioritize existing upstream/relay paths.
++ */
++ZT_SDK_API unsigned int ZT_Node_fastProbeRootIpv6AfterNetworkChange(ZT_Node *node,void *tptr,int64_t now);
++
+ /**
+  * Send a VERB_USER_MESSAGE to another ZeroTier node
+  *
+diff --git a/node/Node.cpp b/node/Node.cpp
+index 665733191..8261d3f5c 100644
+--- a/node/Node.cpp
++++ b/node/Node.cpp
+@@ -702,6 +702,41 @@ void Node::clearLocalInterfaceAddresses()
+ 	_directPaths.clear();
+ }
+ 
++unsigned int Node::fastProbeRootIpv6AfterNetworkChange(void *tptr,int64_t now)
++{
++#ifdef _WIN32
++	// No change to normal 224-second scheduling or memorized upstream paths.
++	// libzt only invokes this after a newly bound global IPv6 address during
++	// a confirmed OS handover, once per handover episode.
++	Hashtable< Address,std::vector<InetAddress> > upstreams;
++	RR->topology->getUpstreamsToContact(upstreams);
++	Hashtable< Address,std::vector<InetAddress> >::Iterator upstream(upstreams);
++	Address *rootAddress = (Address *)0;
++	std::vector<InetAddress> *stable = (std::vector<InetAddress> *)0;
++	unsigned int sent = 0;
++	for (unsigned int inspected=0;inspected<8 && upstream.next(rootAddress,stable);++inspected) {
++		const SharedPtr<Peer> root(RR->topology->getPeerNoCache(*rootAddress));
++		if (!root || RR->topology->role(*rootAddress) == ZT_PEER_ROLE_LEAF)
++			continue;
++		for (std::vector<InetAddress>::const_iterator ep(stable->begin());ep!=stable->end();++ep) {
++			if (ep->ss_family != AF_INET6 || ep->ipScope() != InetAddress::IP_SCOPE_GLOBAL)
++				continue;
++			// The same HELLO primitive used by the existing Root scheduler;
++			// no path invalidation, extra retransmit loop or altered timers.
++			root->sendHELLO(tptr,-1,*ep,now);
++			netloopTrace(tptr,35,rootAddress->toInt(),(uint64_t)now,8U,1,&*ep);
++			++sent;
++			break; // one IPv6 HELLO per known Root per episode
++		}
++	}
++	return sent;
++#else
++	(void)tptr;
++	(void)now;
++	return 0;
++#endif
++}
++
+ unsigned int Node::revalidatePeerPathsAfterNetworkChange(void *tptr,int64_t now)
+ {
+ #ifdef _WIN32
+@@ -1226,6 +1261,15 @@ unsigned int ZT_Node_revalidatePeerPathsAfterNetworkChange(ZT_Node *node,void *t
+ 	}
+ }
+ 
++unsigned int ZT_Node_fastProbeRootIpv6AfterNetworkChange(ZT_Node *node,void *tptr,int64_t now)
++{
++	try {
++		return reinterpret_cast<ZeroTier::Node *>(node)->fastProbeRootIpv6AfterNetworkChange(tptr,now);
++	} catch ( ... ) {
++		return 0;
++	}
++}
++
+ int ZT_Node_sendUserMessage(ZT_Node *node,void *tptr,uint64_t dest,uint64_t typeId,const void *data,unsigned int len)
+ {
+ 	try {
+diff --git a/node/Node.hpp b/node/Node.hpp
+index 854896d77..97baab42a 100644
+--- a/node/Node.hpp
++++ b/node/Node.hpp
+@@ -99,6 +99,7 @@ public:
+ 	int addLocalInterfaceAddress(const struct sockaddr_storage *addr);
+ 	void clearLocalInterfaceAddresses();
+ 	unsigned int revalidatePeerPathsAfterNetworkChange(void *tptr,int64_t now);
++	unsigned int fastProbeRootIpv6AfterNetworkChange(void *tptr,int64_t now);
+ 	int sendUserMessage(void *tptr,uint64_t dest,uint64_t typeId,const void *data,unsigned int len);
+ 	void setNetconfMaster(void *networkControllerInstance);
+ 

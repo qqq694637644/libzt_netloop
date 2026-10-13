@@ -25,6 +25,7 @@ public sealed class LibztNode : IAsyncDisposable
             FullMode = BoundedChannelFullMode.DropOldest
         });
     private Task? _networkConfigWorker;
+    private Task? _underlayTraceWorker;
     private LibztNetworkState? _state;
     private long _stateGeneration;
     private int _configAvailable;
@@ -89,6 +90,8 @@ public sealed class LibztNode : IAsyncDisposable
         {
             ThrowIfError("zts_node_start", LibztNative.NodeStart());
             Volatile.Write(ref _started, true);
+            _underlayTraceWorker = Task.Run(
+                () => ProcessUnderlayTraceAsync(_networkConfigStop.Token));
             SampleBoundUdpPorts("node_started");
             return await JoinAndWaitAsync(cancellationToken).ConfigureAwait(false);
         }
@@ -474,6 +477,110 @@ public sealed class LibztNode : IAsyncDisposable
         }
     }
 
+    private async Task ProcessUnderlayTraceAsync(CancellationToken cancellationToken)
+    {
+        ulong previousDropped = 0;
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                // Bound both native memory and the amount of managed log work
+                // in one polling cycle. A full queue reports dropped records.
+                for (var index = 0; index < 128; ++index)
+                {
+                    var rc = LibztNative.PollUnderlayTrace(
+                        out var sample, out var dropped);
+                    if (dropped != previousDropped)
+                    {
+                        JsonLog.Error("libzt_native_underlay_records_dropped", new {
+                            dropped_since_previous = dropped - previousDropped,
+                            dropped_total = dropped
+                        });
+                        previousDropped = dropped;
+                    }
+                    if (rc == 0)
+                        break;
+                    if (rc < 0)
+                    {
+                        if (!cancellationToken.IsCancellationRequested)
+                            JsonLog.Error("libzt_native_underlay_poll_failed", new {
+                                api_rc = rc
+                            });
+                        break;
+                    }
+
+                    var kind = LibztUnderlayDiagnostics.NativeKind(sample.Kind);
+                    JsonLog.Info("libzt_native_underlay_trace", new {
+                        native_timestamp_utc =
+                            DateTimeOffset.FromUnixTimeMilliseconds(sample.TimestampMs),
+                        kind,
+                        peer_id = sample.PeerId == 0 ? null : sample.PeerId.ToString("x10"),
+                        endpoint = string.IsNullOrEmpty(sample.Endpoint)
+                            ? null : sample.Endpoint,
+                        local_endpoint = string.IsNullOrEmpty(sample.LocalEndpoint)
+                            ? null : sample.LocalEndpoint,
+                        physical_interface = string.IsNullOrEmpty(sample.InterfaceName)
+                            ? null : sample.InterfaceName,
+                        packet_id = sample.Kind is 5 or 6 or 10 or 11 or 14 or 15
+                            or 17 or 18 or 20 or 25 or 26
+                            ? sample.Reference.ToString("x16") : null,
+                        hello_request_packet_id = sample.Kind is 12 or 13
+                            ? sample.Reference.ToString("x16") : null,
+                        echo_request_packet_id = sample.Kind == 19
+                            ? sample.Reference.ToString("x16") : null,
+                        binder_start_native_ms = sample.Kind is 2 or 3
+                            ? (long?)sample.Reference : null,
+                        planet_last_receive_native_ms = sample.Kind == 8
+                            ? (long?)sample.Reference : null,
+                        last_global_receive_native_ms = sample.Kind == 7
+                            ? (long?)sample.Reference : null,
+                        last_upstream_receive_native_ms = sample.Kind == 16
+                            && sample.Reference != 0 ? (long?)sample.Reference : null,
+                        upstream_age_ms = sample.Kind == 16
+                            ? sample.Result : (int?)null,
+                        peer_path_last_receive_native_ms = sample.Kind is 23 or 28
+                            ? (long?)sample.Reference : null,
+                        surface_observation_native_ms = sample.Kind is 21 or 22
+                            ? (long?)sample.Reference : null,
+                        surface_last_seen_native_ms = sample.Kind == 29
+                            ? (long?)sample.Reference : null,
+                        memorized_lookup_native_ms = sample.Kind == 24
+                            ? (long?)sample.Reference : null,
+                        last_upstream_full_hello_native_ms = sample.Kind == 27
+                            ? (long?)sample.Reference : null,
+                        handover_revalidation_native_ms = sample.Kind == 30
+                            ? (long?)sample.Reference : null,
+                        reason_flags = sample.Flags,
+                        byte_count = sample.ByteCount,
+                        result = sample.Result,
+                        primary_port = sample.PrimaryPort,
+                        secondary_port = sample.SecondaryPort,
+                        previous_secondary_port = sample.PreviousSecondaryPort,
+                        // UDP header identities are unverified observations.
+                        wire_header_authenticated = sample.Kind is 5 or 6
+                            ? false : (bool?)null,
+                        // Receive-side core protocol records appear only
+                        // after ZeroTier's existing MAC/identity verification.
+                        core_protocol_authenticated = sample.Kind is 11 or 13
+                            or 15 or 19 or 20 or 25
+                            ? true : (bool?)null
+                    });
+                }
+                await Task.Delay(250, cancellationToken).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            JsonLog.Error("libzt_native_underlay_worker_failed", new {
+                error_type = ex.GetType().Name,
+                error = ex.Message
+            });
+        }
+    }
+
     private static bool IsNetworkConfigEvent(short eventCode)
         => eventCode is LibztNative.EventNetworkOk
             or LibztNative.EventNetworkReadyIp4
@@ -492,6 +599,8 @@ public sealed class LibztNode : IAsyncDisposable
         _networkConfigEvents.Writer.TryComplete();
         if (_networkConfigWorker is not null)
             await _networkConfigWorker.ConfigureAwait(false);
+        if (_underlayTraceWorker is not null)
+            await _underlayTraceWorker.ConfigureAwait(false);
     }
 
     private static unsafe void ZeroBuffer(nint buffer, int length)
