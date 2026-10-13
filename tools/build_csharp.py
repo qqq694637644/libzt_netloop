@@ -24,12 +24,14 @@ LIBZT_PATCHES = [
     ROOT / "patches" / "libzt" / "0008-recovery-decision-trace.patch",
     ROOT / "patches" / "libzt" / "0009-handover-peer-revalidation.patch",
     ROOT / "patches" / "libzt" / "0010-handover-whois-decision-trace.patch",
+    ROOT / "patches" / "libzt" / "0011-handover-root-probe-decision-trace.patch",
 ]
 ZERO_TIER_ONE_PATCHES = [
     ROOT / "patches" / "zerotierone" / "0001-netloop-core-path-trace.patch",
     ROOT / "patches" / "zerotierone" / "0002-netloop-recovery-decision-trace.patch",
     ROOT / "patches" / "zerotierone" / "0003-netloop-handover-peer-revalidation.patch",
     ROOT / "patches" / "zerotierone" / "0004-handover-whois-decision-trace.patch",
+    ROOT / "patches" / "zerotierone" / "0005-handover-root-probe-decision-trace.patch",
 ]
 
 

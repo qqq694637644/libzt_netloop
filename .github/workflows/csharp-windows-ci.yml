@@ -63,7 +63,9 @@ jobs:
           $coreHandoverPatch = git hash-object patches/zerotierone/0003-netloop-handover-peer-revalidation.patch
           $whoisTracePatch = git hash-object patches/libzt/0010-handover-whois-decision-trace.patch
           $coreWhoisTracePatch = git hash-object patches/zerotierone/0004-handover-whois-decision-trace.patch
-          $allInputs = @($libzt, $cmake, $script, $networkRefreshPatch, $peerEventPatch, $cidrPatch, $portsPatch, $nativeTracePatch, $socketTracePatch, $coreTracePatch, $recoveryPatch, $coreRecoveryPatch, $handoverPatch, $coreHandoverPatch, $whoisTracePatch, $coreWhoisTracePatch) -join ':'
+          $rootProbeTracePatch = git hash-object patches/libzt/0011-handover-root-probe-decision-trace.patch
+          $coreRootProbeTracePatch = git hash-object patches/zerotierone/0005-handover-root-probe-decision-trace.patch
+          $allInputs = @($libzt, $cmake, $script, $networkRefreshPatch, $peerEventPatch, $cidrPatch, $portsPatch, $nativeTracePatch, $socketTracePatch, $coreTracePatch, $recoveryPatch, $coreRecoveryPatch, $handoverPatch, $coreHandoverPatch, $whoisTracePatch, $coreWhoisTracePatch, $rootProbeTracePatch, $coreRootProbeTracePatch) -join ':'
           $fingerprint = $allInputs | git hash-object --stdin
           if ($LASTEXITCODE -ne 0) { throw 'Failed to hash native cache inputs' }
           "key=libzt-pinvoke-win-x64-$fingerprint" >> $env:GITHUB_OUTPUT

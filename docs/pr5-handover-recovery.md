@@ -83,6 +83,51 @@ and B. There are **no** new background probes, packet payloads, raw secrets,
 changed timer constants, additional sockets, or modified selection algorithms.
 The underlay ABI remains version 2, 240 bytes.
 
+### Windows Root HELLO scheduling: handover-only snapshots
+
+After a handover, the A/B logs showed A's new public IPv6 surface was visible
+to another peer long before the Root supplying B's RENDEZVOUS candidates
+proposed that new address. Upstream `Node::_PingPeersThatNeedPing` uses a
+**16 × 14-second (224-second) full-HELLO gate** for configured upstreams
+which still have remembered paths. This is a possible explanation for delayed
+Root IPv6 contact, **not proof**: existing paths, authenticated replies and
+actual sent packets must be correlated before touching scheduler behavior.
+
+Three **diagnostic-only** events are recorded for an explicit Windows
+physical handover; periodic Binder refreshes and Linux/Android do not emit
+them. Every event uses the existing underlay ABI and JSONL writer:
+
+| Kind / event | Fields | Interpretation |
+| --- | --- | --- |
+| 34 `binder_handover_ipv6_bindings` | `flags`: bit 1 = any IPv6 binding, bit 2 = global IPv6 binding, bit 4 = IPv4 binding; `byte_count` = number of bound address/port entries; `result` = count of global IPv6 entries; `endpoint` = first bound global IPv6 | Binder has a global IPv6 address **after** copying refreshed interfaces into Core; not proof the new remote IPv6 path is routable |
+| 32 `core_handover_background_ping_deadline` | `reference` = previous native background ping check time; `result` = ms until the next periodic ping check would be due; `flags` bit 1 = low-bandwidth mode | Distinguishes a delayed **background tick** from the separate per-Root full-HELLO decision |
+| 33 `core_handover_root_hello_eligibility` | `peer_id` = Root/Moon ID; `reference` = previous full-HELLO timestamp; `result` = ms remaining on Root full-HELLO eligibility gate (0 = due, -1 = Peer not loaded, -2 = no configured address in that family); `endpoint` = first configured stable address per family | Snapshot of the existing Root eligibility condition, **not** a new HELLO or a guarantee of transmission |
+
+For kind 33 `flags`: bit 1 = Root Peer loaded; bit 2 = remembered paths
+present; bit 4 = full-HELLO timer gate active; bit 8 = IPv6 candidate; bit 16
+= IPv4 candidate; bit 32 = Core categorized this contact as a leaf; bit 64
+= configured endpoint missing for that address family. At most eight upstream
+identities and **one IPv4 plus one IPv6 candidate each** are recorded per
+notification; other configured endpoints might exist. A missing-family event
+has `result=-2` and no endpoint. Its address sampling is for diagnostics,
+not the actual randomly selected endpoint; `core_hello_sent` (10) provides
+that authoritative transmitted destination.
+
+To diagnose a slow recovery, compare kinds 34 → 32/33 with 27
+(`core_upstream_probe_scheduler`, sampled), 10 (`core_hello_sent`, including
+its submission result and endpoint), 13 (`core_ok_hello_authenticated`), 21
+(`core_surface_observed`) on A, and 15/20 (authenticated RENDEZVOUS/candidate
+source) on B. If the gate is still active despite a bound IPv6 interface,
+that is direct evidence of local scheduling delay. If HELLO was submitted
+immediately but Root never authenticated, examine return-path reachability.
+If Root authentication precedes B's new candidate by a long time, the
+remaining delay concerns candidate propagation; A/B logs cannot expose the
+third-party Root's private address cache or timer state.
+
+**No** new HELLO/ECHO/WHOIS is sent by these snapshots; Root timeout/priority,
+path selection, Peer Dial and the existing `connection_probe.ps1` remain
+unchanged.
+
 ## Verify with the existing probe
 
 Use the **existing** `tools/connection_probe.ps1` from the project. Do not

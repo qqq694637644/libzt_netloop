@@ -39,6 +39,9 @@ internal sealed class LibztUnderlayDiagnostics(Func<long>? clock = null)
         29 => "core_surface_expired",
         30 => "core_handover_peer_paths_revalidated",
         31 => "core_handover_whois_decision",
+        32 => "core_handover_background_ping_deadline",
+        33 => "core_handover_root_hello_eligibility",
+        34 => "binder_handover_ipv6_bindings",
         _ => "unknown"
     };
 

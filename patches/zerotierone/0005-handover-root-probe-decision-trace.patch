@@ -1,0 +1,69 @@
+diff --git a/node/Node.cpp b/node/Node.cpp
+index 6d0c7981b..665733191 100644
+--- a/node/Node.cpp
++++ b/node/Node.cpp
+@@ -704,6 +704,64 @@ void Node::clearLocalInterfaceAddresses()
+ 
+ unsigned int Node::revalidatePeerPathsAfterNetworkChange(void *tptr,int64_t now)
+ {
++#ifdef _WIN32
++	// Read-only snapshot of the Root/Planet HELLO scheduler immediately after
++	// Binder rebind. Do not reset upstream paths or send any extra packets.
++	// The ordinary background scheduler may be waiting to check peers at all.
++	const int64_t pingPeriod = (int64_t)ZT_PING_CHECK_INTERVAL * (_lowBandwidthMode ? 5 : 1);
++	const int64_t pingWait = pingPeriod - (now - _lastPingCheck);
++	netloopTrace(tptr,32,0,(uint64_t)_lastPingCheck,
++		_lowBandwidthMode ? 1U : 0U,
++		(int)((pingWait > 0) ? (pingWait > 2147483647LL ? 2147483647LL : pingWait) : 0));
++
++	// Inspect exactly the same designated Root/Moon stable endpoints and
++	// last-full-HELLO timer that _PingPeersThatNeedPing consults. One sample
++	// per IP family per Root (up to eight roots) bounds native log volume.
++	Hashtable< Address,std::vector<InetAddress> > upstreams;
++	RR->topology->getUpstreamsToContact(upstreams);
++	Hashtable< Address,std::vector<InetAddress> >::Iterator upstream(upstreams);
++	Address *rootAddress = (Address *)0;
++	std::vector<InetAddress> *stable = (std::vector<InetAddress> *)0;
++	for (unsigned int logged=0;logged<8 && upstream.next(rootAddress,stable);++logged) {
++		const SharedPtr<Peer> root(RR->topology->getPeerNoCache(*rootAddress));
++		const bool hasPath = root && !root->paths(now).empty();
++		const bool roleIsLeaf = RR->topology->role(*rootAddress) == ZT_PEER_ROLE_LEAF;
++		const int scale = roleIsLeaf ? 2 : (hasPath ? 16 : 0);
++		const int64_t lastHello = root ? root->lastSentFullHello() : 0;
++		const int64_t delay = (int64_t)ZT_PATH_HEARTBEAT_PERIOD * scale - (now - lastHello);
++		const bool gated = root && delay >= 0; // matches the background scheduler's <= test
++		const int waitMs = (!root) ? -1 :
++			((delay > 0) ? (int)(delay > 2147483647LL ? 2147483647LL : delay) : 0);
++		const unsigned int commonFlags = (root ? 1U : 0U)
++			| (hasPath ? 2U : 0U)
++			| (gated ? 4U : 0U)
++			| (roleIsLeaf ? 32U : 0U);
++		bool seenV4 = false;
++		bool seenV6 = false;
++		for (std::vector<InetAddress>::const_iterator ep(stable->begin());ep!=stable->end();++ep) {
++			if (ep->ss_family == AF_INET && !seenV4) {
++				seenV4 = true;
++				netloopTrace(tptr,33,rootAddress->toInt(),(uint64_t)lastHello,
++					commonFlags | 16U,waitMs,&*ep);
++			} else if (ep->ss_family == AF_INET6 && !seenV6) {
++				seenV6 = true;
++				netloopTrace(tptr,33,rootAddress->toInt(),(uint64_t)lastHello,
++					commonFlags | 8U,waitMs,&*ep);
++			}
++			if (seenV4 && seenV6)
++				break;
++		}
++		// Emit missing-family decisions explicitly, rather than interpreting
++		// silence as a missing IPv6 candidate (a truncated trace is different).
++		if (!seenV4)
++			netloopTrace(tptr,33,rootAddress->toInt(),(uint64_t)lastHello,
++				commonFlags | 16U | 64U,-2);
++		if (!seenV6)
++			netloopTrace(tptr,33,rootAddress->toInt(),(uint64_t)lastHello,
++				commonFlags | 8U | 64U,-2);
++	}
++#endif
++
+ 	// Snapshot peer references before sending probes: the send callback and
+ 	// WHOIS may acquire Topology locks. Prioritize most recently heard peers.
+ 	std::vector< std::pair< Address,SharedPtr<Peer> > > peers(RR->topology->allPeers());

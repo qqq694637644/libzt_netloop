@@ -1,0 +1,45 @@
+diff --git a/src/NodeService.cpp b/src/NodeService.cpp
+index ef766f3..f300383 100644
+--- a/src/NodeService.cpp
++++ b/src/NodeService.cpp
+@@ -369,7 +369,7 @@ void NodeService::nodeNetLoopCoreTrace(
+ {
+     // Distinct event namespace from unverified socket-level wire headers.
+     // No encrypted packet content crosses this callback.
+-    if (kind < 10 || kind > 31)
++    if (kind < 10 || kind > 33)
+         return;
+ 
+     if (kind == 26 || kind == 27) {
+@@ -663,6 +663,31 @@ NodeService::ReasonForTermination NodeService::run()
+                     _node->addLocalInterfaceAddress(reinterpret_cast<const struct sockaddr_storage*>(&(*i)));
+ 
+                 if (networkChanged) {
++#ifdef _WIN32
++                    // Snapshot the actual Binder address families after the
++                    // refresh and after syncing interfaces into Core. This
++                    // distinguishes a newly observed public surface from a
++                    // usable local IPv6 binding; no extra socket is opened.
++                    unsigned int binderFamilies = 0;
++                    int globalV6Count = 0;
++                    const InetAddress *firstGlobalV6 = 0;
++                    for (std::vector<InetAddress>::const_iterator i(boundAddrs.begin()); i != boundAddrs.end(); ++i) {
++                        if (i->ss_family == AF_INET)
++                            binderFamilies |= 4U;
++                        else if (i->ss_family == AF_INET6) {
++                            binderFamilies |= 1U;
++                            if (i->ipScope() == InetAddress::IP_SCOPE_GLOBAL) {
++                                binderFamilies |= 2U;
++                                ++globalV6Count;
++                                if (!firstGlobalV6)
++                                    firstGlobalV6 = &*i;
++                            }
++                        }
++                    }
++                    recordUnderlay(34, 0, (uint64_t)now, binderFamilies,
++                                   (uint32_t)boundAddrs.size(), globalV6Count,
++                                   reinterpret_cast<const struct sockaddr_storage*>(firstGlobalV6));
++#endif
+                     // Only an explicit OS physical handover triggers this
+                     // revalidation (never a routine periodic binder refresh).
+                     // Rebind before probing so new sends use current sockets.
