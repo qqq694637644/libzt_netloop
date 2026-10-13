@@ -42,6 +42,8 @@ internal sealed class LibztUnderlayDiagnostics(Func<long>? clock = null)
         32 => "core_handover_background_ping_deadline",
         33 => "core_handover_root_hello_eligibility",
         34 => "binder_handover_ipv6_bindings",
+        35 => "core_handover_root_ipv6_hello_requested",
+        36 => "binder_handover_root_ipv6_hello_batch",
         _ => "unknown"
     };
 

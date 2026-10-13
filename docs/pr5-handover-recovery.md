@@ -128,6 +128,53 @@ third-party Root's private address cache or timer state.
 path selection, Peer Dial and the existing `connection_probe.ps1` remain
 unchanged.
 
+### Windows handover: bounded fast Root IPv6 HELLO
+
+The subsequent A/B trace showed the specific failure: after Binder had a
+different global IPv6 address, known Roots still had memorized paths and the
+ordinary 224-second Full HELLO gate had roughly 170 seconds remaining. The
+normal background tick continued to run, but A did not send a new IPv6 Full
+HELLO to those Roots until the gate expired. After Root IPv6 HELLO/OK,
+authenticated RENDEZVOUS candidates and A→B HTTP recovered shortly afterward.
+That supports accelerating this *specific* handover transition, without
+changing the regular scheduler for ordinary operation.
+
+In the Windows libzt NodeService I/O loop, every Binder refresh now retains a
+deduplicated set of **bound global IPv6 IP addresses** (ignoring UDP source
+ports). On an explicit physical-network notification, the native side opens
+the same 6-second minimum / 2-second quiet handover episode as the managed
+owner. When the bound global IPv6 IP set **actually changes**, once per
+episode, libzt calls `ZT_Node_fastProbeRootIpv6AfterNetworkChange()` after
+rebinding sockets and synchronizing addresses into Core. A changed address
+observed up to 5 seconds before the OS callback also qualifies; if the new
+address appears in a subsequent Binder refresh, the pending episode remains
+eligible for up to 30 seconds after the last callback. No previous baseline,
+only a port rebind, or an empty global IPv6 set does not trigger a probe.
+
+The Core call sends **one standard authenticated Full HELLO** to the first
+configured global IPv6 endpoint of each **already known** non-leaf Root/Moon
+in the `getUpstreamsToContact()` set, capped at **8 Root identities / 8
+HELLOs per handover episode**. It bypasses only the *one-time eligibility
+decision* for this handover; it does not clear or reprioritize memorized Root
+paths, change the normal 224-second timer, send ongoing background probes,
+alter Peer Dial, or disable relay/rendezvous fallback. Root identities without
+an existing Peer entry are skipped rather than implicitly created.
+
+The existing `core_hello_sent` (kind 10) and authenticated `core_ok_hello_*`
+events report actual send submission/response. Two small markers distinguish
+the new fast-path batch:
+
+| Kind | Fields and interpretation |
+| --- | --- |
+| 35 `core_handover_root_ipv6_hello_requested` | One event per known Root for which Core requested a one-time IPv6 HELLO; `peer_id` = Root; `flags=8` = IPv6; `result=1` = requested (not proof of delivery); `endpoint` = chosen Root IPv6 address |
+| 36 `binder_handover_root_ipv6_hello_batch` | Emitted once when a changed Binder global IPv6 IP triggers the batch; `byte_count` = distinct bound global IPv6 IPs; `result` = Roots for which Core requested HELLO (can be 0); `flags=8` = IPv6 |
+
+**This is an actual, bounded network-behavior change**, unlike the previous
+diagnostic-only snapshots. Its benefit and safety require fresh A/B field
+measurements: compare Binder change → Root IPv6 HELLO → authenticated OK →
+B new RENDEZVOUS → successful A→B HTTP using the unchanged probe. Do not
+declare 2-second recovery from offline tests or successful CI alone.
+
 ## Verify with the existing probe
 
 Use the **existing** `tools/connection_probe.ps1` from the project. Do not
@@ -175,12 +222,15 @@ been demonstrated**.
 User A/B logs later confirmed that the Windows episode update suppressed
 repeated destructive Runtime resets; other native link failure remains
 possible. The Single-Flight experiment was reverted. Existing
-`connection_probe.ps1` is unchanged, and this diagnostic addition neither
-changes Core forwarding/path policy nor promises faster real-world recovery.
+`connection_probe.ps1` is unchanged. The Root IPv6 fast HELLO is bounded to
+actual bound-address changes during Windows handover and has **not yet been
+validated** for real-world recovery time or regressions.
 
 Run C# offline checks, Python offline checks and the **Windows x64 CI build**
 from the updated patches. Linux and Android workflows are not part of this PR #5
 recovery verification. Trace ABI stays at version 2 (240 bytes); no
-application restart, credentials reset, identity replacement or new native
-P/Invoke entrypoint is introduced. `ZT_Node_revalidatePeerPathsAfterNetworkChange`
-is internal to the libzt↔ZeroTierOne build.
+application restart, credentials reset, identity replacement or new C#
+P/Invoke entrypoint is introduced. Both
+`ZT_Node_revalidatePeerPathsAfterNetworkChange` and
+`ZT_Node_fastProbeRootIpv6AfterNetworkChange` are internal to the
+libzt↔ZeroTierOne build.

@@ -25,6 +25,7 @@ LIBZT_PATCHES = [
     ROOT / "patches" / "libzt" / "0009-handover-peer-revalidation.patch",
     ROOT / "patches" / "libzt" / "0010-handover-whois-decision-trace.patch",
     ROOT / "patches" / "libzt" / "0011-handover-root-probe-decision-trace.patch",
+    ROOT / "patches" / "libzt" / "0012-handover-fast-root-ipv6-hello.patch",
 ]
 ZERO_TIER_ONE_PATCHES = [
     ROOT / "patches" / "zerotierone" / "0001-netloop-core-path-trace.patch",
@@ -32,6 +33,7 @@ ZERO_TIER_ONE_PATCHES = [
     ROOT / "patches" / "zerotierone" / "0003-netloop-handover-peer-revalidation.patch",
     ROOT / "patches" / "zerotierone" / "0004-handover-whois-decision-trace.patch",
     ROOT / "patches" / "zerotierone" / "0005-handover-root-probe-decision-trace.patch",
+    ROOT / "patches" / "zerotierone" / "0006-handover-fast-root-ipv6-hello.patch",
 ]
 
 
