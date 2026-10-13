@@ -1,5 +1,5 @@
 diff --git a/include/ZeroTierOne.h b/include/ZeroTierOne.h
-index 27b08ff..94d5ec8 100644
+index 27b08ff..dabfac5 100644
 --- a/include/ZeroTierOne.h
 +++ b/include/ZeroTierOne.h
 @@ -1595,6 +1595,14 @@ typedef void (*ZT_EventCallback)(
@@ -17,16 +17,37 @@ index 27b08ff..94d5ec8 100644
  /**
   * Callback for storing and/or publishing state information
   *
-@@ -1768,6 +1776,8 @@ struct ZT_Node_Callbacks
+@@ -1663,6 +1671,18 @@ typedef int (*ZT_WirePacketSendFunction)(
+ 	unsigned int,                     /* Packet length */
+ 	unsigned int);                    /* TTL or 0 to use default */
+ 
++/* Private NetLoop build: explicit physical send mode for fast handover Root
++ * HELLOs. The regular callback remains unchanged for normal Peer/ECHO.
++ * No integer-bit encoding is applied to the localSocket pointer. */
++enum ZT_NetLoopWireSendMode {
++	ZT_NETLOOP_WIRE_SEND_NORMAL = 0,
++	ZT_NETLOOP_WIRE_SEND_REQUIRE_BOUND_SOCKET = 1
++};
++typedef int (*ZT_NetLoopWirePacketSendWithModeFunction)(
++	ZT_Node *,void *,void *,int64_t,
++	const struct sockaddr_storage *,const void *,unsigned int,
++	unsigned int,unsigned int);
++
+ /**
+  * Function to check whether a path should be used for ZeroTier traffic
+  *
+@@ -1768,6 +1788,10 @@ struct ZT_Node_Callbacks
  	 * OPTIONAL: Function to get hints to physical paths to ZeroTier addresses
  	 */
  	ZT_PathLookupFunction pathLookupFunction;
 +	/* NetLoop private build only: optional core control-plane observations. */
 +	ZT_NetLoopTraceFunction netloopTraceFunction;
++	/* OPTIONAL: private strict socket mode; never used for normal packets. */
++	ZT_NetLoopWirePacketSendWithModeFunction netloopWirePacketSendWithModeFunction;
  };
  
  /**
-@@ -2049,6 +2059,27 @@ ZT_SDK_API int ZT_Node_addLocalInterfaceAddress(ZT_Node *node,const struct socka
+@@ -2049,6 +2073,27 @@ ZT_SDK_API int ZT_Node_addLocalInterfaceAddress(ZT_Node *node,const struct socka
   */
  ZT_SDK_API void ZT_Node_clearLocalInterfaceAddresses(ZT_Node *node);
  
@@ -49,13 +70,13 @@ index 27b08ff..94d5ec8 100644
 + * authenticated matching OK(HELLO) stops retries for that Root. Old paths,
 + * Relay and the normal scheduler are unchanged.
 + */
-+ZT_SDK_API unsigned int ZT_Node_fastProbeRootIpv6AfterNetworkChange(ZT_Node *node,void *tptr,int64_t now,int64_t episodeId,int64_t localSocket,unsigned int *pending);
++ZT_SDK_API unsigned int ZT_Node_fastProbeRootIpv6AfterNetworkChange(ZT_Node *node,void *tptr,int64_t now,int64_t episodeId,uint64_t targetId,int64_t localSocket,unsigned int *pending);
 +
  /**
   * Send a VERB_USER_MESSAGE to another ZeroTier node
   *
 diff --git a/node/IncomingPacket.cpp b/node/IncomingPacket.cpp
-index a5dd770..245f8d4 100644
+index a5dd770..9fc8ba5 100644
 --- a/node/IncomingPacket.cpp
 +++ b/node/IncomingPacket.cpp
 @@ -461,6 +461,8 @@ bool IncomingPacket::_doHELLO(const RuntimeEnvironment *RR,void *tPtr,const bool
@@ -91,7 +112,7 @@ index a5dd770..245f8d4 100644
  		case Packet::VERB_HELLO: {
  			const uint64_t latency = RR->node->now() - at<uint64_t>(ZT_PROTO_VERB_HELLO__OK__IDX_TIMESTAMP);
  			const unsigned int vProto = (*this)[ZT_PROTO_VERB_HELLO__OK__IDX_PROTOCOL_VERSION];
-@@ -625,10 +635,16 @@ bool IncomingPacket::_doOK(const RuntimeEnvironment *RR,void *tPtr,const SharedP
+@@ -625,10 +635,17 @@ bool IncomingPacket::_doOK(const RuntimeEnvironment *RR,void *tPtr,const SharedP
  			}
  
  			peer->setRemoteVersion(vProto,vMajor,vMinor,vRevision);
@@ -104,11 +125,12 @@ index a5dd770..245f8d4 100644
 +			// Only a genuine authenticated OK(HELLO) matching the exact fast
 +			// Root IPv6 packet ID cancels that Root's pending retry attempts.
 +			if (!hops())
-+				RR->node->authenticatedHandoverRootHello(peer->address(),inRePacketId,_path->address(),tPtr);
++				RR->node->authenticatedHandoverRootHello(
++					peer->address(),inRePacketId,_path->address(),_path->localSocket(),tPtr);
  		}	break;
  
  		case Packet::VERB_WHOIS:
-@@ -736,7 +752,12 @@ bool IncomingPacket::_doWHOIS(const RuntimeEnvironment *RR,void *tPtr,const Shar
+@@ -736,7 +753,12 @@ bool IncomingPacket::_doWHOIS(const RuntimeEnvironment *RR,void *tPtr,const Shar
  bool IncomingPacket::_doRENDEZVOUS(const RuntimeEnvironment *RR,void *tPtr,const SharedPtr<Peer> &peer)
  {
  	Metrics::pkt_rendezvous_in++;
@@ -122,7 +144,7 @@ index a5dd770..245f8d4 100644
  		const Address with(field(ZT_PROTO_VERB_RENDEZVOUS_IDX_ZTADDRESS,ZT_ADDRESS_LENGTH),ZT_ADDRESS_LENGTH);
  		const SharedPtr<Peer> rendezvousWith(RR->topology->getPeer(tPtr,with));
  		if (rendezvousWith) {
-@@ -744,12 +765,21 @@ bool IncomingPacket::_doRENDEZVOUS(const RuntimeEnvironment *RR,void *tPtr,const
+@@ -744,12 +766,21 @@ bool IncomingPacket::_doRENDEZVOUS(const RuntimeEnvironment *RR,void *tPtr,const
  			const unsigned int addrlen = (*this)[ZT_PROTO_VERB_RENDEZVOUS_IDX_ADDRLEN];
  			if ((port > 0)&&((addrlen == 4)||(addrlen == 16))) {
  				InetAddress atAddr(field(ZT_PROTO_VERB_RENDEZVOUS_IDX_ADDRESS,addrlen),addrlen,port);
@@ -145,140 +167,8 @@ index a5dd770..245f8d4 100644
  		}
  	}
  
-diff --git a/node/NetloopHandoverPolicy.hpp b/node/NetloopHandoverPolicy.hpp
-new file mode 100644
-index 0000000..5aedf43
---- /dev/null
-+++ b/node/NetloopHandoverPolicy.hpp
-@@ -0,0 +1,126 @@
-+/*
-+ * NetLoop's private handover send/retry policy. Kept independent of sockets,
-+ * Windows IP Helper and Node locks so the exact decisions can be unit tested.
-+ */
-+#ifndef ZT_NETLOOP_HANDOVER_POLICY_HPP
-+#define ZT_NETLOOP_HANDOVER_POLICY_HPP
-+
-+#include <stdint.h>
-+
-+namespace ZeroTier {
-+namespace NetloopHandoverPolicy {
-+
-+// A private tag on the Core->libzt wire callback's localSocket argument.
-+// Only fast handover Root HELLOs use it. Windows user-mode pointers never
-+// occupy bit 62. Normal socket IDs (including -1) remain unchanged.
-+static const uint64_t STRICT_ROOT_SOCKET_FLAG = 0x4000000000000000ULL;
-+
-+inline int64_t markStrictRootSocket(int64_t socket)
-+{
-+#ifdef _WIN32
-+    if (socket <= 0 || (static_cast<uint64_t>(socket) & STRICT_ROOT_SOCKET_FLAG))
-+        return -1;
-+    return static_cast<int64_t>(
-+        static_cast<uint64_t>(socket) | STRICT_ROOT_SOCKET_FLAG);
-+#else
-+    return socket;
-+#endif
-+}
-+
-+inline bool isStrictRootSocket(int64_t token)
-+{
-+#ifdef _WIN32
-+    return token > 0 &&
-+        (static_cast<uint64_t>(token) & STRICT_ROOT_SOCKET_FLAG) != 0;
-+#else
-+    (void)token;
-+    return false;
-+#endif
-+}
-+
-+inline int64_t physicalSocket(int64_t token)
-+{
-+    return isStrictRootSocket(token)
-+        ? static_cast<int64_t>(
-+            static_cast<uint64_t>(token) & ~STRICT_ROOT_SOCKET_FLAG)
-+        : token;
-+}
-+
-+enum UdpSendMode {
-+    SEND_SPECIFIED_SOCKET,
-+    FALLBACK_TO_BINDER,
-+    REJECT_STALE_ROOT_SOCKET
-+};
-+
-+inline UdpSendMode udpSendMode(int64_t token, bool boundSocketValid)
-+{
-+    if (boundSocketValid)
-+        return SEND_SPECIFIED_SOCKET;
-+    return isStrictRootSocket(token)
-+        ? REJECT_STALE_ROOT_SOCKET : FALLBACK_TO_BINDER;
-+}
-+
-+// A temporary DAD/IP Helper error does not spend one of three Root HELLO
-+// sends. Never retry beyond the bounded 30-second episode window.
-+enum RootRetryMode {
-+    ROOT_RETRY_STOP,
-+    ROOT_RETRY_DEFER,
-+    ROOT_RETRY_SEND
-+};
-+
-+inline RootRetryMode rootRetryMode(
-+    unsigned int attempts, int64_t startedAt, int64_t now,
-+    bool dadPreferred, bool socketMatchesPreferredInterface)
-+{
-+    if (attempts >= 3 || now < startedAt || now - startedAt >= 30000)
-+        return ROOT_RETRY_STOP;
-+    if (!dadPreferred || !socketMatchesPreferredInterface)
-+        return ROOT_RETRY_DEFER;
-+    return ROOT_RETRY_SEND;
-+}
-+
-+// Packet IDs are registered before the synchronous send callback to avoid
-+// missing a very fast authenticated reply. The owner map is keyed by Root ID.
-+struct RootHelloAttemptState {
-+    uint64_t packetIds[3];
-+    unsigned int attempts;
-+    bool authenticated;
-+
-+    RootHelloAttemptState() : attempts(0), authenticated(false)
-+    {
-+        packetIds[0] = packetIds[1] = packetIds[2] = 0;
-+    }
-+
-+    unsigned int beginAttempt()
-+    {
-+        if (authenticated || attempts >= 3)
-+            return 0;
-+        return ++attempts;
-+    }
-+
-+    void registerPacket(uint64_t packetId)
-+    {
-+        if (!authenticated && attempts && attempts <= 3)
-+            packetIds[attempts - 1] = packetId;
-+    }
-+
-+    bool acknowledge(uint64_t packetId)
-+    {
-+        if (!packetId || authenticated)
-+            return false;
-+        for (unsigned int i = 0; i < attempts; ++i) {
-+            if (packetIds[i] && packetIds[i] == packetId) {
-+                authenticated = true;
-+                return true;
-+            }
-+        }
-+        return false;
-+    }
-+
-+    bool pending() const { return !authenticated && attempts < 3; }
-+};
-+
-+} // namespace NetloopHandoverPolicy
-+} // namespace ZeroTier
-+
-+#endif
 diff --git a/node/Node.cpp b/node/Node.cpp
-index 4913d1a..513d98a 100644
+index 4913d1a..0f8763f 100644
 --- a/node/Node.cpp
 +++ b/node/Node.cpp
 @@ -257,7 +257,20 @@ public:
@@ -337,11 +227,11 @@ index 4913d1a..513d98a 100644
  			if (oldOnline != _online) {
  				postEvent(tptr,_online ? ZT_EVENT_ONLINE : ZT_EVENT_OFFLINE);
  			}
-@@ -671,6 +702,200 @@ void Node::clearLocalInterfaceAddresses()
+@@ -671,6 +702,150 @@ void Node::clearLocalInterfaceAddresses()
  	_directPaths.clear();
  }
  
-+unsigned int Node::fastProbeRootIpv6AfterNetworkChange(void *tptr,int64_t now,int64_t episodeId,int64_t localSocket,unsigned int *pending)
++unsigned int Node::fastProbeRootIpv6AfterNetworkChange(void *tptr,int64_t now,int64_t episodeId,uint64_t targetId,int64_t localSocket,unsigned int *pending)
 +{
 +	if (pending)
 +		*pending = 0;
@@ -349,7 +239,7 @@ index 4913d1a..513d98a 100644
 +	// Only on Windows after the Binder confirms a changed Preferred IPv6.
 +	// Every Root has its own three-attempt budget; ACKed Roots are never
 +	// probed again within this episode. No changes to ordinary Root timers.
-+	if (localSocket <= 0)
++	if (localSocket <= 0 || !targetId)
 +		return 0;
 +	{
 +		Mutex::Lock _l(_handoverRootHellos_m);
@@ -368,28 +258,33 @@ index 4913d1a..513d98a 100644
 +		const SharedPtr<Peer> root(RR->topology->getPeerNoCache(*rootAddress));
 +		if (!root || RR->topology->role(*rootAddress) == ZT_PEER_ROLE_LEAF)
 +			continue;
-+		for (std::vector<InetAddress>::const_iterator ep(stable->begin());ep!=stable->end();++ep) {
-+			if (ep->ss_family != AF_INET6 || ep->ipScope() != InetAddress::IP_SCOPE_GLOBAL)
-+				continue;
-+			unsigned int attempt = 0;
-+			{
-+				// Only guard the bounded retry accounting. Never hold this
-+				// mutex across the topology lookup or wire-send callback.
-+				Mutex::Lock _l(_handoverRootHellos_m);
-+				HandoverRootHello &probe = _handoverRootHellos[rootAddress->toInt()];
-+				attempt = probe.beginAttempt();
-+			}
-+			if (!attempt)
-+				break;
-+			uint64_t packetId = 0;
-+			const bool submitted = root->sendHELLO(
-+				tptr,localSocket,*ep,now,&packetId,true);
-+			netloopTrace(tptr,35,rootAddress->toInt(),packetId,
-+				8U | (attempt << 8),submitted ? 1 : 0,&*ep);
-+			if (submitted)
-+				++accepted;
-+			break; // at most one HELLO for a Root during this attempt
++		std::vector<InetAddress> ipv6Endpoints;
++		for (std::vector<InetAddress>::const_iterator ep(stable->begin());ep!=stable->end();++ep)
++			if (ep->ss_family == AF_INET6 && ep->ipScope() == InetAddress::IP_SCOPE_GLOBAL)
++				ipv6Endpoints.push_back(*ep);
++		if (ipv6Endpoints.empty())
++			continue;
++		unsigned int attempt = 0;
++		{
++			// Only guard bounded accounting, never topology or wire callbacks.
++			Mutex::Lock _l(_handoverRootHellos_m);
++			HandoverRootHello &probe = _handoverRootHellos[rootAddress->toInt()];
++			attempt = probe.beginAttempt(targetId);
 +		}
++		if (!attempt)
++			continue;
++		// Rotate known IPv6 endpoints rather than retrying the first one
++		// three times. A single Root still gets only one HELLO per batch.
++		const InetAddress &endpoint = ipv6Endpoints[
++			NetloopHandoverPolicy::rootEndpointIndex(
++				attempt,(unsigned int)ipv6Endpoints.size())];
++		uint64_t packetId = 0;
++		const bool submitted = root->sendHELLO(
++			tptr,localSocket,endpoint,now,&packetId,true);
++		netloopTrace(tptr,35,rootAddress->toInt(),packetId,
++			8U | (attempt << 8),submitted ? 1 : 0,&endpoint);
++		if (submitted)
++			++accepted;
 +	}
 +	if (pending) {
 +		Mutex::Lock _l(_handoverRootHellos_m);
@@ -404,25 +299,27 @@ index 4913d1a..513d98a 100644
 +	(void)tptr;
 +	(void)now;
 +	(void)episodeId;
++	(void)targetId;
 +	(void)localSocket;
 +	return 0;
 +#endif
 +}
 +
-+void Node::registerHandoverRootHelloPacket(const Address &peer,uint64_t packetId)
++void Node::registerHandoverRootHelloPacket(const Address &peer,uint64_t packetId,int64_t localSocket)
 +{
 +#ifdef _WIN32
 +	Mutex::Lock _l(_handoverRootHellos_m);
 +	std::map<uint64_t,HandoverRootHello>::iterator i(_handoverRootHellos.find(peer.toInt()));
 +	if (i != _handoverRootHellos.end())
-+		i->second.registerPacket(packetId);
++		i->second.registerPacket(packetId,localSocket);
 +#else
 +	(void)peer;
 +	(void)packetId;
++	(void)localSocket;
 +#endif
 +}
 +
-+void Node::authenticatedHandoverRootHello(const Address &peer,uint64_t packetId,const InetAddress &source,void *tptr)
++void Node::authenticatedHandoverRootHello(const Address &peer,uint64_t packetId,const InetAddress &source,int64_t localSocket,void *tptr)
 +{
 +#ifdef _WIN32
 +	if (source.ss_family != AF_INET6)
@@ -432,7 +329,7 @@ index 4913d1a..513d98a 100644
 +		Mutex::Lock _l(_handoverRootHellos_m);
 +		std::map<uint64_t,HandoverRootHello>::iterator i(_handoverRootHellos.find(peer.toInt()));
 +		if (i != _handoverRootHellos.end())
-+			authenticated = i->second.acknowledge(packetId);
++			authenticated = i->second.acknowledge(packetId,localSocket);
 +	}
 +	if (authenticated)
 +		netloopTrace(tptr,38,peer.toInt(),packetId,8U,1,&source);
@@ -440,70 +337,13 @@ index 4913d1a..513d98a 100644
 +	(void)peer;
 +	(void)packetId;
 +	(void)source;
++	(void)localSocket;
 +	(void)tptr;
 +#endif
 +}
 +
 +unsigned int Node::revalidatePeerPathsAfterNetworkChange(void *tptr,int64_t now)
 +{
-+#ifdef _WIN32
-+	// Read-only snapshot of the Root/Planet HELLO scheduler immediately after
-+	// Binder rebind. Do not reset upstream paths or send any extra packets.
-+	// The ordinary background scheduler may be waiting to check peers at all.
-+	const int64_t pingPeriod = (int64_t)ZT_PING_CHECK_INTERVAL * (_lowBandwidthMode ? 5 : 1);
-+	const int64_t pingWait = pingPeriod - (now - _lastPingCheck);
-+	netloopTrace(tptr,32,0,(uint64_t)_lastPingCheck,
-+		_lowBandwidthMode ? 1U : 0U,
-+		(int)((pingWait > 0) ? (pingWait > 2147483647LL ? 2147483647LL : pingWait) : 0));
-+
-+	// Inspect exactly the same designated Root/Moon stable endpoints and
-+	// last-full-HELLO timer that _PingPeersThatNeedPing consults. One sample
-+	// per IP family per Root (up to eight roots) bounds native log volume.
-+	Hashtable< Address,std::vector<InetAddress> > upstreams;
-+	RR->topology->getUpstreamsToContact(upstreams);
-+	Hashtable< Address,std::vector<InetAddress> >::Iterator upstream(upstreams);
-+	Address *rootAddress = (Address *)0;
-+	std::vector<InetAddress> *stable = (std::vector<InetAddress> *)0;
-+	for (unsigned int logged=0;logged<8 && upstream.next(rootAddress,stable);++logged) {
-+		const SharedPtr<Peer> root(RR->topology->getPeerNoCache(*rootAddress));
-+		const bool hasPath = root && !root->paths(now).empty();
-+		const bool roleIsLeaf = RR->topology->role(*rootAddress) == ZT_PEER_ROLE_LEAF;
-+		const int scale = roleIsLeaf ? 2 : (hasPath ? 16 : 0);
-+		const int64_t lastHello = root ? root->lastSentFullHello() : 0;
-+		const int64_t delay = (int64_t)ZT_PATH_HEARTBEAT_PERIOD * scale - (now - lastHello);
-+		const bool gated = root && delay >= 0; // matches the background scheduler's <= test
-+		const int waitMs = (!root) ? -1 :
-+			((delay > 0) ? (int)(delay > 2147483647LL ? 2147483647LL : delay) : 0);
-+		const unsigned int commonFlags = (root ? 1U : 0U)
-+			| (hasPath ? 2U : 0U)
-+			| (gated ? 4U : 0U)
-+			| (roleIsLeaf ? 32U : 0U);
-+		bool seenV4 = false;
-+		bool seenV6 = false;
-+		for (std::vector<InetAddress>::const_iterator ep(stable->begin());ep!=stable->end();++ep) {
-+			if (ep->ss_family == AF_INET && !seenV4) {
-+				seenV4 = true;
-+				netloopTrace(tptr,33,rootAddress->toInt(),(uint64_t)lastHello,
-+					commonFlags | 16U,waitMs,&*ep);
-+			} else if (ep->ss_family == AF_INET6 && !seenV6) {
-+				seenV6 = true;
-+				netloopTrace(tptr,33,rootAddress->toInt(),(uint64_t)lastHello,
-+					commonFlags | 8U,waitMs,&*ep);
-+			}
-+			if (seenV4 && seenV6)
-+				break;
-+		}
-+		// Emit missing-family decisions explicitly, rather than interpreting
-+		// silence as a missing IPv6 candidate (a truncated trace is different).
-+		if (!seenV4)
-+			netloopTrace(tptr,33,rootAddress->toInt(),(uint64_t)lastHello,
-+				commonFlags | 16U | 64U,-2);
-+		if (!seenV6)
-+			netloopTrace(tptr,33,rootAddress->toInt(),(uint64_t)lastHello,
-+				commonFlags | 8U | 64U,-2);
-+	}
-+#endif
-+
 +	// Snapshot peer references before sending probes: the send callback and
 +	// WHOIS may acquire Topology locks. Prioritize most recently heard peers.
 +	std::vector< std::pair< Address,SharedPtr<Peer> > > peers(RR->topology->allPeers());
@@ -538,7 +378,7 @@ index 4913d1a..513d98a 100644
  int Node::sendUserMessage(void *tptr,uint64_t dest,uint64_t typeId,const void *data,unsigned int len)
  {
  	try {
-@@ -1095,6 +1320,26 @@ void ZT_Node_clearLocalInterfaceAddresses(ZT_Node *node)
+@@ -1095,6 +1270,26 @@ void ZT_Node_clearLocalInterfaceAddresses(ZT_Node *node)
  	} catch ( ... ) {}
  }
  
@@ -551,12 +391,12 @@ index 4913d1a..513d98a 100644
 +	}
 +}
 +
-+unsigned int ZT_Node_fastProbeRootIpv6AfterNetworkChange(ZT_Node *node,void *tptr,int64_t now,int64_t episodeId,int64_t localSocket,unsigned int *pending)
++unsigned int ZT_Node_fastProbeRootIpv6AfterNetworkChange(ZT_Node *node,void *tptr,int64_t now,int64_t episodeId,uint64_t targetId,int64_t localSocket,unsigned int *pending)
 +{
 +	if (pending)
 +		*pending = 0;
 +	try {
-+		return reinterpret_cast<ZeroTier::Node *>(node)->fastProbeRootIpv6AfterNetworkChange(tptr,now,episodeId,localSocket,pending);
++		return reinterpret_cast<ZeroTier::Node *>(node)->fastProbeRootIpv6AfterNetworkChange(tptr,now,episodeId,targetId,localSocket,pending);
 +	} catch ( ... ) {
 +		return 0;
 +	}
@@ -566,7 +406,7 @@ index 4913d1a..513d98a 100644
  {
  	try {
 diff --git a/node/Node.hpp b/node/Node.hpp
-index 1f74b83..fe6f6e1 100644
+index 1f74b83..f31383a 100644
 --- a/node/Node.hpp
 +++ b/node/Node.hpp
 @@ -36,6 +36,7 @@
@@ -582,13 +422,31 @@ index 1f74b83..fe6f6e1 100644
  	int addLocalInterfaceAddress(const struct sockaddr_storage *addr);
  	void clearLocalInterfaceAddresses();
 +	unsigned int revalidatePeerPathsAfterNetworkChange(void *tptr,int64_t now);
-+	unsigned int fastProbeRootIpv6AfterNetworkChange(void *tptr,int64_t now,int64_t episodeId,int64_t localSocket,unsigned int *pending);
-+	void registerHandoverRootHelloPacket(const Address &peer,uint64_t packetId);
-+	void authenticatedHandoverRootHello(const Address &peer,uint64_t packetId,const InetAddress &source,void *tptr);
++	unsigned int fastProbeRootIpv6AfterNetworkChange(void *tptr,int64_t now,int64_t episodeId,uint64_t targetId,int64_t localSocket,unsigned int *pending);
++	void registerHandoverRootHelloPacket(const Address &peer,uint64_t packetId,int64_t localSocket);
++	void authenticatedHandoverRootHello(const Address &peer,uint64_t packetId,const InetAddress &source,int64_t localSocket,void *tptr);
  	int sendUserMessage(void *tptr,uint64_t dest,uint64_t typeId,const void *data,unsigned int len);
  	void setNetconfMaster(void *networkControllerInstance);
  
-@@ -171,6 +176,12 @@ public:
+@@ -105,8 +110,16 @@ public:
+ 
+ 	inline int64_t now() const { return _now; }
+ 
+-	inline bool putPacket(void *tPtr,const int64_t localSocket,const InetAddress &addr,const void *data,unsigned int len,unsigned int ttl = 0)
++	inline bool putPacket(void *tPtr,const int64_t localSocket,const InetAddress &addr,const void *data,unsigned int len,
++		unsigned int ttl = 0,unsigned int sendMode = ZT_NETLOOP_WIRE_SEND_NORMAL)
+ 	{
++		if (sendMode != ZT_NETLOOP_WIRE_SEND_NORMAL) {
++			if (!_cb.netloopWirePacketSendWithModeFunction)
++				return false;
++			return (_cb.netloopWirePacketSendWithModeFunction(
++				reinterpret_cast<ZT_Node *>(this),_uPtr,tPtr,localSocket,
++				reinterpret_cast<const struct sockaddr_storage *>(&addr),data,len,ttl,sendMode) == 0);
++		}
+ 		return (_cb.wirePacketSendFunction(
+ 			reinterpret_cast<ZT_Node *>(this),
+ 			_uPtr,
+@@ -171,6 +184,12 @@ public:
  
  	inline void postEvent(void *tPtr,ZT_Event ev,const void *md = (const void *)0) { _cb.eventCallback(reinterpret_cast<ZT_Node *>(this),_uPtr,tPtr,ev,md); }
  
@@ -601,7 +459,7 @@ index 1f74b83..fe6f6e1 100644
  	inline int configureVirtualNetworkPort(void *tPtr,uint64_t nwid,void **nuptr,ZT_VirtualNetworkConfigOperation op,const ZT_VirtualNetworkConfig *nc) { return _cb.virtualNetworkConfigFunction(reinterpret_cast<ZT_Node *>(this),_uPtr,tPtr,nwid,nuptr,op,nc); }
  
  	inline bool online() const { return _online; }
-@@ -318,6 +329,13 @@ private:
+@@ -318,6 +337,13 @@ private:
  	std::vector<InetAddress> _directPaths;
  	Mutex _directPaths_m;
  
@@ -616,7 +474,7 @@ index 1f74b83..fe6f6e1 100644
  
  	Address _remoteTraceTarget;
 diff --git a/node/Peer.cpp b/node/Peer.cpp
-index 2040a3b..3016623 100644
+index 2040a3b..b3dc818 100644
 --- a/node/Peer.cpp
 +++ b/node/Peer.cpp
 @@ -23,11 +23,22 @@
@@ -703,18 +561,18 @@ index 2040a3b..3016623 100644
  		outp.armor(_key,false,nullptr); // false == don't encrypt full payload, but add MAC
 +		if (packetId)
 +			*packetId = outp.packetId();
-+		const int64_t socket = handoverRootProbe
-+			? NetloopHandoverPolicy::markStrictRootSocket(localSocket)
-+			: (RR->node->lowBandwidthModeEnabled() ? localSocket : -1);
-+		// Never silently turn a failed strict Root-socket tag into the
-+		// generic -1 (all Binder interfaces) send path.
++		const int64_t socket = handoverRootProbe ? localSocket :
++			(RR->node->lowBandwidthModeEnabled() ? localSocket : -1);
 +		if (handoverRootProbe && socket <= 0)
 +			return false;
 +		if (handoverRootProbe)
-+			RR->node->registerHandoverRootHelloPacket(_id.address(),outp.packetId());
++			RR->node->registerHandoverRootHelloPacket(_id.address(),outp.packetId(),localSocket);
  		RR->node->expectReplyTo(outp.packetId());
 -		RR->node->putPacket(tPtr,RR->node->lowBandwidthModeEnabled() ? localSocket : -1,atAddress,outp.data(),outp.size());
-+		const bool sent = RR->node->putPacket(tPtr,socket,atAddress,outp.data(),outp.size());
++		const bool sent = RR->node->putPacket(tPtr,socket,atAddress,
++			outp.data(),outp.size(),0,
++			handoverRootProbe ? ZT_NETLOOP_WIRE_SEND_REQUIRE_BOUND_SOCKET
++				: ZT_NETLOOP_WIRE_SEND_NORMAL);
 +		RR->node->netloopTrace(tPtr,10,_id.address().toInt(),outp.packetId(),
 +			1U,sent ? 1 : 0,&atAddress);
 +		return sent;

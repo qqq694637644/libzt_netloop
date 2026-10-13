@@ -151,7 +151,7 @@ index 8aa0a72..4fae296 100644
  {
      ACQUIRE_SERVICE(ZTS_ERR_SERVICE);
 diff --git a/src/NodeService.cpp b/src/NodeService.cpp
-index 036f406..abd3e68 100644
+index 036f406..785f3ca 100644
 --- a/src/NodeService.cpp
 +++ b/src/NodeService.cpp
 @@ -27,6 +27,7 @@
@@ -162,7 +162,7 @@ index 036f406..abd3e68 100644
  
  #if defined(__WINDOWS__)
  #include <iphlpapi.h>
-@@ -41,6 +42,58 @@
+@@ -41,6 +42,63 @@
  
  namespace ZeroTier {
  
@@ -174,10 +174,13 @@ index 036f406..abd3e68 100644
 +static int netloopPreferredIpv6DadState(
 +    const std::vector<InetAddress> &newBoundIps,
 +    const Binder &binder,
-+    InetAddress* preferredIp = 0, int64_t* preferredSocket = 0)
++    InetAddress* preferredIp = 0, int64_t* preferredSocket = 0,
++    uint64_t* preferredLuid = 0)
 +{
 +    if (preferredSocket)
 +        *preferredSocket = -1;
++    if (preferredLuid)
++        *preferredLuid = 0;
 +    PMIB_UNICASTIPADDRESS_TABLE table = (PMIB_UNICASTIPADDRESS_TABLE)0;
 +    const DWORD error = GetUnicastIpAddressTable(AF_INET6, &table);
 +    if (error != NO_ERROR || !table)
@@ -199,6 +202,8 @@ index 036f406..abd3e68 100644
 +                        *preferredIp = *ip;
 +                    if (preferredSocket)
 +                        *preferredSocket = socket;
++                    if (preferredLuid)
++                        *preferredLuid = (uint64_t)row.InterfaceLuid.Value;
 +                    FreeMibTable(table);
 +                    return (int)IpDadStatePreferred;
 +                }
@@ -221,7 +226,7 @@ index 036f406..abd3e68 100644
  static int SnodeVirtualNetworkConfigFunction(
      ZT_Node* node,
      void* uptr,
-@@ -62,6 +115,17 @@ static void SnodeEventCallback(ZT_Node* node, void* uptr, void* tptr, enum ZT_Ev
+@@ -62,6 +120,17 @@ static void SnodeEventCallback(ZT_Node* node, void* uptr, void* tptr, enum ZT_Ev
      reinterpret_cast<NodeService*>(uptr)->nodeEventCallback(event, metaData);
  }
  
@@ -239,7 +244,25 @@ index 036f406..abd3e68 100644
  static void SnodeStatePutFunction(
      ZT_Node* node,
      void* uptr,
-@@ -182,6 +246,7 @@ NodeService::NodeService()
+@@ -105,6 +174,17 @@ static int SnodeWirePacketSendFunction(
+     return reinterpret_cast<NodeService*>(uptr)->nodeWirePacketSendFunction(localSocket, addr, data, len, ttl);
+ }
+ 
++static int SnodeNetLoopWirePacketSendWithModeFunction(
++    ZT_Node* node, void* uptr, void* tptr, int64_t localSocket,
++    const struct sockaddr_storage* addr, const void* data,
++    unsigned int len, unsigned int ttl, unsigned int mode)
++{
++    ZTS_UNUSED_ARG(node);
++    ZTS_UNUSED_ARG(tptr);
++    return reinterpret_cast<NodeService*>(uptr)->nodeWirePacketSendFunction(
++        localSocket, addr, data, len, ttl, mode);
++}
++
+ static void SnodeVirtualNetworkFrameFunction(
+     ZT_Node* node,
+     void* uptr,
+@@ -182,6 +262,7 @@ NodeService::NodeService()
      , _lastSendToGlobalV4(0)
      , _tcpFallbackTunnel((TcpConnection*)0)
      , _lastRestart(0)
@@ -247,7 +270,7 @@ index 036f406..abd3e68 100644
      , _nextBackgroundTaskDeadline(0)
      , _run(false)
      , _termReason(ONE_STILL_RUNNING)
-@@ -210,6 +275,189 @@ NodeService::~NodeService()
+@@ -210,6 +291,189 @@ NodeService::~NodeService()
  #endif
  }
  
@@ -437,7 +460,14 @@ index 036f406..abd3e68 100644
  NodeService::ReasonForTermination NodeService::run()
  {
      _run = true;
-@@ -250,6 +498,9 @@ NodeService::ReasonForTermination NodeService::run()
+@@ -245,11 +509,16 @@ NodeService::ReasonForTermination NodeService::run()
+             cb.stateGetFunction = SnodeStateGetFunction;
+             cb.statePutFunction = SnodeStatePutFunction;
+             cb.wirePacketSendFunction = SnodeWirePacketSendFunction;
++            cb.netloopWirePacketSendWithModeFunction =
++                SnodeNetLoopWirePacketSendWithModeFunction;
+             cb.virtualNetworkFrameFunction = SnodeVirtualNetworkFrameFunction;
+             cb.virtualNetworkConfigFunction = SnodeVirtualNetworkConfigFunction;
              cb.eventCallback = SnodeEventCallback;
              cb.pathCheckFunction = SnodePathCheckFunction;
              cb.pathLookupFunction = SnodePathLookupFunction;
@@ -447,7 +477,7 @@ index 036f406..abd3e68 100644
              _node = new Node(this, (void*)0, &cb, OSUtils::now());
          }
  
-@@ -359,10 +610,30 @@ NodeService::ReasonForTermination NodeService::run()
+@@ -359,10 +628,35 @@ NodeService::ReasonForTermination NodeService::run()
          int64_t lastTapMulticastGroupCheck = 0;
          int64_t lastBindRefresh = 0;
          int64_t lastCleanedPeersDb = 0;
@@ -462,11 +492,16 @@ index 036f406..abd3e68 100644
 +        std::vector<InetAddress> previousGlobalV6;
 +        std::vector<InetAddress> newlyBoundGlobalV6;
 +        bool haveV6Baseline = false;
-+        int64_t lastGlobalV6Change = 0;
 +        int64_t handoverEpisodeStart = 0;
 +        int64_t lastHandoverEpoch = 0;
-+        int64_t handoverLastNotification = 0;
-+        bool rootV6ProbedInEpisode = false;
++        // A new (epoch, LUID, local IPv6) path may rearm Root recovery
++        // without resetting the per-episode total of six send batches.
++        NetloopHandoverPolicy::RootBindingIdentity activeRootTarget;
++        bool haveActiveRootTarget = false;
++        bool rootTargetCheckPending = false;
++        uint64_t nextRootTargetId = 0;
++        uint64_t activeRootTargetId = 0;
++        unsigned int rootV6TotalAttempt = 0;
 +        bool rootV6RetryActive = false;
 +        int64_t rootV6RetryStartedAt = 0;
 +        int64_t nextRootV6RetryAt = 0;
@@ -480,7 +515,7 @@ index 036f406..abd3e68 100644
              _run_m.lock();
              if (! _run) {
                  _run_m.unlock();
-@@ -372,11 +643,31 @@ NodeService::ReasonForTermination NodeService::run()
+@@ -372,11 +666,33 @@ NodeService::ReasonForTermination NodeService::run()
                  break;
              }
              else {
@@ -499,20 +534,22 @@ index 036f406..abd3e68 100644
 +                if (handoverEpoch && handoverEpoch != (uint64_t)lastHandoverEpoch) {
 +                    lastHandoverEpoch = (int64_t)handoverEpoch;
 +                    handoverEpisodeStart = now;
-+                    rootV6ProbedInEpisode = false;
++                    haveActiveRootTarget = false;
++                    rootV6TotalAttempt = 0;
 +                    rootV6RetryActive = false;
 +                    rootV6Attempt = 0;
 +                    lastDadState = -999;
 +                    nextDadCheck = 0;
 +                }
-+                handoverLastNotification = now;
++                newlyBoundGlobalV6.clear();
++                rootTargetCheckPending = true;
 +            }
 +#endif
 +
              // Attempt to detect sleep/wake events by detecting delay
              // overruns
              bool restarted = false;
-@@ -384,22 +675,45 @@ NodeService::ReasonForTermination NodeService::run()
+@@ -384,22 +700,45 @@ NodeService::ReasonForTermination NodeService::run()
                  _lastRestart = now;
                  restarted = true;
              }
@@ -568,7 +605,7 @@ index 036f406..abd3e68 100644
                  lastBindRefresh = now;
                  unsigned int p[3] = { 0 };
                  unsigned int pc = 0;
-@@ -412,10 +726,239 @@ NodeService::ReasonForTermination NodeService::run()
+@@ -412,10 +751,265 @@ NodeService::ReasonForTermination NodeService::run()
                      // Only bother binding UDP ports if we aren't forcing TCP-relay mode
                      _binder.refresh(_phy, p, pc, explicitBind, *this);
                  }
@@ -649,7 +686,7 @@ index 036f406..abd3e68 100644
 +                    }
 +                }
 +                if (ipv6BindingsChanged) {
-+                    lastGlobalV6Change = now;
++                    rootTargetCheckPending = true;
 +                    newlyBoundGlobalV6.clear();
 +                    for (std::vector<InetAddress>::const_iterator ip(currentGlobalV6.begin());
 +                         ip!=currentGlobalV6.end();++ip) {
@@ -664,6 +701,8 @@ index 036f406..abd3e68 100644
 +                        if (!wasPresent)
 +                            newlyBoundGlobalV6.push_back(*ip);
 +                    }
++                    if (newlyBoundGlobalV6.empty())
++                        newlyBoundGlobalV6 = currentGlobalV6;
 +                    nextDadCheck = 0;
 +                    lastDadState = -999;
 +                }
@@ -728,74 +767,98 @@ index 036f406..abd3e68 100644
 +            }
 +
 +#ifdef _WIN32
-+            // First prefer a real, newly bound global IPv6 address that has
-+            // passed Windows DAD. A successful bind of a Tentative address
-+            // is NOT proof the interface can transmit packets yet.
-+            const bool handoverIpv6Pending = !_forceTcpRelay && handoverEpisodeStart
-+                && !rootV6ProbedInEpisode && (now - handoverLastNotification <= 30000)
-+                && !newlyBoundGlobalV6.empty() && lastGlobalV6Change
-+                && (lastGlobalV6Change >= handoverEpisodeStart
-+                    || handoverEpisodeStart - lastGlobalV6Change <= 5000);
-+            if (handoverIpv6Pending && now >= nextDadCheck) {
++            // A physical egress change arms Root recovery immediately.
++            // Further IPv6 changes inside this same epoch may arm a *new*
++            // target, but never reset the six-batch episode budget.
++            const bool inRootRecoveryWindow = !_forceTcpRelay
++                && handoverEpisodeStart > 0
++                && now - handoverEpisodeStart < 30000
++                && rootV6TotalAttempt < 6;
++            if (!inRootRecoveryWindow) {
++                rootV6RetryActive = false;
++                rootTargetCheckPending = false;
++            }
++            if (rootTargetCheckPending && inRootRecoveryWindow && now >= nextDadCheck) {
 +                nextDadCheck = now + 250;
 +                InetAddress candidateIp;
++                int64_t candidateSocket = -1;
++                uint64_t candidateLuid = 0;
++                const std::vector<InetAddress> &candidates =
++                    !newlyBoundGlobalV6.empty() ? newlyBoundGlobalV6 : previousGlobalV6;
 +                int dadState = netloopPreferredIpv6DadState(
-+                    newlyBoundGlobalV6, _binder, &candidateIp);
++                    candidates, _binder, &candidateIp, &candidateSocket, &candidateLuid);
 +                if (dadState != lastDadState) {
 +                    lastDadState = dadState;
 +                    recordUnderlay(37, 0, (uint64_t)now, 8U,
-+                                   (uint32_t)newlyBoundGlobalV6.size(), dadState,
-+                                   reinterpret_cast<const struct sockaddr_storage*>(&newlyBoundGlobalV6.front()));
++                                   (uint32_t)candidates.size(), dadState,
++                                   candidates.empty() ? 0 :
++                                   reinterpret_cast<const struct sockaddr_storage*>(&candidates.front()));
 +                }
 +                if (dadState == (int)IpDadStatePreferred) {
-+                    rootV6ProbedInEpisode = true;
-+                    rootV6RetryActive = true;
-+                    rootV6RetryStartedAt = now;
-+                    nextRootV6RetryAt = now;
-+                    rootV6Attempt = 0;
++                    if (!haveActiveRootTarget ||
++                        !activeRootTarget.matches((uint64_t)lastHandoverEpoch,
++                                                  candidateLuid, candidateIp.rawIpData())) {
++                        activeRootTarget.set((uint64_t)lastHandoverEpoch,
++                                             candidateLuid, candidateIp.rawIpData());
++                        haveActiveRootTarget = true;
++                        activeRootTargetId = ++nextRootTargetId;
++                        rootV6RetryActive = true;
++                        rootV6RetryStartedAt = now;
++                        nextRootV6RetryAt = now;
++                        rootV6Attempt = 0;
++                    }
++                    rootTargetCheckPending = false;
 +                }
-+            }
-+
-+            // One immediate send, then up to two retries at +500ms and
-+            // +1500ms. Core tracks each Root independently and suppresses
-+            // retransmission after the exact authenticated OK(HELLO).
-+            if (rootV6RetryActive && rootV6Attempt < 3
+             }
+ 
++            // Three sends per target, six total per episode. Re-evaluate the
++            // actual Preferred LUID/socket before each send, not once per
++            // handover. ACK must arrive through that same physical socket.
++            if (inRootRecoveryWindow && rootV6RetryActive && rootV6Attempt < 3
 +                && now >= nextRootV6RetryAt) {
-+                // A second physical change or a deprecated/tentative source
-+                // must not cause further fast HELLOs on a superseded IPv6.
-+                if (newlyBoundGlobalV6.empty()) {
++                if (!haveActiveRootTarget) {
 +                    rootV6RetryActive = false;
 +                } else {
 +                    InetAddress preferredIp;
 +                    int64_t localSocket = -1;
++                    uint64_t preferredLuid = 0;
++                    const std::vector<InetAddress> &candidates =
++                        !newlyBoundGlobalV6.empty() ? newlyBoundGlobalV6 : previousGlobalV6;
 +                    const int dadState = netloopPreferredIpv6DadState(
-+                        newlyBoundGlobalV6, _binder, &preferredIp, &localSocket);
++                        candidates, _binder, &preferredIp, &localSocket, &preferredLuid);
++                    const bool selectedTargetStillValid =
++                        dadState == (int)IpDadStatePreferred
++                        && activeRootTarget.matches((uint64_t)lastHandoverEpoch,
++                                                   preferredLuid, preferredIp.rawIpData());
 +                    const NetloopHandoverPolicy::RootRetryMode mode =
 +                        NetloopHandoverPolicy::rootRetryMode(
 +                            rootV6Attempt, rootV6RetryStartedAt, now,
-+                            dadState == (int)IpDadStatePreferred, localSocket != -1);
++                            selectedTargetStillValid, localSocket != -1);
 +                    if (mode == NetloopHandoverPolicy::ROOT_RETRY_STOP) {
 +                        rootV6RetryActive = false;
 +                    } else if (mode == NetloopHandoverPolicy::ROOT_RETRY_DEFER) {
 +                        // Keep the remaining attempts after transient DAD or
 +                        // IP Helper failures, bounded by the episode deadline.
 +                        nextRootV6RetryAt = now + 250;
++                        rootTargetCheckPending = true;
 +                    } else {
 +                        unsigned int pendingRoots = 0;
 +                        const unsigned int submitted = ZT_Node_fastProbeRootIpv6AfterNetworkChange(
-+                            _node, (void*)0, now, lastHandoverEpoch, localSocket, &pendingRoots);
++                            _node, (void*)0, now, lastHandoverEpoch,
++                            activeRootTargetId, localSocket, &pendingRoots);
 +                        recordUnderlay(36, 0, (uint64_t)now, 8U | ((rootV6Attempt + 1) << 8),
 +                                       (uint32_t)newlyBoundGlobalV6.size(), (int32_t)submitted,
 +                                       reinterpret_cast<const struct sockaddr_storage*>(&preferredIp));
 +                        ++rootV6Attempt;
++                        ++rootV6TotalAttempt;
 +                        nextRootV6RetryAt = now + (rootV6Attempt == 1 ? 500 : 1000);
 +                        if (!pendingRoots || rootV6Attempt >= 3)
 +                            rootV6RetryActive = false;
 +                    }
 +                }
-             }
++            }
 +#endif
- 
++
              // Generate callback messages for user application
              generateSyntheticEvents();
 +            // Root-path snapshots are observations, not online policy or
@@ -808,7 +871,7 @@ index 036f406..abd3e68 100644
  
              // Run background task processor in core if it's time to do so
              int64_t dl = _nextBackgroundTaskDeadline;
-@@ -467,27 +1010,6 @@ NodeService::ReasonForTermination NodeService::run()
+@@ -467,27 +1061,6 @@ NodeService::ReasonForTermination NodeService::run()
                  }
              }
  
@@ -836,7 +899,7 @@ index 036f406..abd3e68 100644
              // Clean peers.d periodically
              if ((now - lastCleanedPeersDb) >= 3600000) {
                  lastCleanedPeersDb = now;
-@@ -496,7 +1018,13 @@ NodeService::ReasonForTermination NodeService::run()
+@@ -496,7 +1069,13 @@ NodeService::ReasonForTermination NodeService::run()
                      now - 2592000000LL);   // delete older than 30 days
              }
  
@@ -845,13 +908,13 @@ index 036f406..abd3e68 100644
 +#ifdef _WIN32
 +            // Wake locally to recheck DAD and bounded retry deadlines; this
 +            // adds no periodic network traffic or global timer changes.
-+            if (handoverIpv6Pending || rootV6RetryActive)
++            if ((rootTargetCheckPending && inRootRecoveryWindow) || rootV6RetryActive)
 +                delay = std::min<unsigned long>(delay, 250UL);
 +#endif
              clockShouldBe = now + (uint64_t)delay;
              _phy.poll(delay);
          }
-@@ -566,6 +1094,28 @@ void NodeService::terminate()
+@@ -566,6 +1145,28 @@ void NodeService::terminate()
      _phy.whack();
  }
  
@@ -880,7 +943,7 @@ index 036f406..abd3e68 100644
  void NodeService::syncManagedStuff(NetworkState& n)
  {
      char ipbuf[64] = { 0 };
-@@ -651,6 +1201,18 @@ void NodeService::phyOnDatagram(
+@@ -651,6 +1252,18 @@ void NodeService::phyOnDatagram(
          data,
          len,
          &_nextBackgroundTaskDeadline);
@@ -899,7 +962,7 @@ index 036f406..abd3e68 100644
      if (ZT_ResultCode_isFatal(rc)) {
          char tmp[256] = { 0 };
          OSUtils::ztsnprintf(tmp, sizeof(tmp), "fatal error code from processWirePacket: %d", (int)rc);
-@@ -942,6 +1504,9 @@ void NodeService::nodeEventCallback(enum ZT_Event event, const void* metaData)
+@@ -942,6 +1555,9 @@ void NodeService::nodeEventCallback(enum ZT_Event event, const void* metaData)
              break;
      }
      if (event_code) {
@@ -909,7 +972,7 @@ index 036f406..abd3e68 100644
          sendEventToUser(event_code, NULL);
      }
  }
-@@ -1054,11 +1619,30 @@ void NodeService::sendEventToUser(unsigned int zt_event_code, const void* obj, u
+@@ -1054,11 +1670,30 @@ void NodeService::sendEventToUser(unsigned int zt_event_code, const void* obj, u
          case ZTS_EVENT_PEER_UNREACHABLE:
          case ZTS_EVENT_PEER_PATH_DISCOVERED:
          case ZTS_EVENT_PEER_PATH_DEAD: {
@@ -943,7 +1006,7 @@ index 036f406..abd3e68 100644
              }
              objptr = (void*)pr;
              break;
-@@ -1306,6 +1890,34 @@ int NodeService::getAddrAtIdx(uint64_t net_id, unsigned int idx, char* dst, unsi
+@@ -1306,6 +1941,34 @@ int NodeService::getAddrAtIdx(uint64_t net_id, unsigned int idx, char* dst, unsi
      return ZTS_ERR_OK;
  }
  
@@ -978,7 +1041,7 @@ index 036f406..abd3e68 100644
  int NodeService::getRouteAtIdx(
      uint64_t net_id,
      unsigned int idx,
-@@ -1355,6 +1967,35 @@ int NodeService::getRouteAtIdx(
+@@ -1355,6 +2018,35 @@ int NodeService::getRouteAtIdx(
      return ZTS_ERR_OK;
  }
  
@@ -1014,18 +1077,32 @@ index 036f406..abd3e68 100644
  int NodeService::getMulticastSubAtIdx(uint64_t net_id, unsigned int idx, uint64_t* mac, uint32_t* adi)
  {
      std::map<uint64_t, NetworkState>::const_iterator n(_nets.find(net_id));
-@@ -1797,17 +2438,39 @@ int NodeService::nodeWirePacketSendFunction(
+@@ -1718,7 +2410,8 @@ int NodeService::nodeWirePacketSendFunction(
+     const struct sockaddr_storage* addr,
+     const void* data,
+     unsigned int len,
+-    unsigned int ttl)
++    unsigned int ttl,
++    unsigned int sendMode)
+ {
+     if (_allowTcpRelay) {
+         if (addr->ss_family == AF_INET) {
+@@ -1797,17 +2490,43 @@ int NodeService::nodeWirePacketSendFunction(
      // working we can instantly "fail forward" to it and stop using TCP
      // proxy fallback, which is slow.
  
 -    if ((localSocket != -1) && (localSocket != 0) && (_binder.isUdpSocketValid((PhySocket*)((uintptr_t)localSocket)))) {
-+    const int64_t physicalSocket = NetloopHandoverPolicy::physicalSocket(localSocket);
++    if (sendMode != ZT_NETLOOP_WIRE_SEND_NORMAL
++        && sendMode != ZT_NETLOOP_WIRE_SEND_REQUIRE_BOUND_SOCKET)
++        return -1;
++    const int64_t physicalSocket = localSocket;
 +    const bool socketValid =
 +        physicalSocket > 0 && _binder.isUdpSocketValid((PhySocket*)((uintptr_t)physicalSocket));
-+    const NetloopHandoverPolicy::UdpSendMode sendMode =
-+        NetloopHandoverPolicy::udpSendMode(localSocket, socketValid);
++    const NetloopHandoverPolicy::UdpSendMode selectedMode =
++        NetloopHandoverPolicy::udpSendMode(
++            sendMode == ZT_NETLOOP_WIRE_SEND_REQUIRE_BOUND_SOCKET, socketValid);
 +    int sent = -1;
-+    if (sendMode == NetloopHandoverPolicy::SEND_SPECIFIED_SOCKET) {
++    if (selectedMode == NetloopHandoverPolicy::SEND_SPECIFIED_SOCKET) {
          if ((ttl) && (addr->ss_family == AF_INET))
 -            _phy.setIp4UdpTtl((PhySocket*)((uintptr_t)localSocket), ttl);
 -        const bool r = _phy.udpSend((PhySocket*)((uintptr_t)localSocket), (const struct sockaddr*)addr, data, len);
@@ -1045,7 +1122,7 @@ index 036f406..abd3e68 100644
 +                              known ? &sendBinding : 0, known ? sendInterface : 0);
 +        }
 +    }
-+    else if (sendMode == NetloopHandoverPolicy::REJECT_STALE_ROOT_SOCKET) {
++    else if (selectedMode == NetloopHandoverPolicy::REJECT_STALE_ROOT_SOCKET) {
 +        // Only the marked handover Root HELLO may not fan out after its
 +        // Preferred IPv6/LUID-specific socket becomes stale.
 +        sent = -1;
@@ -1060,7 +1137,7 @@ index 036f406..abd3e68 100644
  }
  
  void NodeService::nodeVirtualNetworkFrameFunction(
-@@ -1843,6 +2506,7 @@ int NodeService::nodePathCheckFunction(
+@@ -1843,6 +2562,7 @@ int NodeService::nodePathCheckFunction(
                  std::vector<InetAddress> ips(n->second.tap->ips());
                  for (std::vector<InetAddress>::const_iterator i(ips.begin()); i != ips.end(); ++i) {
                      if (i->containsAddress(*(reinterpret_cast<const InetAddress*>(remoteAddr)))) {
@@ -1068,7 +1145,7 @@ index 036f406..abd3e68 100644
                          return 0;
                      }
                  }
-@@ -1874,6 +2538,7 @@ int NodeService::nodePathCheckFunction(
+@@ -1874,6 +2594,7 @@ int NodeService::nodePathCheckFunction(
          if (l) {
              for (std::vector<InetAddress>::const_iterator a(l->begin()); a != l->end(); ++a) {
                  if (a->containsAddress(*reinterpret_cast<const InetAddress*>(remoteAddr))) {
@@ -1076,7 +1153,7 @@ index 036f406..abd3e68 100644
                      return 0;
                  }
              }
-@@ -1882,10 +2547,12 @@ int NodeService::nodePathCheckFunction(
+@@ -1882,10 +2603,12 @@ int NodeService::nodePathCheckFunction(
      if (gbl) {
          for (std::vector<InetAddress>::const_iterator a(gbl->begin()); a != gbl->end(); ++a) {
              if (a->containsAddress(*reinterpret_cast<const InetAddress*>(remoteAddr))) {
@@ -1090,7 +1167,7 @@ index 036f406..abd3e68 100644
  }
  
 diff --git a/src/NodeService.hpp b/src/NodeService.hpp
-index c600bbc..ae73db8 100644
+index c600bbc..e90350c 100644
 --- a/src/NodeService.hpp
 +++ b/src/NodeService.hpp
 @@ -31,6 +31,9 @@
@@ -1191,7 +1268,17 @@ index c600bbc..ae73db8 100644
  
      int getMulticastSubAtIdx(uint64_t net_id, unsigned int idx, uint64_t* mac, uint32_t* adi);
  
-@@ -433,6 +480,8 @@ class NodeService {
+@@ -384,7 +431,8 @@ class NodeService {
+         const struct sockaddr_storage* addr,
+         const void* data,
+         unsigned int len,
+-        unsigned int ttl);
++        unsigned int ttl,
++        unsigned int sendMode = ZT_NETLOOP_WIRE_SEND_NORMAL);
+ 
+     void nodeVirtualNetworkFrameFunction(
+         uint64_t net_id,
+@@ -433,6 +481,8 @@ class NodeService {
      /** Get the primary port */
      unsigned short getPrimaryPort() const;
  

@@ -39,7 +39,7 @@ internal static class Program
             await CheckAsync("UDP Factory concurrent disposal", UdpFactoryDisposal);
             await CheckAsync("Startup processes physical events while Node waits", StartupPhysicalRefresh);
             Check("Rapid physical events retain the final network notification", RapidPhysicalEventDelivery);
-            Check("One Windows handover epoch survives notifications and startup refresh retries", HandoverEpochSequence);
+            Check("Physical egress defines epochs across rapid switches and startup retries", HandoverEpochSequence);
             await CheckAsync("Peer dialing is bounded across simultaneous SOCKS requests", PeerDialAdmission);
             await CheckAsync("Peer dialing releases canceled waiters and isolates different peers", PeerDialCancellation);
             await CheckAsync("Peer failure backoff does not hold established TCP", PeerDialCooldown);
@@ -675,30 +675,56 @@ internal static class Program
 
     private static void HandoverEpochSequence()
     {
-        long now = 10_000;
-        var episodes = new PhysicalHandoverEpisode(() => now);
-        Require(episodes.Epoch == 0 && episodes.Observe() && episodes.Epoch == 1,
-            "First Windows network notification must allocate epoch 1");
-        now += 1_000;
-        Require(!episodes.Observe() && episodes.Epoch == 1,
-            "Nearby network notifications must not split an episode");
-        now += 4_500;
-        Require(!episodes.Observe() && episodes.Epoch == 1,
-            "Notifications inside six seconds still share epoch 1");
-        now += 500;
-        Require(!episodes.Observe() && episodes.Epoch == 1,
-            "Six seconds elapsed is insufficient without two seconds of quiet");
-        now += 2_000;
-        Require(episodes.Observe() && episodes.Epoch == 2,
-            "New episode must start only after both minimum and quiet periods");
-        now += 100;
-        Require(!episodes.Observe() && episodes.Epoch == 2,
-            "Late Binder notification within same episode changed the epoch");
+        var wifi = new PhysicalEgressIdentity(
+            "nic-wifi", "192.168.1.10", "192.168.1.1", "20010DB800000001");
+        var hotspot = new PhysicalEgressIdentity(
+            "nic-mobile", "192.168.43.10", "192.168.43.1", "20010DB800000002");
+        var sameAdapterNewRoute = new PhysicalEgressIdentity(
+            "nic-wifi", "10.0.0.27", "10.0.0.1", "20010DB800000003");
+
+        var episodes = new PhysicalHandoverEpisode();
+        episodes.Seed(wifi);
+        Require(!episodes.Observe(wifi) && episodes.Epoch == 0,
+            "Repeated same-outlet address notification reset an established runtime");
+        Require(!episodes.Observe(PhysicalEgressIdentity.CaptureFailed)
+                && episodes.Epoch == 0,
+            "Transient IP Helper failure must not invent a network disconnect");
+        Require(episodes.Observe(null, reportedUnavailable: true) && episodes.Epoch == 1,
+            "Physical disconnect must start a destructive handover");
+        Require(!episodes.Observe(null, reportedUnavailable: true) && episodes.Epoch == 1,
+            "Duplicate disconnect notifications must share an epoch");
+        Require(!episodes.Observe(hotspot) && episodes.Epoch == 1,
+            "Reconnect after the disconnect belongs to its existing epoch");
+        Require(!episodes.Observe(hotspot) && episodes.Epoch == 1,
+            "Duplicate hotspot callbacks must not reset twice");
+        Require(episodes.Observe(wifi) && episodes.Epoch == 2,
+            "Hotspot-to-Wi-Fi switch in under six seconds must get a NEW epoch");
+        Require(episodes.Observe(sameAdapterNewRoute) && episodes.Epoch == 3,
+            "Same Wi-Fi adapter with a new gateway/source is a different exit");
+        var bssidA = wifi with { WifiBssid = "02:11:22:33:44:55" };
+        var bssidB = wifi with { WifiBssid = "02:11:22:33:44:66" };
+        var accessPoints = new PhysicalHandoverEpisode();
+        accessPoints.Seed(bssidA);
+        Require(accessPoints.Observe(bssidB) && accessPoints.Epoch == 1,
+            "Different Wi-Fi BSSIDs with identical DHCP settings are separate exits");
+        Require(!accessPoints.Observe(bssidB) && accessPoints.Epoch == 1,
+            "Repeated callback from same BSSID must not reset");
+
+        var delayedV6 = new PhysicalHandoverEpisode();
+        delayedV6.Seed(new PhysicalEgressIdentity(
+            "nic-wifi", "10.0.0.27", "10.0.0.1", ""));
+        Require(!delayedV6.Observe(sameAdapterNewRoute) && delayedV6.Epoch == 0,
+            "IPv6 DAD becoming available cannot split one physical handover");
+        Require(delayedV6.Observe(sameAdapterNewRoute with {
+            IPv6Prefix = "20010DB800000099"
+        }) && delayedV6.Epoch == 1,
+            "Real IPv6 prefix change must identify a new physical exit");
 
         // Model Runtime creation: multiple events are consumed while the
-        // Node is unavailable; a pending Native refresh retains its epoch.
-        long startupClock = 0;
-        var waiting = new PhysicalHandoverEpisode(() => startupClock);
+        // Node is unavailable; a pending Native refresh retains its epoch
+        // even when the physical network changes again before Runtime Ready.
+        var waiting = new PhysicalHandoverEpisode();
+        waiting.Seed(wifi);
         var events = Channel.CreateUnbounded<RuntimeOwner.Event>();
         bool pending = false;
         RuntimeOwner.Event? deferred = null;
@@ -710,35 +736,33 @@ internal static class Program
             return nativeReady;
         }
 
-        RuntimeOwner.QueuePhysicalNetworkRefresh(events.Writer, "wifi_down");
-        RuntimeOwner.QueuePhysicalNetworkRefresh(events.Writer, "wifi_connecting");
+        RuntimeOwner.QueuePhysicalNetworkRefresh(events.Writer, "network_unavailable");
+        RuntimeOwner.QueuePhysicalNetworkRefresh(events.Writer, "network_available", hotspot);
         RuntimeOwner.DrainPendingWaitingEvents(
             events.Reader, Notify, ref pending, ref deferred,
-            () => waiting.Observe());
+            notification => waiting.Observe(
+                notification.Egress, notification.Reason == "network_unavailable"));
         Require(pending && waiting.Epoch == 1
                 && delivered.SequenceEqual(new ulong[] { 1 }),
             "Combined waiting notifications must share epoch 1");
 
         nativeReady = true;
-        startupClock = 250;
         Require(RuntimeOwner.TryDeliverPendingPhysicalRefresh(
                     ref pending, Notify)
                 && !pending && delivered[^1] == 1,
             "Native startup retry must deliver the same epoch");
 
-        startupClock = 4_000;
-        RuntimeOwner.QueuePhysicalNetworkRefresh(events.Writer, "wifi_preferred");
+        RuntimeOwner.QueuePhysicalNetworkRefresh(events.Writer, "network_address_changed", hotspot);
         RuntimeOwner.DrainPendingWaitingEvents(
             events.Reader, Notify, ref pending, ref deferred,
-            () => waiting.Observe());
+            notification => waiting.Observe(notification.Egress));
         Require(!pending && waiting.Epoch == 1 && delivered[^1] == 1,
             "Binder refresh after startup must keep the original epoch");
 
-        startupClock = 8_000;
-        RuntimeOwner.QueuePhysicalNetworkRefresh(events.Writer, "next_wifi_handover");
+        RuntimeOwner.QueuePhysicalNetworkRefresh(events.Writer, "network_address_changed", wifi);
         RuntimeOwner.DrainPendingWaitingEvents(
             events.Reader, Notify, ref pending, ref deferred,
-            () => waiting.Observe());
+            notification => waiting.Observe(notification.Egress));
         Require(!pending && waiting.Epoch == 2 && delivered[^1] == 2,
             "A later physical handover must allocate and deliver epoch 2");
     }

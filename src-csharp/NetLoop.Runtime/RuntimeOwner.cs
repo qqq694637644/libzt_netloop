@@ -31,7 +31,8 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
 {
     internal enum EventKind { Config, Unavailable, Physical, Manual }
     internal sealed record Event(
-        EventKind Kind, string Reason, LibztNetworkState? Network = null);
+        EventKind Kind, string Reason, LibztNetworkState? Network = null,
+        PhysicalEgressIdentity? Egress = null);
 
     private readonly Channel<Event> _events = Channel.CreateBounded<Event>(
         new BoundedChannelOptions(64) {
@@ -60,18 +61,23 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
     internal NetLoopRuntime? Current => Volatile.Read(ref _active);
     internal int ResetCount => _resetCount;
 
-    internal void RequestPhysicalNetworkRefresh(string reason)
+    internal void SeedPhysicalEgress(PhysicalEgressIdentity? initial)
+        => _handoverEpisode.Seed(initial);
+
+    internal void RequestPhysicalNetworkRefresh(
+        string reason, PhysicalEgressIdentity? egress = null)
     {
         // The platform monitors already debounce transient address changes.
         // Never discard a second notification based on its arrival time: it
         // may describe the final usable interface after an earlier refresh
         // ran against a not-yet-ready network. The owner coalesces notifications
         // while waiting for native startup/runtime creation.
-        QueuePhysicalNetworkRefresh(_events.Writer, reason);
+        QueuePhysicalNetworkRefresh(_events.Writer, reason, egress);
     }
 
-    internal static void QueuePhysicalNetworkRefresh(ChannelWriter<Event> writer, string reason)
-        => writer.TryWrite(new Event(EventKind.Physical, reason));
+    internal static void QueuePhysicalNetworkRefresh(
+        ChannelWriter<Event> writer, string reason, PhysicalEgressIdentity? egress = null)
+        => writer.TryWrite(new Event(EventKind.Physical, reason, Egress: egress));
 
     internal void RequestManualReset(string reason)
         => _events.Writer.TryWrite(new Event(EventKind.Manual, reason));
@@ -119,22 +125,24 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
             ref _deferredManualReset,
             OnPhysicalEventWhileWaiting);
 
-    private void OnPhysicalEventWhileWaiting()
+    private void OnPhysicalEventWhileWaiting(Event notification)
     {
         // Runtime recreation can overlap a burst of OS notifications. They
         // still refresh the native Binder, but must extend the same episode.
         if (OperatingSystem.IsWindows())
-            _handoverEpisode.Observe();
+            _handoverEpisode.Observe(notification.Egress,
+                notification.Reason == "network_unavailable");
     }
 
-    private bool BeginPhysicalEpisodeIfSettled()
+    private bool BeginPhysicalEpisodeIfSettled(Event notification)
     {
         // This owner is shared by Windows, Linux and Android. Limit the new
         // coalescing policy to Windows; preserve other platforms' behavior.
         if (!OperatingSystem.IsWindows())
             return true;
 
-        return _handoverEpisode.Observe();
+        return _handoverEpisode.Observe(notification.Egress,
+            notification.Reason == "network_unavailable");
     }
 
     internal static void DrainPendingWaitingEvents(
@@ -142,7 +150,7 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
         Func<bool> tryNotifyPhysicalNetworkChanged,
         ref bool physicalRefreshPending,
         ref Event? deferredManualReset,
-        Action? onPhysicalEvent = null)
+        Action<Event>? onPhysicalEvent = null)
     {
         while (events.TryRead(out var notification))
         {
@@ -150,7 +158,7 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
             {
                 case EventKind.Physical:
                     physicalRefreshPending = true;
-                    onPhysicalEvent?.Invoke();
+                    onPhysicalEvent?.Invoke(notification);
                     break;
                 case EventKind.Manual:
                     deferredManualReset = notification;
@@ -350,7 +358,7 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
                                     // consumed during Runtime creation extend
                                     // the episode without creating a new one.
                                     var destructiveHandover =
-                                        BeginPhysicalEpisodeIfSettled();
+                                        BeginPhysicalEpisodeIfSettled(currentEvent);
                                     _physicalRefreshPending = true;
                                     if (!TryDeliverPendingPhysicalRefresh(
                                             ref _physicalRefreshPending,

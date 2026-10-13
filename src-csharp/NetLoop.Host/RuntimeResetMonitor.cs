@@ -10,7 +10,7 @@ internal sealed class RuntimeResetMonitor : IAsyncDisposable
 
     private readonly string? _commandFile;
     private readonly TimeSpan _debounce;
-    private readonly Action<string> _requestReset;
+    private readonly Action<string, PhysicalEgressIdentity?> _requestReset;
     private readonly CancellationTokenSource _stop = new();
     private readonly object _debounceGate = new();
     private readonly object _availabilityGate = new();
@@ -23,7 +23,7 @@ internal sealed class RuntimeResetMonitor : IAsyncDisposable
     internal RuntimeResetMonitor(
         string? commandFile,
         TimeSpan debounce,
-        Action<string> requestReset)
+        Action<string, PhysicalEgressIdentity?> requestReset)
     {
         _commandFile = string.IsNullOrWhiteSpace(commandFile)
             ? null
@@ -172,7 +172,10 @@ internal sealed class RuntimeResetMonitor : IAsyncDisposable
     private void RequestReset(string reason)
     {
         JsonLog.Info("runtime_reset_requested", new { reason });
-        _requestReset(reason);
+        // Snapshot the effective physical route *when the debounce completes*.
+        // The owner may not process the event until after another Wi-Fi switch.
+        _requestReset(reason, reason.StartsWith("network_", StringComparison.Ordinal)
+            ? PhysicalEgressIdentity.Capture() : null);
     }
 
     public async ValueTask DisposeAsync()

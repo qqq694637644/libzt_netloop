@@ -127,7 +127,7 @@ public sealed class LibztNode : IAsyncDisposable
         }
     }
 
-    public bool TryNotifyPhysicalNetworkChanged(ulong handoverEpoch = 0)
+    public bool TryNotifyPhysicalNetworkChanged(ulong handoverEpoch)
     {
         // A NodeStart return does not imply NetJoin has been submitted.
         // Keep the owner's pending refresh until native network join begins,
