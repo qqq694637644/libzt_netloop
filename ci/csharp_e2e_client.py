@@ -423,8 +423,6 @@ def start_client(
             [
                 "--reset-command-file",
                 str(reset_command_path),
-                "--reset-debounce-ms",
-                "250",
             ]
         )
 

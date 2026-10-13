@@ -120,7 +120,6 @@ internal static class Program
 
         await using var resetMonitor = new RuntimeResetMonitor(
             options.ResetCommandFile,
-            options.ResetEventDebounce,
             OnMonitorEvent);
         resetMonitor.Start();
 

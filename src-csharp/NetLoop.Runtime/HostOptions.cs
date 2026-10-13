@@ -35,7 +35,6 @@ internal sealed class HostOptions
             "--udp-queue-capacity",
             "--udp-send-timeout",
             "--udp-idle-timeout",
-            "--reset-debounce-ms",
             "--reset-command-file"
         ],
         StringComparer.Ordinal);
@@ -69,7 +68,6 @@ internal sealed class HostOptions
     internal int RelayBufferKiB { get; init; } = 64;
     internal int UdpQueueCapacity { get; init; } = 256;
     internal TimeSpan UdpSendTimeout { get; init; } = TimeSpan.FromSeconds(30);
-    internal TimeSpan ResetEventDebounce { get; init; } = TimeSpan.FromMilliseconds(250);
     internal string? ResetCommandFile { get; init; }
     internal bool ShowHelp { get; init; }
     internal bool ShowVersion { get; init; }
@@ -193,7 +191,6 @@ internal sealed class HostOptions
             UdpQueueCapacity = ParseBoundedInt(values, "--udp-queue-capacity", 256, 16, 4096),
             UdpSendTimeout = TimeSpan.FromSeconds(
                 ParseBoundedInt(values, "--udp-send-timeout", 30, 1, 120)),
-            ResetEventDebounce = TimeSpan.FromMilliseconds(ParsePositiveInt(Optional(values, "--reset-debounce-ms") ?? "250", "--reset-debounce-ms")),
             ResetCommandFile = Optional(values, "--reset-command-file")
         };
     }
@@ -270,7 +267,6 @@ internal sealed class HostOptions
           --udp-queue-capacity <count> Per-transport UDP receive queue cap (default 256; 16..4096)
           --udp-send-timeout <sec>   Overlay UDP per-datagram forwarding deadline (default 30; 1..120)
           --udp-idle-timeout <sec>    UDP association idle timeout (default 60)
-          --reset-debounce-ms <ms>    Coalesce OS network-change events (default 250)
           --reset-command-file <path> Optional deterministic reset trigger input
           --version
           --help

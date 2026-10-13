@@ -1,5 +1,10 @@
 # PR #5: physical network handover / Peer path revalidation
 
+> 历史实现说明：PR #7 已取代本节的 Windows 250ms 防抖与 6s/2s
+> episode 时间分组。Windows 现在按每条回调即时采集到的实际出站
+> IPv4/IPv6 路由生成 epoch，并对失败采集执行有限重试。
+> 请以 `docs/pr7-native-debt-cleanup.md` 为当前规则。
+
 ## Scope
 
 A confirmed OS physical network change should abort old SOCKS/overlay business

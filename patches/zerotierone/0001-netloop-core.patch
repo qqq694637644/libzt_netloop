@@ -169,10 +169,10 @@ index a5dd770..9fc8ba5 100644
  
 diff --git a/node/NetloopHandoverPolicy.hpp b/node/NetloopHandoverPolicy.hpp
 new file mode 100644
-index 0000000..bfbe71d
+index 0000000..bdac756
 --- /dev/null
 +++ b/node/NetloopHandoverPolicy.hpp
-@@ -0,0 +1,140 @@
+@@ -0,0 +1,141 @@
 +/*
 + * NetLoop private, side-effect-free Windows handover policies.
 + * Used by Node/Peer and libzt NodeService; directly tested in CI.
@@ -246,7 +246,8 @@ index 0000000..bfbe71d
 +    return ROOT_RETRY_SEND;
 +}
 +
-+// Root identity -> per-target packet state, with a six-send per-epoch cap.
++// Root identity -> per-target packet state: up to six HELLO submissions
++// PER ROOT across targets in an epoch (not six UDP packets in total).
 +// Exact locally received socket is required for authentication success.
 +struct RootHelloAttemptState {
 +    uint64_t packetIds[3];

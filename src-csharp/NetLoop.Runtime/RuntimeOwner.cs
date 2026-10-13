@@ -67,7 +67,7 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
     internal void RequestPhysicalNetworkRefresh(
         string reason, PhysicalEgressIdentity? egress = null)
     {
-        // The platform monitors already debounce transient address changes.
+        // Windows captures physical egress on callback arrival (no debounce).
         // Never discard a second notification based on its arrival time: it
         // may describe the final usable interface after an earlier refresh
         // ran against a not-yet-ready network. The owner coalesces notifications

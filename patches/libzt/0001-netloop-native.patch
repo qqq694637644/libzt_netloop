@@ -151,7 +151,7 @@ index 8aa0a72..4fae296 100644
  {
      ACQUIRE_SERVICE(ZTS_ERR_SERVICE);
 diff --git a/src/NodeService.cpp b/src/NodeService.cpp
-index 036f406..785f3ca 100644
+index 036f406..0220b38 100644
 --- a/src/NodeService.cpp
 +++ b/src/NodeService.cpp
 @@ -27,6 +27,7 @@
@@ -495,7 +495,7 @@ index 036f406..785f3ca 100644
 +        int64_t handoverEpisodeStart = 0;
 +        int64_t lastHandoverEpoch = 0;
 +        // A new (epoch, LUID, local IPv6) path may rearm Root recovery
-+        // without resetting the per-episode total of six send batches.
++        // without resetting the per-episode total of six Root probe batches.
 +        NetloopHandoverPolicy::RootBindingIdentity activeRootTarget;
 +        bool haveActiveRootTarget = false;
 +        bool rootTargetCheckPending = false;
@@ -605,7 +605,7 @@ index 036f406..785f3ca 100644
                  lastBindRefresh = now;
                  unsigned int p[3] = { 0 };
                  unsigned int pc = 0;
-@@ -412,10 +751,265 @@ NodeService::ReasonForTermination NodeService::run()
+@@ -412,10 +751,268 @@ NodeService::ReasonForTermination NodeService::run()
                      // Only bother binding UDP ports if we aren't forcing TCP-relay mode
                      _binder.refresh(_phy, p, pc, explicitBind, *this);
                  }
@@ -770,6 +770,8 @@ index 036f406..785f3ca 100644
 +            // A physical egress change arms Root recovery immediately.
 +            // Further IPv6 changes inside this same epoch may arm a *new*
 +            // target, but never reset the six-batch episode budget.
++            // Each batch may send once to each eligible Root (up to 8);
++            // six batches do not mean six total UDP packets.
 +            const bool inRootRecoveryWindow = !_forceTcpRelay
 +                && handoverEpisodeStart > 0
 +                && now - handoverEpisodeStart < 30000
@@ -811,7 +813,8 @@ index 036f406..785f3ca 100644
 +                }
              }
  
-+            // Three sends per target, six total per episode. Re-evaluate the
++            // Three batches per target, six batches per episode. Each batch
++            // may send to several Roots. Re-evaluate the
 +            // actual Preferred LUID/socket before each send, not once per
 +            // handover. ACK must arrive through that same physical socket.
 +            if (inRootRecoveryWindow && rootV6RetryActive && rootV6Attempt < 3
@@ -871,7 +874,7 @@ index 036f406..785f3ca 100644
  
              // Run background task processor in core if it's time to do so
              int64_t dl = _nextBackgroundTaskDeadline;
-@@ -467,27 +1061,6 @@ NodeService::ReasonForTermination NodeService::run()
+@@ -467,27 +1064,6 @@ NodeService::ReasonForTermination NodeService::run()
                  }
              }
  
@@ -899,7 +902,7 @@ index 036f406..785f3ca 100644
              // Clean peers.d periodically
              if ((now - lastCleanedPeersDb) >= 3600000) {
                  lastCleanedPeersDb = now;
-@@ -496,7 +1069,13 @@ NodeService::ReasonForTermination NodeService::run()
+@@ -496,7 +1072,13 @@ NodeService::ReasonForTermination NodeService::run()
                      now - 2592000000LL);   // delete older than 30 days
              }
  
@@ -914,7 +917,7 @@ index 036f406..785f3ca 100644
              clockShouldBe = now + (uint64_t)delay;
              _phy.poll(delay);
          }
-@@ -566,6 +1145,28 @@ void NodeService::terminate()
+@@ -566,6 +1148,28 @@ void NodeService::terminate()
      _phy.whack();
  }
  
@@ -943,7 +946,7 @@ index 036f406..785f3ca 100644
  void NodeService::syncManagedStuff(NetworkState& n)
  {
      char ipbuf[64] = { 0 };
-@@ -651,6 +1252,18 @@ void NodeService::phyOnDatagram(
+@@ -651,6 +1255,18 @@ void NodeService::phyOnDatagram(
          data,
          len,
          &_nextBackgroundTaskDeadline);
@@ -962,7 +965,7 @@ index 036f406..785f3ca 100644
      if (ZT_ResultCode_isFatal(rc)) {
          char tmp[256] = { 0 };
          OSUtils::ztsnprintf(tmp, sizeof(tmp), "fatal error code from processWirePacket: %d", (int)rc);
-@@ -942,6 +1555,9 @@ void NodeService::nodeEventCallback(enum ZT_Event event, const void* metaData)
+@@ -942,6 +1558,9 @@ void NodeService::nodeEventCallback(enum ZT_Event event, const void* metaData)
              break;
      }
      if (event_code) {
@@ -972,7 +975,7 @@ index 036f406..785f3ca 100644
          sendEventToUser(event_code, NULL);
      }
  }
-@@ -1054,11 +1670,30 @@ void NodeService::sendEventToUser(unsigned int zt_event_code, const void* obj, u
+@@ -1054,11 +1673,30 @@ void NodeService::sendEventToUser(unsigned int zt_event_code, const void* obj, u
          case ZTS_EVENT_PEER_UNREACHABLE:
          case ZTS_EVENT_PEER_PATH_DISCOVERED:
          case ZTS_EVENT_PEER_PATH_DEAD: {
@@ -1006,7 +1009,7 @@ index 036f406..785f3ca 100644
              }
              objptr = (void*)pr;
              break;
-@@ -1306,6 +1941,34 @@ int NodeService::getAddrAtIdx(uint64_t net_id, unsigned int idx, char* dst, unsi
+@@ -1306,6 +1944,34 @@ int NodeService::getAddrAtIdx(uint64_t net_id, unsigned int idx, char* dst, unsi
      return ZTS_ERR_OK;
  }
  
@@ -1041,7 +1044,7 @@ index 036f406..785f3ca 100644
  int NodeService::getRouteAtIdx(
      uint64_t net_id,
      unsigned int idx,
-@@ -1355,6 +2018,35 @@ int NodeService::getRouteAtIdx(
+@@ -1355,6 +2021,35 @@ int NodeService::getRouteAtIdx(
      return ZTS_ERR_OK;
  }
  
@@ -1077,7 +1080,7 @@ index 036f406..785f3ca 100644
  int NodeService::getMulticastSubAtIdx(uint64_t net_id, unsigned int idx, uint64_t* mac, uint32_t* adi)
  {
      std::map<uint64_t, NetworkState>::const_iterator n(_nets.find(net_id));
-@@ -1718,7 +2410,8 @@ int NodeService::nodeWirePacketSendFunction(
+@@ -1718,7 +2413,8 @@ int NodeService::nodeWirePacketSendFunction(
      const struct sockaddr_storage* addr,
      const void* data,
      unsigned int len,
@@ -1087,7 +1090,7 @@ index 036f406..785f3ca 100644
  {
      if (_allowTcpRelay) {
          if (addr->ss_family == AF_INET) {
-@@ -1797,17 +2490,43 @@ int NodeService::nodeWirePacketSendFunction(
+@@ -1797,17 +2493,43 @@ int NodeService::nodeWirePacketSendFunction(
      // working we can instantly "fail forward" to it and stop using TCP
      // proxy fallback, which is slow.
  
@@ -1137,7 +1140,7 @@ index 036f406..785f3ca 100644
  }
  
  void NodeService::nodeVirtualNetworkFrameFunction(
-@@ -1843,6 +2562,7 @@ int NodeService::nodePathCheckFunction(
+@@ -1843,6 +2565,7 @@ int NodeService::nodePathCheckFunction(
                  std::vector<InetAddress> ips(n->second.tap->ips());
                  for (std::vector<InetAddress>::const_iterator i(ips.begin()); i != ips.end(); ++i) {
                      if (i->containsAddress(*(reinterpret_cast<const InetAddress*>(remoteAddr)))) {
@@ -1145,7 +1148,7 @@ index 036f406..785f3ca 100644
                          return 0;
                      }
                  }
-@@ -1874,6 +2594,7 @@ int NodeService::nodePathCheckFunction(
+@@ -1874,6 +2597,7 @@ int NodeService::nodePathCheckFunction(
          if (l) {
              for (std::vector<InetAddress>::const_iterator a(l->begin()); a != l->end(); ++a) {
                  if (a->containsAddress(*reinterpret_cast<const InetAddress*>(remoteAddr))) {
@@ -1153,7 +1156,7 @@ index 036f406..785f3ca 100644
                      return 0;
                  }
              }
-@@ -1882,10 +2603,12 @@ int NodeService::nodePathCheckFunction(
+@@ -1882,10 +2606,12 @@ int NodeService::nodePathCheckFunction(
      if (gbl) {
          for (std::vector<InetAddress>::const_iterator a(gbl->begin()); a != gbl->end(); ++a) {
              if (a->containsAddress(*reinterpret_cast<const InetAddress*>(remoteAddr))) {

@@ -40,6 +40,9 @@ internal static class Program
             await CheckAsync("Startup processes physical events while Node waits", StartupPhysicalRefresh);
             Check("Rapid physical events retain the final network notification", RapidPhysicalEventDelivery);
             Check("Physical egress defines epochs across rapid switches and startup retries", HandoverEpochSequence);
+            await CheckAsync("Physical event entry preserves two exits inside 250ms", ImmediatePhysicalCapture);
+            await CheckAsync("Failed egress capture recovers without a second OS callback", PhysicalCaptureRecovery);
+            Check("Separate IPv4 and IPv6 default interfaces distinguish egress", IndependentPhysicalRoutes);
             await CheckAsync("Peer dialing is bounded across simultaneous SOCKS requests", PeerDialAdmission);
             await CheckAsync("Peer dialing releases canceled waiters and isolates different peers", PeerDialCancellation);
             await CheckAsync("Peer failure backoff does not hold established TCP", PeerDialCooldown);
@@ -51,6 +54,7 @@ internal static class Program
             await CheckAsync("UDP cleanup errors never leak association capacity", UdpFaultyCleanup);
             await CheckAsync("Overlay UDP returns queued bytes after failed Dispose", OverlayFaultyCleanup);
             Check("Removed --status-file CLI is rejected", RemovedStatusOption);
+            Check("Removed --reset-debounce-ms CLI is rejected", RemovedResetDebounceOption);
             Check("CLI log level defaults and invalid values are validated", LogLevelOption);
             await CheckAsync("JSONL none and error levels suppress unwanted output", JsonLogLevels);
             await CheckAsync("JSONL consumer survives an output failure", JsonLogConsumerSurvives);
@@ -675,12 +679,9 @@ internal static class Program
 
     private static void HandoverEpochSequence()
     {
-        var wifi = new PhysicalEgressIdentity(
-            "nic-wifi", "192.168.1.10", "192.168.1.1", "20010DB800000001");
-        var hotspot = new PhysicalEgressIdentity(
-            "nic-mobile", "192.168.43.10", "192.168.43.1", "20010DB800000002");
-        var sameAdapterNewRoute = new PhysicalEgressIdentity(
-            "nic-wifi", "10.0.0.27", "10.0.0.1", "20010DB800000003");
+        var wifi = Egress("nic-wifi", "192.168.1.10", "192.168.1.1", "20010DB800000001");
+        var hotspot = Egress("nic-mobile", "192.168.43.10", "192.168.43.1", "20010DB800000002");
+        var sameAdapterNewRoute = Egress("nic-wifi", "10.0.0.27", "10.0.0.1", "20010DB800000003");
 
         var episodes = new PhysicalHandoverEpisode();
         episodes.Seed(wifi);
@@ -701,8 +702,10 @@ internal static class Program
             "Hotspot-to-Wi-Fi switch in under six seconds must get a NEW epoch");
         Require(episodes.Observe(sameAdapterNewRoute) && episodes.Epoch == 3,
             "Same Wi-Fi adapter with a new gateway/source is a different exit");
-        var bssidA = wifi with { WifiBssid = "02:11:22:33:44:55" };
-        var bssidB = wifi with { WifiBssid = "02:11:22:33:44:66" };
+        var bssidA = Egress("nic-wifi", "192.168.1.10", "192.168.1.1",
+            "20010DB800000001", "02:11:22:33:44:55");
+        var bssidB = Egress("nic-wifi", "192.168.1.10", "192.168.1.1",
+            "20010DB800000001", "02:11:22:33:44:66");
         var accessPoints = new PhysicalHandoverEpisode();
         accessPoints.Seed(bssidA);
         Require(accessPoints.Observe(bssidB) && accessPoints.Epoch == 1,
@@ -711,14 +714,16 @@ internal static class Program
             "Repeated callback from same BSSID must not reset");
 
         var delayedV6 = new PhysicalHandoverEpisode();
-        delayedV6.Seed(new PhysicalEgressIdentity(
-            "nic-wifi", "10.0.0.27", "10.0.0.1", ""));
+        delayedV6.Seed(Egress("nic-wifi", "10.0.0.27", "10.0.0.1", ""));
         Require(!delayedV6.Observe(sameAdapterNewRoute) && delayedV6.Epoch == 0,
             "IPv6 DAD becoming available cannot split one physical handover");
-        Require(delayedV6.Observe(sameAdapterNewRoute with {
-            IPv6Prefix = "20010DB800000099"
-        }) && delayedV6.Epoch == 1,
+        Require(delayedV6.Observe(Egress("nic-wifi", "10.0.0.27", "10.0.0.1",
+                "20010DB800000099")) && delayedV6.Epoch == 1,
             "Real IPv6 prefix change must identify a new physical exit");
+        var unknownSeed = new PhysicalHandoverEpisode();
+        unknownSeed.Seed(PhysicalEgressIdentity.CaptureFailed);
+        Require(unknownSeed.Observe(wifi) && unknownSeed.Epoch == 1,
+            "An unavailable initial snapshot must not poison the first valid egress");
 
         // Model Runtime creation: multiple events are consumed while the
         // Node is unavailable; a pending Native refresh retains its epoch
@@ -765,6 +770,118 @@ internal static class Program
             notification => waiting.Observe(notification.Egress));
         Require(!pending && waiting.Epoch == 2 && delivered[^1] == 2,
             "A later physical handover must allocate and deliver epoch 2");
+    }
+
+    private static PhysicalEgressIdentity Egress(
+        string nic, string ipv4, string gateway, string prefix, string bssid = "")
+        => new(new PhysicalRouteIdentity(nic, ipv4, gateway, "", bssid),
+            new PhysicalRouteIdentity(nic, "", "", prefix, bssid));
+
+    private static async Task ImmediatePhysicalCapture()
+    {
+        var wifi = Egress("wifi", "10.0.0.2", "10.0.0.1", "20010DB800000001");
+        var hotspot = Egress("hotspot", "172.20.10.2", "172.20.10.1", "20010DB800000002");
+        var captured = new Queue<PhysicalEgressIdentity?>([hotspot, wifi]);
+        var observed = new List<(string Reason, PhysicalEgressIdentity? Route)>();
+        await using var monitor = new RuntimeResetMonitor(null,
+            (reason, route) => observed.Add((reason, route)),
+            () => captured.Dequeue());
+
+        // Exactly the production callback path, invoked back-to-back with no
+        // clock sleep; the old 250ms cancellation would drop the first exit.
+        monitor.NotifyPhysicalNetworkChange("network_address_changed");
+        monitor.NotifyPhysicalNetworkChange("network_address_changed");
+        Require(observed.Count == 2
+                && ReferenceEquals(observed[0].Route, hotspot)
+                && ReferenceEquals(observed[1].Route, wifi),
+            "Two distinct physical exits before 250ms must both reach the owner");
+        var episode = new PhysicalHandoverEpisode();
+        episode.Seed(wifi);
+        Require(episode.Observe(observed[0].Route) && episode.Epoch == 1,
+            "First fast switch was swallowed before epoch allocation");
+        Require(episode.Observe(observed[1].Route) && episode.Epoch == 2,
+            "Fast return switch was merged into the first episode");
+
+        // Concurrent arrivals are serialized and never dispose a CTS still
+        // being read by another callback.
+        var all = new ConcurrentQueue<string>();
+        await using var parallel = new RuntimeResetMonitor(null,
+            (reason, _) => all.Enqueue(reason), () => wifi);
+        await Task.WhenAll(Enumerable.Range(0, 64)
+            .Select(_ => Task.Run(() =>
+                parallel.NotifyPhysicalNetworkChange("network_address_changed"))));
+        Require(all.Count == 64,
+            "Concurrent network callbacks must be delivered without CTS disposal races");
+    }
+
+    private static async Task PhysicalCaptureRecovery()
+    {
+        var wifi = Egress("wifi", "10.0.0.2", "10.0.0.1", "20010DB800000001");
+        var hotspot = Egress("hotspot", "172.20.10.2", "172.20.10.1", "20010DB800000002");
+        var captures = new Queue<PhysicalEgressIdentity?>(
+            [PhysicalEgressIdentity.CaptureFailed, PhysicalEgressIdentity.CaptureFailed, hotspot]);
+        var gates = Channel.CreateUnbounded<TaskCompletionSource>();
+        var events = new ConcurrentQueue<(string Reason, PhysicalEgressIdentity? Route)>();
+        long now = 0;
+        Task Pause(TimeSpan _, CancellationToken token)
+        {
+            var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            gates.Writer.TryWrite(tcs);
+            return tcs.Task.WaitAsync(token);
+        }
+
+        await using var monitor = new RuntimeResetMonitor(null,
+            (reason, route) => events.Enqueue((reason, route)),
+            () => captures.Dequeue(), Pause, () => now);
+
+        monitor.NotifyPhysicalNetworkChange("network_address_changed");
+        Require(events.Count == 1 && events.TryPeek(out var first)
+                && first.Route?.IsCaptureFailed == true,
+            "Transient capture failure must still deliver the native refresh notification");
+
+        now = 200;
+        (await gates.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2)))
+            .TrySetResult();
+        now = 400;
+        (await gates.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2)))
+            .TrySetResult();
+
+        var until = Environment.TickCount64 + 2_000;
+        while (events.Count < 2 && Environment.TickCount64 < until)
+            await Task.Delay(5);
+        Require(events.Count == 2 && events.Last().Reason == "network_address_rechecked"
+                && ReferenceEquals(events.Last().Route, hotspot),
+            "Successful bounded recapture must reissue the event without any new OS notification");
+
+        var epoch = new PhysicalHandoverEpisode();
+        epoch.Seed(wifi);
+        foreach (var evt in events)
+            epoch.Observe(evt.Route);
+        Require(epoch.Epoch == 1,
+            "A later valid recapture must reveal and recover the actual physical change");
+    }
+
+    private static void IndependentPhysicalRoutes()
+    {
+        var ethernet = new PhysicalInterfaceCandidate("ethernet", 4, 44,
+            "192.168.50.10", "192.168.50.1", "", "");
+        var wifi = new PhysicalInterfaceCandidate("wifi", 8, 88,
+            "10.0.0.2", "10.0.0.1", "20010DB800000001", "02:11:22:33:44:55");
+        var hotspot = new PhysicalInterfaceCandidate("hotspot", 9, 99,
+            "172.20.10.2", "172.20.10.1", "20010DB800000002", "02:11:22:33:44:66");
+        var initial = PhysicalEgressIdentity.SelectEffectiveRoutes([ethernet, wifi], 4, 88)!;
+        var switched = PhysicalEgressIdentity.SelectEffectiveRoutes([ethernet, hotspot], 4, 99)!;
+        Require(initial.IPv4?.InterfaceId == "ethernet"
+                && initial.IPv6?.InterfaceId == "wifi",
+            "IPv4 and IPv6 must use independent Windows best-route indices");
+        Require(initial.IPv4 == switched.IPv4 && initial.IPv6 != switched.IPv6
+                && initial.DiffersFrom(switched),
+            "IPv6 hotspot switch must be visible even if Ethernet IPv4 never changes");
+        var delayedPrefix = initial with {
+            IPv6 = initial.IPv6! with { Prefix = "" }
+        };
+        Require(!initial.DiffersFrom(delayedPrefix),
+            "IPv6 DAD temporarily lacking a prefix must not create a fake new exit");
     }
 
     private static async Task StartupPhysicalRefresh()
@@ -1046,6 +1163,18 @@ internal static class Program
             "The supported configuration did not parse after status-file removal");
         Require(!HostOptions.Usage.Contains("--status-file", StringComparison.Ordinal),
             "Removed --status-file is still advertised in --help");
+    }
+
+    private static void RemovedResetDebounceOption()
+    {
+        Throws<ArgumentException>(() => HostOptions.Parse([
+            "--network", "123456789abcdef0",
+            "--state-dir", "state",
+            "--default-exit", "10.70.0.2",
+            "--reset-debounce-ms", "250"
+        ]));
+        Require(!HostOptions.Usage.Contains("--reset-debounce-ms", StringComparison.Ordinal),
+            "Removed Windows debounce CLI is still advertised");
     }
 
     private static void LogLevelOption()

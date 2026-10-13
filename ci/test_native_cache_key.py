@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 import sys
 from pathlib import Path
 import unittest
@@ -43,6 +44,18 @@ class NativeCacheKeyTests(unittest.TestCase):
         )
         self.assertIn("+inline UdpSendMode udpSendMode", core_patch)
         self.assertIn("+struct RootBindingIdentity", core_patch)
+
+    def test_consolidated_native_patch_hunk_counts_are_valid(self) -> None:
+        # Syntax-only parse; works even when Native was already patched by
+        # CI before Python tests execute. Directly editing unified patches
+        # without regenerating their @@ counts must fail this check.
+        for patch in [*LIBZT_PATCHES, *ZERO_TIER_ONE_PATCHES, *ANDROID_PATCHES]:
+            result = subprocess.run(
+                ["git", "apply", "--numstat", str(patch)],
+                cwd=ROOT, text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0,
+                             f"{patch.name} malformed: {result.stderr}")
 
     def test_release_native_cache_steps_match_regular_ci(self) -> None:
         """A release must not hash deleted patches after a patch-chain squash."""

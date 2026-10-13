@@ -149,7 +149,7 @@ public sealed class NetLoopService : Service
 
         await using var networkMonitor = new AndroidNetworkMonitor(
             this,
-            options.ResetEventDebounce,
+            TimeSpan.FromMilliseconds(250),
             reason => owner.RequestPhysicalNetworkRefresh(reason));
 
         try

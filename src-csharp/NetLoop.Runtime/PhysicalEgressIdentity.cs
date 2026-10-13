@@ -5,44 +5,65 @@ using System.Runtime.InteropServices;
 
 namespace NetLoop.Host;
 
+// Keep IPv4 and IPv6 independent: Windows may route Ethernet IPv4 and
+// hotspot/Wi-Fi IPv6 through different physical interfaces.
+internal sealed record PhysicalRouteIdentity(
+    string InterfaceId,
+    string Source,
+    string Gateway,
+    string Prefix,
+    string WifiBssid)
+{
+    internal bool DiffersFrom(PhysicalRouteIdentity other)
+        => InterfaceId != other.InterfaceId
+           || DifferentKnown(Source, other.Source)
+           || DifferentKnown(Gateway, other.Gateway)
+           || DifferentKnown(Prefix, other.Prefix)
+           || DifferentKnown(WifiBssid, other.WifiBssid);
+
+    private static bool DifferentKnown(string a, string b)
+        => a.Length != 0 && b.Length != 0 && !string.Equals(a, b, StringComparison.Ordinal);
+}
+
+// Plain snapshots keep route selection testable without IP Helper or real NICs.
+internal sealed record PhysicalInterfaceCandidate(
+    string Id, int IPv4Index, int IPv6Index,
+    string IPv4Source, string IPv4Gateway,
+    string IPv6Prefix, string WifiBssid);
+
 /// <summary>
-/// Passive snapshot of Windows' effective public IPv4/IPv6 routes. Network
-/// callbacks are only wakeups: the OS-selected egress and its gateway/source
-/// addresses determine whether this is a different physical connection.
-/// No probe packets, shell commands or artificial delays are introduced.
+/// Passive Windows physical-egress snapshot. An OS notification is captured at
+/// arrival, not after a cancellation-based debounce. Transient API failure is
+/// distinct from actual loss of both default routes.
 /// </summary>
 internal sealed record PhysicalEgressIdentity(
-    string InterfaceId,
-    string IPv4Source,
-    string IPv4Gateway,
-    string IPv6Prefix,
-    string WifiBssid = "")
+    PhysicalRouteIdentity? IPv4,
+    PhysicalRouteIdentity? IPv6,
+    bool IsCaptureFailed = false)
 {
-    internal static PhysicalEgressIdentity CaptureFailed { get; } =
-        new("__capture_failed__", "", "", "");
-    internal bool IsCaptureFailed => InterfaceId == "__capture_failed__";
+    internal static PhysicalEgressIdentity CaptureFailed { get; } = new(null, null, true);
 
     internal bool DiffersFrom(PhysicalEgressIdentity other)
+        => FamilyChanged(IPv4, other.IPv4) || FamilyChanged(IPv6, other.IPv6);
+
+    private static bool FamilyChanged(PhysicalRouteIdentity? previous, PhysicalRouteIdentity? current)
+        => previous is null ? current is not null
+            : current is null || previous.DiffersFrom(current);
+
+    internal static PhysicalEgressIdentity? SelectEffectiveRoutes(
+        IEnumerable<PhysicalInterfaceCandidate> interfaces, int v4Index, int v6Index)
     {
-        if (InterfaceId != other.InterfaceId)
-            return true;
-        if (!string.IsNullOrEmpty(WifiBssid)
-            && !string.IsNullOrEmpty(other.WifiBssid)
-            && WifiBssid != other.WifiBssid)
-            return true;
-        if (!string.IsNullOrEmpty(IPv4Source)
-            && !string.IsNullOrEmpty(other.IPv4Source)
-            && IPv4Source != other.IPv4Source)
-            return true;
-        if (!string.IsNullOrEmpty(IPv4Gateway)
-            && !string.IsNullOrEmpty(other.IPv4Gateway)
-            && IPv4Gateway != other.IPv4Gateway)
-            return true;
-        // DAD can add/remove IPv6 during one handover. Compare stable
-        // /64 prefixes only once both snapshots have a global prefix.
-        return !string.IsNullOrEmpty(IPv6Prefix)
-            && !string.IsNullOrEmpty(other.IPv6Prefix)
-            && IPv6Prefix != other.IPv6Prefix;
+        var all = interfaces.ToArray();
+        var v4 = v4Index > 0 ? all.FirstOrDefault(i => i.IPv4Index == v4Index) : null;
+        var v6 = v6Index > 0 ? all.FirstOrDefault(i => i.IPv6Index == v6Index) : null;
+        if (v4 is null && v6 is null)
+            return null;
+
+        return new PhysicalEgressIdentity(
+            v4 is null ? null : new PhysicalRouteIdentity(
+                v4.Id, v4.IPv4Source, v4.IPv4Gateway, "", v4.WifiBssid),
+            v6 is null ? null : new PhysicalRouteIdentity(
+                v6.Id, "", "", v6.IPv6Prefix, v6.WifiBssid));
     }
 
     internal static PhysicalEgressIdentity? Capture()
@@ -56,52 +77,63 @@ internal sealed record PhysicalEgressIdentity(
                 IPAddress.Parse("1.1.1.1"), AddressFamily.InterNetwork);
             var v6Index = BestInterface(
                 IPAddress.Parse("2606:4700:4700::1111"), AddressFamily.InterNetworkV6);
-            var interfaces = NetworkInterface.GetAllNetworkInterfaces();
-            var nic = interfaces.FirstOrDefault(candidate =>
-                candidate.OperationalStatus == OperationalStatus.Up
-                && candidate.NetworkInterfaceType is not (
-                    NetworkInterfaceType.Loopback or NetworkInterfaceType.Tunnel)
-                && candidate.GetIPProperties().GetIPv4Properties()?.Index == v4Index)
-                ?? interfaces.FirstOrDefault(candidate =>
-                    candidate.OperationalStatus == OperationalStatus.Up
-                    && candidate.NetworkInterfaceType is not (
-                        NetworkInterfaceType.Loopback or NetworkInterfaceType.Tunnel)
-                    && candidate.GetIPProperties().GetIPv6Properties()?.Index == v6Index);
-            if (nic is null)
-                return null;
 
-            var properties = nic.GetIPProperties();
-            var gatewayV4 = properties.GatewayAddresses
-                .Select(g => g.Address)
-                .Where(g => g.AddressFamily == AddressFamily.InterNetwork
-                            && !IPAddress.Any.Equals(g))
-                .Select(g => g.ToString())
-                .OrderBy(g => g, StringComparer.Ordinal)
-                .FirstOrDefault() ?? "";
-            var sourceV4 = properties.UnicastAddresses
-                .Select(u => u.Address)
-                .Where(ip => ip.AddressFamily == AddressFamily.InterNetwork
-                             && !IPAddress.IsLoopback(ip))
-                .Select(ip => ip.ToString())
-                .OrderBy(ip => ip, StringComparer.Ordinal)
-                .FirstOrDefault() ?? "";
-            var ipv6Prefix = properties.UnicastAddresses
-                .Select(u => u.Address)
-                .Where(ip => ip.AddressFamily == AddressFamily.InterNetworkV6
-                             && !ip.IsIPv6LinkLocal && !ip.IsIPv6SiteLocal
-                             && !IPAddress.IsLoopback(ip))
-                .Select(ip => Convert.ToHexString(ip.GetAddressBytes().AsSpan(0, 8)))
-                .OrderBy(ip => ip, StringComparer.Ordinal)
-                .FirstOrDefault() ?? "";
-            return new PhysicalEgressIdentity(
-                nic.Id, sourceV4, gatewayV4, ipv6Prefix, WirelessBssid(nic));
+            var candidates = new List<PhysicalInterfaceCandidate>();
+            foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (nic.OperationalStatus != OperationalStatus.Up
+                    || nic.NetworkInterfaceType is NetworkInterfaceType.Loopback
+                        or NetworkInterfaceType.Tunnel)
+                    continue;
+
+                var props = nic.GetIPProperties();
+                var index4 = props.GetIPv4Properties()?.Index ?? -1;
+                var index6 = props.GetIPv6Properties()?.Index ?? -1;
+                if ((v4Index <= 0 || index4 != v4Index)
+                    && (v6Index <= 0 || index6 != v6Index))
+                    continue;
+
+                var ip4 = props.UnicastAddresses
+                    .Select(u => u.Address)
+                    .Where(ip => ip.AddressFamily == AddressFamily.InterNetwork
+                                 && !IPAddress.IsLoopback(ip))
+                    .Select(ip => ip.ToString())
+                    .OrderBy(ip => ip, StringComparer.Ordinal)
+                    .FirstOrDefault() ?? "";
+                var gateway4 = props.GatewayAddresses
+                    .Select(g => g.Address)
+                    .Where(g => g.AddressFamily == AddressFamily.InterNetwork
+                                && !IPAddress.Any.Equals(g))
+                    .Select(g => g.ToString())
+                    .OrderBy(g => g, StringComparer.Ordinal)
+                    .FirstOrDefault() ?? "";
+                // Stable /64 identity; temporary IPv6 privacy addresses can
+                // rotate without indicating a new physical egress.
+                var prefix6 = props.UnicastAddresses
+                    .Select(u => u.Address)
+                    .Where(ip => ip.AddressFamily == AddressFamily.InterNetworkV6
+                                 && !ip.IsIPv6LinkLocal && !ip.IsIPv6SiteLocal
+                                 && !IPAddress.IsLoopback(ip))
+                    .Select(ip => Convert.ToHexString(ip.GetAddressBytes().AsSpan(0, 8)))
+                    .OrderBy(ip => ip, StringComparer.Ordinal)
+                    .FirstOrDefault() ?? "";
+
+                candidates.Add(new PhysicalInterfaceCandidate(
+                    nic.Id, index4, index6, ip4, gateway4, prefix6, WirelessBssid(nic)));
+            }
+
+            var route = SelectEffectiveRoutes(candidates, v4Index, v6Index);
+            if (route is not null)
+                return route;
+
+            // Zero effective routes while the system reports offline is a
+            // known disconnect. If Windows is online but IP Helper has not
+            // settled, retry rather than fabricating an offline transition.
+            return NetworkInterface.GetIsNetworkAvailable() ? CaptureFailed : null;
         }
-        catch (Exception ex) when (
-            ex is NetworkInformationException or SocketException
-                or InvalidOperationException or ArgumentException)
+        catch (Exception ex) when (ex is NetworkInformationException
+            or SocketException or InvalidOperationException or ArgumentException)
         {
-            // A transient IP Helper error is not evidence of an actual
-            // disconnect. Native still refreshes Binder on the notification.
             return CaptureFailed;
         }
     }
@@ -114,8 +146,14 @@ internal sealed record PhysicalEgressIdentity(
         address[1] = (byte)(familyValue >> 8);
         destination.GetAddressBytes().CopyTo(
             address, family == AddressFamily.InterNetwork ? 4 : 8);
-        return GetBestInterfaceEx(address, out var index) == 0
-            ? checked((int)index) : -1;
+        var rc = GetBestInterfaceEx(address, out var index);
+        if (rc == 0)
+            return checked((int)index);
+        // Explicit route-absence conditions; arbitrary IP Helper failures
+        // are NOT evidence that the interface disappeared.
+        if (rc is 1231 or 1232 or 1168)
+            return -1;
+        throw new NetworkInformationException(checked((int)rc));
     }
 
     private static string WirelessBssid(NetworkInterface nic)
@@ -133,9 +171,10 @@ internal sealed record PhysicalEgressIdentity(
                 return "";
             try
             {
-                // WLAN_CONNECTION_ATTRIBUTES: state(4), mode(4), profile(512),
-                // DOT11_SSID(36), BSS type(4), then DOT11_BSSID(6).
-                if (size < 566)
+                // WLAN_CONNECTION_ATTRIBUTES state == connected (1).
+                // Profile name: 256 wide chars; SSID: 36 bytes; then
+                // DOT11_BSS_TYPE (4) and 6-byte DOT11_BSSID at offset 560.
+                if (size < 566 || Marshal.ReadInt32(data) != 1)
                     return "";
                 return string.Join(":", Enumerable.Range(560, 6)
                     .Select(i => Marshal.ReadByte(data, i).ToString("X2")));

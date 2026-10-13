@@ -17,8 +17,8 @@ internal sealed class PhysicalHandoverEpisode
     {
         if (_hasEpisode || _lastKnownRoute is not null)
             throw new InvalidOperationException("Physical egress can only be seeded before monitoring.");
-        _lastKnownRoute = initialRoute;
-        _lastObservationHasRoute = initialRoute is not null;
+        _lastKnownRoute = initialRoute?.IsCaptureFailed == true ? null : initialRoute;
+        _lastObservationHasRoute = _lastKnownRoute is not null;
     }
 
     /// <summary>True only for a new physical disconnect or egress.</summary>
