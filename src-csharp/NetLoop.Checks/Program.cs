@@ -184,7 +184,9 @@ internal static class Program
                 && LibztUnderlayDiagnostics.NativeKind(33) == "core_handover_root_hello_eligibility"
                 && LibztUnderlayDiagnostics.NativeKind(34) == "binder_handover_ipv6_bindings"
                 && LibztUnderlayDiagnostics.NativeKind(35) == "core_handover_root_ipv6_hello_requested"
-                && LibztUnderlayDiagnostics.NativeKind(36) == "binder_handover_root_ipv6_hello_batch",
+                && LibztUnderlayDiagnostics.NativeKind(36) == "binder_handover_root_ipv6_hello_batch"
+                && LibztUnderlayDiagnostics.NativeKind(37) == "binder_handover_ipv6_dad_state"
+                && LibztUnderlayDiagnostics.NativeKind(38) == "core_handover_root_ipv6_hello_authenticated",
             "Native trace kinds must remain compatible across builds");
         Require(LibztUnderlayDiagnostics.NativeKind(200) == "unknown",
             "Unknown native trace kind must remain safe");

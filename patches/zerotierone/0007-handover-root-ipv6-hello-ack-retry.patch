@@ -1,0 +1,241 @@
+diff --git a/include/ZeroTierOne.h b/include/ZeroTierOne.h
+index 772feed34..59233eecb 100644
+--- a/include/ZeroTierOne.h
++++ b/include/ZeroTierOne.h
+@@ -2070,11 +2070,15 @@ ZT_SDK_API unsigned int ZT_Node_revalidatePeerPathsAfterNetworkChange(ZT_Node *n
+ /**
+  * Windows physical handover fast path: send one full HELLO to the configured
+  * global IPv6 endpoint of each known Root (at most eight). Unlike the
+- * ordinary 224-second Root scheduler gate, this is called once per handover
+- * episode only after libzt observes a changed global IPv6 Binder address.
+- * It does not delete or reprioritize existing upstream/relay paths.
+- */
+-ZT_SDK_API unsigned int ZT_Node_fastProbeRootIpv6AfterNetworkChange(ZT_Node *node,void *tptr,int64_t now);
++ * ordinary 224-second Root scheduler gate, this may be called for up to
++ * three bounded attempts during one handover episode, only after libzt
++ * observes a changed, OS-Preferred global IPv6 Binder address.
++ * Returns the number of accepted wire submissions (not proof of delivery).
++ * `pending` returns the number of Roots still eligible for retry. An
++ * authenticated matching OK(HELLO) stops retries for that Root. Old paths,
++ * Relay and the normal scheduler are unchanged.
++ */
++ZT_SDK_API unsigned int ZT_Node_fastProbeRootIpv6AfterNetworkChange(ZT_Node *node,void *tptr,int64_t now,int64_t episodeId,unsigned int *pending);
+ 
+ /**
+  * Send a VERB_USER_MESSAGE to another ZeroTier node
+diff --git a/node/IncomingPacket.cpp b/node/IncomingPacket.cpp
+index 08a26cbc9..245f8d42d 100644
+--- a/node/IncomingPacket.cpp
++++ b/node/IncomingPacket.cpp
+@@ -641,6 +641,10 @@ bool IncomingPacket::_doOK(const RuntimeEnvironment *RR,void *tPtr,const SharedP
+ 			if ((externalSurfaceAddress)&&(hops() == 0)) {
+ 				RR->sa->iam(tPtr,peer->address(),_path->localSocket(),_path->address(),externalSurfaceAddress,RR->topology->isUpstream(peer->identity()),RR->node->now());
+ 			}
++			// Only a genuine authenticated OK(HELLO) matching the exact fast
++			// Root IPv6 packet ID cancels that Root's pending retry attempts.
++			if (!hops())
++				RR->node->authenticatedHandoverRootHello(peer->address(),inRePacketId,_path->address(),tPtr);
+ 		}	break;
+ 
+ 		case Packet::VERB_WHOIS:
+diff --git a/node/Node.cpp b/node/Node.cpp
+index 8261d3f5c..84a7b1100 100644
+--- a/node/Node.cpp
++++ b/node/Node.cpp
+@@ -702,41 +702,85 @@ void Node::clearLocalInterfaceAddresses()
+ 	_directPaths.clear();
+ }
+ 
+-unsigned int Node::fastProbeRootIpv6AfterNetworkChange(void *tptr,int64_t now)
++unsigned int Node::fastProbeRootIpv6AfterNetworkChange(void *tptr,int64_t now,int64_t episodeId,unsigned int *pending)
+ {
++	if (pending)
++		*pending = 0;
+ #ifdef _WIN32
+-	// No change to normal 224-second scheduling or memorized upstream paths.
+-	// libzt only invokes this after a newly bound global IPv6 address during
+-	// a confirmed OS handover, once per handover episode.
++	// Only on Windows after the Binder confirms a changed Preferred IPv6.
++	// Every Root has its own three-attempt budget; ACKed Roots are never
++	// probed again within this episode. No changes to ordinary Root timers.
++	Mutex::Lock _l(_handoverRootHellos_m);
++	if (episodeId != _handoverRootEpisode) {
++		_handoverRootEpisode = episodeId;
++		_handoverRootHellos.clear();
++	}
+ 	Hashtable< Address,std::vector<InetAddress> > upstreams;
+ 	RR->topology->getUpstreamsToContact(upstreams);
+ 	Hashtable< Address,std::vector<InetAddress> >::Iterator upstream(upstreams);
+ 	Address *rootAddress = (Address *)0;
+ 	std::vector<InetAddress> *stable = (std::vector<InetAddress> *)0;
+-	unsigned int sent = 0;
++	unsigned int accepted = 0;
+ 	for (unsigned int inspected=0;inspected<8 && upstream.next(rootAddress,stable);++inspected) {
+ 		const SharedPtr<Peer> root(RR->topology->getPeerNoCache(*rootAddress));
+ 		if (!root || RR->topology->role(*rootAddress) == ZT_PEER_ROLE_LEAF)
+ 			continue;
++		HandoverRootHello &probe = _handoverRootHellos[rootAddress->toInt()];
++		if (probe.authenticated || probe.attempts >= 3)
++			continue;
+ 		for (std::vector<InetAddress>::const_iterator ep(stable->begin());ep!=stable->end();++ep) {
+ 			if (ep->ss_family != AF_INET6 || ep->ipScope() != InetAddress::IP_SCOPE_GLOBAL)
+ 				continue;
+-			// The same HELLO primitive used by the existing Root scheduler;
+-			// no path invalidation, extra retransmit loop or altered timers.
+-			root->sendHELLO(tptr,-1,*ep,now);
+-			netloopTrace(tptr,35,rootAddress->toInt(),(uint64_t)now,8U,1,&*ep);
+-			++sent;
+-			break; // one IPv6 HELLO per known Root per episode
++			uint64_t packetId = 0;
++			const bool submitted = root->sendHELLO(tptr,-1,*ep,now,&packetId);
++			probe.packetIds[probe.attempts++] = submitted ? packetId : 0;
++			netloopTrace(tptr,35,rootAddress->toInt(),packetId,
++				8U | (probe.attempts << 8),submitted ? 1 : 0,&*ep);
++			if (submitted)
++				++accepted;
++			break; // at most one HELLO for a Root during this attempt
++		}
++	}
++	if (pending) {
++		for (std::map<uint64_t,HandoverRootHello>::const_iterator i(_handoverRootHellos.begin());
++			i != _handoverRootHellos.end();++i) {
++			if (!i->second.authenticated && i->second.attempts < 3)
++				++*pending;
+ 		}
+ 	}
+-	return sent;
++	return accepted;
+ #else
+ 	(void)tptr;
+ 	(void)now;
++	(void)episodeId;
+ 	return 0;
+ #endif
+ }
+ 
++void Node::authenticatedHandoverRootHello(const Address &peer,uint64_t packetId,const InetAddress &source,void *tptr)
++{
++#ifdef _WIN32
++	if (source.ss_family != AF_INET6)
++		return;
++	Mutex::Lock _l(_handoverRootHellos_m);
++	std::map<uint64_t,HandoverRootHello>::iterator i(_handoverRootHellos.find(peer.toInt()));
++	if (i == _handoverRootHellos.end() || i->second.authenticated)
++		return;
++	for (unsigned int n=0;n<i->second.attempts;++n) {
++		if (i->second.packetIds[n] && i->second.packetIds[n] == packetId) {
++			i->second.authenticated = true;
++			netloopTrace(tptr,38,peer.toInt(),packetId,8U,1,&source);
++			break;
++		}
++	}
++#else
++	(void)peer;
++	(void)packetId;
++	(void)source;
++	(void)tptr;
++#endif
++}
++
+ unsigned int Node::revalidatePeerPathsAfterNetworkChange(void *tptr,int64_t now)
+ {
+ #ifdef _WIN32
+@@ -1261,10 +1305,12 @@ unsigned int ZT_Node_revalidatePeerPathsAfterNetworkChange(ZT_Node *node,void *t
+ 	}
+ }
+ 
+-unsigned int ZT_Node_fastProbeRootIpv6AfterNetworkChange(ZT_Node *node,void *tptr,int64_t now)
++unsigned int ZT_Node_fastProbeRootIpv6AfterNetworkChange(ZT_Node *node,void *tptr,int64_t now,int64_t episodeId,unsigned int *pending)
+ {
++	if (pending)
++		*pending = 0;
+ 	try {
+-		return reinterpret_cast<ZeroTier::Node *>(node)->fastProbeRootIpv6AfterNetworkChange(tptr,now);
++		return reinterpret_cast<ZeroTier::Node *>(node)->fastProbeRootIpv6AfterNetworkChange(tptr,now,episodeId,pending);
+ 	} catch ( ... ) {
+ 		return 0;
+ 	}
+diff --git a/node/Node.hpp b/node/Node.hpp
+index 97baab42a..4432b9ae4 100644
+--- a/node/Node.hpp
++++ b/node/Node.hpp
+@@ -99,7 +99,8 @@ public:
+ 	int addLocalInterfaceAddress(const struct sockaddr_storage *addr);
+ 	void clearLocalInterfaceAddresses();
+ 	unsigned int revalidatePeerPathsAfterNetworkChange(void *tptr,int64_t now);
+-	unsigned int fastProbeRootIpv6AfterNetworkChange(void *tptr,int64_t now);
++	unsigned int fastProbeRootIpv6AfterNetworkChange(void *tptr,int64_t now,int64_t episodeId,unsigned int *pending);
++	void authenticatedHandoverRootHello(const Address &peer,uint64_t packetId,const InetAddress &source,void *tptr);
+ 	int sendUserMessage(void *tptr,uint64_t dest,uint64_t typeId,const void *data,unsigned int len);
+ 	void setNetconfMaster(void *networkControllerInstance);
+ 
+@@ -326,6 +327,22 @@ private:
+ 	std::vector<InetAddress> _directPaths;
+ 	Mutex _directPaths_m;
+ 
++#ifdef _WIN32
++	struct HandoverRootHello
++	{
++		uint64_t packetIds[3];
++		unsigned int attempts;
++		bool authenticated;
++		HandoverRootHello() : attempts(0), authenticated(false)
++		{
++			packetIds[0] = packetIds[1] = packetIds[2] = 0;
++		}
++	};
++	std::map<uint64_t,HandoverRootHello> _handoverRootHellos;
++	int64_t _handoverRootEpisode = 0;
++	Mutex _handoverRootHellos_m;
++#endif
++
+ 	Mutex _backgroundTasksLock;
+ 
+ 	Address _remoteTraceTarget;
+diff --git a/node/Peer.cpp b/node/Peer.cpp
+index 997e1fc44..6c55bb6d7 100644
+--- a/node/Peer.cpp
++++ b/node/Peer.cpp
+@@ -436,7 +436,7 @@ void Peer::introduce(void *const tPtr,const int64_t now,const SharedPtr<Peer> &o
+ 	}
+ }
+ 
+-void Peer::sendHELLO(void *tPtr,const int64_t localSocket,const InetAddress &atAddress,int64_t now)
++bool Peer::sendHELLO(void *tPtr,const int64_t localSocket,const InetAddress &atAddress,int64_t now,uint64_t *packetId)
+ {
+ 	Packet outp(_id.address(),RR->identity.address(),Packet::VERB_HELLO);
+ 
+@@ -473,14 +473,18 @@ void Peer::sendHELLO(void *tPtr,const int64_t localSocket,const InetAddress &atA
+ 
+ 	if (atAddress) {
+ 		outp.armor(_key,false,nullptr); // false == don't encrypt full payload, but add MAC
++		if (packetId)
++			*packetId = outp.packetId();
+ 		RR->node->expectReplyTo(outp.packetId());
+ 		const bool sent = RR->node->putPacket(tPtr,RR->node->lowBandwidthModeEnabled() ? localSocket : -1,atAddress,outp.data(),outp.size());
+ 		RR->node->netloopTrace(tPtr,10,_id.address().toInt(),outp.packetId(),
+ 			1U,sent ? 1 : 0,&atAddress);
++		return sent;
+ 	} else {
+ 		RR->node->expectReplyTo(outp.packetId());
+ 		RR->sw->send(tPtr,outp,false); // false == don't encrypt full payload, but add MAC
+ 		RR->node->netloopTrace(tPtr,10,_id.address().toInt(),outp.packetId(),2U,-1);
++		return true; // forwarded to Switch, not a synchronous wire-send result
+ 	}
+ }
+ 
+diff --git a/node/Peer.hpp b/node/Peer.hpp
+index e29975b19..2b94ebf8e 100644
+--- a/node/Peer.hpp
++++ b/node/Peer.hpp
+@@ -207,7 +207,9 @@ public:
+ 	 * @param atAddress Destination address
+ 	 * @param now Current time
+ 	 */
+-	void sendHELLO(void *tPtr,const int64_t localSocket,const InetAddress &atAddress,int64_t now);
++	// Return actual wire-send acceptance for explicit endpoints. Optionally
++	// expose the packet ID so handover retries stop on the matching OK(HELLO).
++	bool sendHELLO(void *tPtr,const int64_t localSocket,const InetAddress &atAddress,int64_t now,uint64_t *packetId = (uint64_t *)0);
+ 
+ 	/**
+ 	 * Send ECHO (or HELLO for older peers) to this peer at the given address

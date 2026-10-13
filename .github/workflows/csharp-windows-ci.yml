@@ -67,7 +67,9 @@ jobs:
           $coreRootProbeTracePatch = git hash-object patches/zerotierone/0005-handover-root-probe-decision-trace.patch
           $fastRootHelloPatch = git hash-object patches/libzt/0012-handover-fast-root-ipv6-hello.patch
           $coreFastRootHelloPatch = git hash-object patches/zerotierone/0006-handover-fast-root-ipv6-hello.patch
-          $allInputs = @($libzt, $cmake, $script, $networkRefreshPatch, $peerEventPatch, $cidrPatch, $portsPatch, $nativeTracePatch, $socketTracePatch, $coreTracePatch, $recoveryPatch, $coreRecoveryPatch, $handoverPatch, $coreHandoverPatch, $whoisTracePatch, $coreWhoisTracePatch, $rootProbeTracePatch, $coreRootProbeTracePatch, $fastRootHelloPatch, $coreFastRootHelloPatch) -join ':'
+          $rootPreferredRetryPatch = git hash-object patches/libzt/0013-handover-preferred-ipv6-root-retry.patch
+          $coreAckRetryPatch = git hash-object patches/zerotierone/0007-handover-root-ipv6-hello-ack-retry.patch
+          $allInputs = @($libzt, $cmake, $script, $networkRefreshPatch, $peerEventPatch, $cidrPatch, $portsPatch, $nativeTracePatch, $socketTracePatch, $coreTracePatch, $recoveryPatch, $coreRecoveryPatch, $handoverPatch, $coreHandoverPatch, $whoisTracePatch, $coreWhoisTracePatch, $rootProbeTracePatch, $coreRootProbeTracePatch, $fastRootHelloPatch, $coreFastRootHelloPatch, $rootPreferredRetryPatch, $coreAckRetryPatch) -join ':'
           $fingerprint = $allInputs | git hash-object --stdin
           if ($LASTEXITCODE -ne 0) { throw 'Failed to hash native cache inputs' }
           "key=libzt-pinvoke-win-x64-$fingerprint" >> $env:GITHUB_OUTPUT
