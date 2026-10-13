@@ -54,6 +54,13 @@ def main() -> int:
     assert poll(ctypes.byref(sample), ctypes.byref(dropped)) == -2, (
         "unstarted native service must return ZTS_ERR_SERVICE"
     )
+    toggle = lib.zts_netloop_set_underlay_trace_enabled
+    toggle.argtypes = [ctypes.c_int]
+    toggle.restype = ctypes.c_int
+    assert toggle(-1) == -3, "invalid trace toggle must return ZTS_ERR_ARG"
+    assert toggle(0) == 0, "native traces must be configurable before NodeStart"
+    assert toggle(1) == 0, "opt-in trace should be configurable before NodeStart"
+    assert toggle(0) == 0, "tracing should be disabled again before NodeStart"
     print("PASS: Native trace export, argument checks and 240-byte ABI")
     return 0
 

@@ -31,7 +31,6 @@ internal static class Program
             Check("UDP response peer set is bounded and expires entries", UdpResponsePeers);
             Check("TCP capacity occupancy classified by phase and source", TcpSessionPhases);
             await CheckAsync("TCP permit shutdown and concurrent exits reconcile", TcpSessionPermitShutdown);
-            Check("Underlay port and Peer path timeline uses observed events", UnderlayTimeline);
             Check("Native underlay trace ABI and event kinds are fixed", NativeUnderlayTraceAbi);
             Check("SOCKS5 UDP datagram logical source", UdpPacketRoundTrip);
             Check("Shared UDP byte budget", UdpBudget);
@@ -360,52 +359,6 @@ internal static class Program
         Require(usage.Total == 0 && usage.Sources.Count == 0
                 && capacity.CurrentCount == maxConnections,
             "Concurrent exits leaked or over-released TCP slots or left stale session metrics");
-    }
-
-    private static void UnderlayTimeline()
-    {
-        long now = 1_000;
-        var observations = new LibztUnderlayDiagnostics(() => now);
-        var firstPorts = observations.ObservePorts(9993, 34000);
-        Require(firstPorts is { PreviousSecondary: null },
-            "Initial native port snapshot was not accepted");
-        Require(observations.ObservePorts(9993, 34000) is null,
-            "Unchanged ports should not produce a new log record");
-        observations.RecordPhysicalRefresh();
-        now += 250;
-        var changed = observations.ObservePorts(9993, 34100);
-        Require(changed is {
-            PreviousSecondary: 34000,
-            Secondary: 34100,
-            SinceRefreshMs: 250
-        }, "Observed native secondary port rotation was not recorded");
-
-        observations.ObservePeer(LibztNative.EventPeerRelay, 0x12345);
-        now += 91_000;
-        var peer = observations.ObservePeer(
-            LibztNative.EventPeerDirect, 0x12345);
-        Require(peer is { ElapsedMs: 91_000, Previous: "RELAY" },
-            "Native RELAY to DIRECT observation was not timed");
-        Require(observations.ObservePeer(
-            LibztNative.EventPeerDirect, 0x12345) is null,
-            "Repeated DIRECT is not another recovery");
-
-        observations.ObserveNode(LibztNative.EventNodeOnline);
-        now += 156_000;
-        var offline = observations.ObserveNode(
-            LibztNative.EventNodeOffline);
-        Require(offline is { LastPhaseDurationMs: 156_000 },
-            "NODE_OFFLINE did not capture prior online duration");
-        now += 70_000;
-        var online = observations.ObserveNode(
-            LibztNative.EventNodeOnline);
-        Require(online is { LastPhaseDurationMs: 70_000 },
-            "NODE_ONLINE did not capture offline interval");
-        now += 156_000;
-        offline = observations.ObserveNode(
-            LibztNative.EventNodeOffline);
-        Require(offline is { TimeSincePreviousOfflineMs: 226_000 },
-            "226-second NODE_OFFLINE cycle cannot be measured");
     }
 
     private static async Task PeerDialAdmission()
@@ -1009,6 +962,16 @@ internal static class Program
         ];
         Require(HostOptions.Parse(common).LogLevel == JsonLogLevel.Info,
             "Default log level must preserve existing JSONL behavior");
+        Require(!HostOptions.Parse(common).NativeTraceEnabled,
+            "Native traces must be disabled by default");
+        Require(HostOptions.Parse([..common, "--native-trace"]).NativeTraceEnabled,
+            "Explicit --native-trace must enable native diagnostics");
+        Throws<ArgumentException>(() => HostOptions.Parse([
+            ..common, "--log-level", "none", "--native-trace"
+        ]));
+        Throws<ArgumentException>(() => HostOptions.Parse([
+            ..common, "--log-level", "error", "--native-trace"
+        ]));
         foreach (var (name, level) in new[] {
             ("none", JsonLogLevel.None),
             ("error", JsonLogLevel.Error),

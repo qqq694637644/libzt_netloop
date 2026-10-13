@@ -15,17 +15,18 @@ B 未发生 `max_connections` 拒绝，已有 Relay 则有成批 Native read 错
 
 ## 实现与边界
 
-Native `0006-native-underlay-trace.patch`、`0007-core-underlay-socket-trace.patch`
-和独立应用到固定 ZeroTierOne 子模块的 `0001-netloop-core-path-trace.patch` 添加只读
+PR #7 将早期的增量诊断补丁合并进
+`patches/libzt/0001-netloop-native.patch` 和
+`patches/zerotierone/0001-netloop-core.patch`；固定 ABI 保持不变。两者添加只读
 `zts_netloop_poll_underlay_event` P/Invoke ABI。NodeService 在最多 **512 条**
 的固定上限 FIFO 中记录原生时间戳；C# 每 250ms 最多消费 128 条，
 写入 JSONL `libzt_native_underlay_trace`。
 丢弃时记录 `libzt_native_underlay_records_dropped`，不阻塞 TCP 业务以等待日志。
 
-本 PR 后续增量补丁 `libzt/0008-recovery-decision-trace.patch` 和
-`zerotierone/0002-netloop-recovery-decision-trace.patch` 进一步捕获
-ECHO 往返、RENDEZVOUS 的来源、路由回退和 NAT 映射变化的决策证据。
-**它们不改变定时器、Peer 选路、路径过期规则或发包数量。**
+**运行开关**：新增 `--native-trace --log-level info` 才安装
+ZeroTierOne 内部 Trace callback 并启动托管队列消费；默认 `info`、
+`error`、`none` 都不做逐包 Native 追踪。日志开关仅影响观测，
+不改变 ECHO/HELLO、Rendezvous、Root/Relay、DAD 与重试算法。
 
 | kind | 捕获点 | 关键字段及含义 |
 | --- | --- | --- |

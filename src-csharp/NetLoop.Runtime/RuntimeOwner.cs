@@ -59,6 +59,7 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
     private bool _physicalEpisodeActive;
     private long _physicalEpisodeStartedAt;
     private long _physicalEpisodeLastEventAt;
+    private ulong _physicalEpisodeId;
     private long _failedReadyRefreshAttempts;
     private Event? _deferredManualReset;
 
@@ -122,7 +123,7 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
     private void DrainEventsWhileWaiting()
         => DrainPendingWaitingEvents(
             _events.Reader,
-            node.TryNotifyPhysicalNetworkChanged,
+            () => node.TryNotifyPhysicalNetworkChanged(_physicalEpisodeId),
             ref _physicalRefreshPending,
             ref _deferredManualReset,
             OnPhysicalEventWhileWaiting);
@@ -131,7 +132,9 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
     {
         // Runtime recreation can overlap a burst of OS notifications. They
         // still refresh the native Binder, but must extend the same episode.
-        if (_physicalEpisodeActive)
+        if (OperatingSystem.IsWindows())
+            BeginPhysicalEpisodeIfSettled();
+        else if (_physicalEpisodeActive)
             _physicalEpisodeLastEventAt = Environment.TickCount64;
     }
 
@@ -151,6 +154,9 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
         {
             _physicalEpisodeActive = true;
             _physicalEpisodeStartedAt = now;
+            // A single OS episode owns a single token across all the Native
+            // refreshes it triggers. Do not make NodeService infer epochs.
+            ++_physicalEpisodeId;
         }
 
         // Never drop a later OS notification: it must still cause native
@@ -339,7 +345,7 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
                         {
                             if (!TryDeliverPendingPhysicalRefresh(
                                     ref _physicalRefreshPending,
-                                    node.TryNotifyPhysicalNetworkChanged))
+                                    () => node.TryNotifyPhysicalNetworkChanged(_physicalEpisodeId)))
                                 LogFailedReadyRefresh("retry_after_native_failure");
                             else
                                 _failedReadyRefreshAttempts = 0;
@@ -376,7 +382,7 @@ internal sealed class RuntimeOwner(LibztNode node, HostOptions options)
                                     _physicalRefreshPending = true;
                                     if (!TryDeliverPendingPhysicalRefresh(
                                             ref _physicalRefreshPending,
-                                            node.TryNotifyPhysicalNetworkChanged))
+                                            () => node.TryNotifyPhysicalNetworkChanged(_physicalEpisodeId)))
                                         LogFailedReadyRefresh(currentEvent.Reason);
                                     else
                                         _failedReadyRefreshAttempts = 0;

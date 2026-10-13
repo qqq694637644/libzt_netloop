@@ -48,22 +48,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          libzt="$(git ls-tree HEAD external/libzt | awk '{print $3}')"
-          cmake="$(git hash-object CMakeLists.txt)"
-          script="$(git hash-object tools/build_android_native.py)"
-          patch1="$(git hash-object patches/libzt/0001-host-network-change-refresh.patch)"
-          patch2="$(git hash-object patches/libzt/0002-android-pinvoke.patch)"
-          patch3="$(git hash-object patches/libzt/0003-peer-event-details.patch)"
-          patch4="$(git hash-object patches/libzt/0004-network-cidr-queries.patch)"
-          patch5="$(git hash-object patches/libzt/0005-underlay-port-diagnostics.patch)"
-          patch6="$(git hash-object patches/libzt/0006-native-underlay-trace.patch)"
-          patch7="$(git hash-object patches/libzt/0007-core-underlay-socket-trace.patch)"
-          core_trace_patch="$(git hash-object patches/zerotierone/0001-netloop-core-path-trace.patch)"
-          patch8="$(git hash-object patches/libzt/0008-recovery-decision-trace.patch)"
-          core_recovery_patch="$(git hash-object patches/zerotierone/0002-netloop-recovery-decision-trace.patch)"
           ndk_revision="$(awk -F= '/Pkg.Revision/ {gsub(/ /, "", $2); print $2}' "$ANDROID_NDK_HOME/source.properties")"
           echo "ndk_revision=$ndk_revision" >> "$GITHUB_OUTPUT"
-          fingerprint="$(printf '%s' "${ndk_revision}|${libzt}|${cmake}|${script}|${patch1}|${patch2}|${patch3}|${patch4}|${patch5}|${patch6}|${patch7}|${patch8}|${core_trace_patch}|${core_recovery_patch}" | git hash-object --stdin)"
+          fingerprint="$(python tools/native_cache_key.py --platform android --arch arm64-v8a --ndk-revision "$ndk_revision")"
           echo "key=libzt-pinvoke-android-arm64-${fingerprint}" >> "$GITHUB_OUTPUT"
 
       - name: Restore compiled Android libzt bundle

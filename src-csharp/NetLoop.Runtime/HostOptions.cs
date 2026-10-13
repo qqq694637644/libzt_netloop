@@ -55,6 +55,7 @@ internal sealed class HostOptions
     internal string? UpstreamUsername { get; init; }
     internal string? UpstreamPassword { get; init; }
     internal JsonLogLevel LogLevel { get; init; } = JsonLogLevel.Info;
+    internal bool NativeTraceEnabled { get; init; }
     internal string? LogFile { get; init; }
     internal int LogMaxMegabytes { get; init; } = 16;
     internal int LogRetainedFiles { get; init; } = 5;
@@ -81,7 +82,7 @@ internal sealed class HostOptions
         for (var index = 0; index < args.Length; index++)
         {
             var key = args[index];
-            if (key is "--help" or "-h" or "--version")
+            if (key is "--help" or "-h" or "--version" or "--native-trace")
             {
                 flags.Add(key);
                 continue;
@@ -150,6 +151,8 @@ internal sealed class HostOptions
             "none" => JsonLogLevel.None,
             _ => throw new ArgumentException("--log-level must be 'none', 'error', or 'info'.")
         };
+        if (flags.Contains("--native-trace") && logLevel != JsonLogLevel.Info)
+            throw new ArgumentException("--native-trace requires --log-level info.");
         var logFile = Optional(values, "--log-file");
         var logMaxMb = ParsePositiveInt(Optional(values, "--log-max-mb") ?? "16", "--log-max-mb");
         var logRetain = ParsePositiveInt(Optional(values, "--log-retain") ?? "5", "--log-retain");
@@ -175,6 +178,7 @@ internal sealed class HostOptions
             UpstreamUsername = upstreamUsername,
             UpstreamPassword = upstreamPassword,
             LogLevel = logLevel,
+            NativeTraceEnabled = flags.Contains("--native-trace"),
             LogFile = logFile,
             LogMaxMegabytes = logMaxMb,
             LogRetainedFiles = logRetain,
@@ -252,6 +256,7 @@ internal sealed class HostOptions
           --upstream-user <user>      RFC1929 username; requires password
           --upstream-password <pass>  RFC1929 password; requires username
           --log-level <level>         none | error | info (default info; none disables JSONL)
+          --native-trace              Opt-in detailed Native UDP/Core traces (requires info; off by default)
           --log-file <path>           Optional rotating JSONL file (stdout by default; ignored when none)
           --log-max-mb <MiB>          Maximum file size (default 16, range 1..1024)
           --log-retain <count>        Retained rotated files (default 5, range 1..50)

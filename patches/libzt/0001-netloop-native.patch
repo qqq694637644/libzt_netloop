@@ -1,0 +1,1163 @@
+diff --git a/include/ZeroTierSockets.h b/include/ZeroTierSockets.h
+index ba9732a..c3a7134 100644
+--- a/include/ZeroTierSockets.h
++++ b/include/ZeroTierSockets.h
+@@ -1724,6 +1724,56 @@ ZTS_API int ZTCALL zts_node_get_id_pair(char* key, unsigned int* key_dst_len);
+  */
+ ZTS_API int ZTCALL zts_node_get_port();
+ 
++/**
++ * Read-only snapshot of the primary and secondary UDP ports actually
++ * present in libzt's binder local-interface address set. Zero means not bound.
++ */
++
++/**
++ * NetLoop read-only underlay trace. Version 2, fixed 240-byte ABI layout.
++ * Kinds: 1=network-refresh-queued, 2=binder-start, 3=binder-complete,
++ * 4=path-check, 5=wire-tx, 6=wire-rx, 7=node-phase, 8=planet-snapshot.
++ *
++ * UDP wire IDs are unverified header observations, NOT authenticated peer
++ * identity or decoded protocol verbs. No packet contents are retained.
++ * Returns 1 if an event was read, 0 if empty, negative ZTS_ERR_* on error.
++ * dropped_total is cumulative and also populated when the queue is empty.
++ */
++typedef struct zts_netloop_underlay_event {
++    int64_t timestamp_ms;
++    uint64_t peer_id;
++    uint64_t reference;
++    uint32_t kind;
++    uint32_t flags;
++    uint32_t byte_count;
++    int32_t result;
++    uint16_t primary_port;
++    uint16_t secondary_port;
++    uint16_t previous_secondary_port;
++    uint16_t reserved;
++    char endpoint[64];
++    char local_endpoint[64];
++    char interface_name[64];
++} zts_netloop_underlay_event_t;
++ZTS_API int ZTCALL zts_netloop_poll_underlay_event(
++    zts_netloop_underlay_event_t* event, uint64_t* dropped_total);
++/* Configure optional detailed Native/Core traces before zts_node_start.
++ * 0 disables high-frequency diagnostics, 1 enables them. */
++ZTS_API int ZTCALL zts_netloop_set_underlay_trace_enabled(int enabled);
++
++/**
++ * @brief Notify the node that the host's physical network changed.
++ *
++ * Forces an immediate refresh of physical UDP bindings and local interface
++ * addresses without restarting the ZeroTier node or virtual networks.
++ *
++ * @return `ZTS_ERR_OK` if successful, `ZTS_ERR_SERVICE` if the node
++ *     is not running.
++ */
++/* handover_epoch is assigned by the sole managed RuntimeOwner; repeated
++ * notifications of the same OS handover carry the same value. */
++ZTS_API int ZTCALL zts_node_network_changed(uint64_t handover_epoch);
++
+ /**
+  * @brief Stop the ZeroTier node and bring down all virtual network
+  *     transport services. Callable only after the node has been started.
+@@ -2978,6 +3028,14 @@ ZTS_API int ZTCALL zts_core_query_addr_count(uint64_t net_id);
+  */
+ ZTS_API int ZTCALL zts_core_query_addr(uint64_t net_id, unsigned int idx, char* addr, unsigned int len);
+ 
++/**
++ * NetLoop extension: return an assigned address with its controller-provided
++ * prefix length, e.g. "192.0.2.10/24" or "2001:db8::10/64".
++ * Buffer must hold at least ZTS_IP_MAX_STR_LEN + 5 bytes.
++ * Caller must hold the core query lock.
++ */
++ZTS_API int ZTCALL zts_netloop_query_addr_cidr(uint64_t net_id, unsigned int idx, char* dst, unsigned int len);
++
+ /**
+  * @brief Lock the core service so that queries about addresses, routes, paths, etc. can be
+  * performed.
+@@ -3009,6 +3067,16 @@ ZTS_API int ZTCALL zts_core_query_route(
+     uint16_t* flags,
+     uint16_t* metric);
+ 
++/**
++ * NetLoop extension: same as zts_core_query_route, but target includes the
++ * controller-provided prefix. via is "0.0.0.0" for a directly connected route.
++ * Each string buffer must hold at least ZTS_IP_MAX_STR_LEN + 5 bytes.
++ * Caller must hold the core query lock.
++ */
++ZTS_API int ZTCALL zts_netloop_query_route_cidr(
++    uint64_t net_id, unsigned int idx, char* target, char* via,
++    unsigned int len, uint16_t* flags, uint16_t* metric);
++
+ /**
+  * @brief Lock the core service so that queries about addresses, routes, paths, etc. can be
+  * performed.
+diff --git a/src/Controls.cpp b/src/Controls.cpp
+index 8aa0a72..8b8099d 100644
+--- a/src/Controls.cpp
++++ b/src/Controls.cpp
+@@ -404,6 +404,12 @@ int zts_core_query_addr(uint64_t net_id, unsigned int idx, char* addr, unsigned
+     return zts_service->getAddrAtIdx(net_id, idx, addr, len);
+ }
+ 
++int zts_netloop_query_addr_cidr(uint64_t net_id, unsigned int idx, char* dst, unsigned int len)
++{
++    ACQUIRE_SERVICE(ZTS_ERR_SERVICE);
++    return zts_service->getAddrCidrAtIdx(net_id, idx, dst, len);
++}
++
+ int zts_core_query_route_count(uint64_t net_id)
+ {
+     ACQUIRE_SERVICE(ZTS_ERR_SERVICE);
+@@ -423,6 +429,14 @@ int zts_core_query_route(
+     return zts_service->getRouteAtIdx(net_id, idx, target, via, len, flags, metric);
+ }
+ 
++int zts_netloop_query_route_cidr(
++    uint64_t net_id, unsigned int idx, char* target, char* via,
++    unsigned int len, uint16_t* flags, uint16_t* metric)
++{
++    ACQUIRE_SERVICE(ZTS_ERR_SERVICE);
++    return zts_service->getRouteCidrAtIdx(net_id, idx, target, via, len, flags, metric);
++}
++
+ int zts_core_query_path_count(uint64_t peer_id)
+ {
+     ACQUIRE_SERVICE(ZTS_ERR_SERVICE);
+@@ -619,6 +633,31 @@ int zts_node_get_port()
+     return zts_service->getPrimaryPort();
+ }
+ 
++int zts_netloop_poll_underlay_event(
++    zts_netloop_underlay_event_t* event, uint64_t* dropped_total)
++{
++    if (!event || !dropped_total)
++        return ZTS_ERR_ARG;
++    ACQUIRE_SERVICE(ZTS_ERR_SERVICE);
++    return zts_service->pollUnderlayEvent(event, dropped_total);
++}
++
++int zts_netloop_set_underlay_trace_enabled(int enabled)
++{
++    if (enabled != 0 && enabled != 1)
++        return ZTS_ERR_ARG;
++    ACQUIRE_SERVICE_OFFLINE();
++    zts_service->setUnderlayTraceEnabled(enabled != 0);
++    return ZTS_ERR_OK;
++}
++
++int zts_node_network_changed(uint64_t handover_epoch)
++{
++    ACQUIRE_SERVICE(ZTS_ERR_SERVICE);
++    zts_service->networkChanged(handover_epoch);
++    return ZTS_ERR_OK;
++}
++
+ int zts_node_stop()
+ {
+     ACQUIRE_SERVICE(ZTS_ERR_SERVICE);
+diff --git a/src/NodeService.cpp b/src/NodeService.cpp
+index 036f406..71298bd 100644
+--- a/src/NodeService.cpp
++++ b/src/NodeService.cpp
+@@ -41,6 +41,49 @@
+ 
+ namespace ZeroTier {
+ 
++#ifdef _WIN32
++// The Binder's successful bind is not proof Windows has completed IPv6 DAD.
++// Check only the newly bound global IPv6 IPs (not old still-preferred IPs).
++// IpDadStatePreferred and SkipAsSource are supplied by Windows IP Helper.
++// A negative result means the query failed; zero means no matching address.
++static int netloopPreferredIpv6DadState(
++    const std::vector<InetAddress> &newBoundIps,
++    InetAddress* preferredIp = 0, uint64_t* preferredLuid = 0)
++{
++    if (preferredLuid)
++        *preferredLuid = 0;
++    PMIB_UNICASTIPADDRESS_TABLE table = (PMIB_UNICASTIPADDRESS_TABLE)0;
++    const DWORD error = GetUnicastIpAddressTable(AF_INET6, &table);
++    if (error != NO_ERROR || !table)
++        return error ? -((int)error) : -1;
++
++    int result = 0;
++    for (unsigned int n=0;n<table->NumEntries;++n) {
++        const MIB_UNICASTIPADDRESS_ROW &row = table->Table[n];
++        if (row.Address.si_family != AF_INET6)
++            continue;
++        for (std::vector<InetAddress>::const_iterator ip(newBoundIps.begin());ip!=newBoundIps.end();++ip) {
++            if (memcmp(row.Address.Ipv6.sin6_addr.s6_addr,ip->rawIpData(),16) != 0)
++                continue;
++            if (row.DadState == IpDadStatePreferred && !row.SkipAsSource) {
++                if (preferredIp)
++                    *preferredIp = *ip;
++                if (preferredLuid)
++                    *preferredLuid = (uint64_t)row.InterfaceLuid.Value;
++                FreeMibTable(table);
++                return (int)IpDadStatePreferred;
++            }
++            result = row.SkipAsSource ? 5 : (int)row.DadState;
++        }
++    }
++    FreeMibTable(table);
++    return result;
++}
++#endif
++
++static_assert(sizeof(zts_netloop_underlay_event_t) == 240,
++              "NetLoop underlay trace ABI size must remain 240 bytes");
++
+ static int SnodeVirtualNetworkConfigFunction(
+     ZT_Node* node,
+     void* uptr,
+@@ -62,6 +105,17 @@ static void SnodeEventCallback(ZT_Node* node, void* uptr, void* tptr, enum ZT_Ev
+     reinterpret_cast<NodeService*>(uptr)->nodeEventCallback(event, metaData);
+ }
+ 
++static void SnodeNetLoopTraceCallback(
++    ZT_Node* node, void* uptr, void* tptr, unsigned int kind,
++    uint64_t peerId, uint64_t reference, unsigned int flags, int result,
++    const struct sockaddr_storage* endpoint)
++{
++    ZTS_UNUSED_ARG(node);
++    ZTS_UNUSED_ARG(tptr);
++    reinterpret_cast<NodeService*>(uptr)->nodeNetLoopCoreTrace(
++        kind, peerId, reference, flags, result, endpoint);
++}
++
+ static void SnodeStatePutFunction(
+     ZT_Node* node,
+     void* uptr,
+@@ -182,6 +236,7 @@ NodeService::NodeService()
+     , _lastSendToGlobalV4(0)
+     , _tcpFallbackTunnel((TcpConnection*)0)
+     , _lastRestart(0)
++    , _networkChangeRequested(false)
+     , _nextBackgroundTaskDeadline(0)
+     , _run(false)
+     , _termReason(ONE_STILL_RUNNING)
+@@ -210,6 +265,189 @@ NodeService::~NodeService()
+ #endif
+ }
+ 
++// Only the unencrypted ZeroTier header is inspected. Packet IDs and source/
++// destination Node IDs are not authenticated by this trace and must not be
++// treated as verified application or Peer control-plane messages.
++static uint64_t netloopReadWireInteger(const unsigned char* bytes, unsigned int count)
++{
++    uint64_t value = 0;
++    for (unsigned int i = 0; i < count; ++i)
++        value = (value << 8) | bytes[i];
++    return value;
++}
++
++void NodeService::recordUnderlay(
++    uint32_t kind, uint64_t peerId, uint64_t reference, uint32_t flags,
++    uint32_t byteCount, int32_t result, const struct sockaddr_storage* endpoint,
++    uint16_t previousSecondary, const InetAddress* localEndpoint,
++    const char* interfaceName)
++{
++    if (!_underlayTraceEnabled.load(std::memory_order_relaxed))
++        return;
++    zts_netloop_underlay_event_t event = {};
++    event.timestamp_ms = OSUtils::now();
++    event.peer_id = peerId;
++    event.reference = reference;
++    event.kind = kind;
++    event.flags = flags;
++    event.byte_count = byteCount;
++    event.result = result;
++    const unsigned int ports = _boundUdpPortSnapshot.load(std::memory_order_acquire);
++    event.primary_port = static_cast<uint16_t>(ports >> 16);
++    event.secondary_port = static_cast<uint16_t>(ports & 0xffff);
++    event.previous_secondary_port = previousSecondary;
++    if (endpoint)
++        reinterpret_cast<const InetAddress*>(endpoint)->toString(event.endpoint);
++    if (localEndpoint)
++        localEndpoint->toString(event.local_endpoint);
++    if (interfaceName)
++        OSUtils::ztsnprintf(event.interface_name, sizeof(event.interface_name),
++                           "%s", interfaceName);
++
++    Mutex::Lock _l(_underlayTrace_m);
++    if (_underlayTrace.size() == 512) {
++        _underlayTrace.pop_front();
++        ++_underlayTraceDropped;
++    }
++    _underlayTrace.push_back(event);
++}
++
++int NodeService::pollUnderlayEvent(
++    zts_netloop_underlay_event_t* event, uint64_t* droppedTotal)
++{
++    Mutex::Lock _l(_underlayTrace_m);
++    *droppedTotal = _underlayTraceDropped;
++    if (_underlayTrace.empty())
++        return 0;
++    *event = _underlayTrace.front();
++    _underlayTrace.pop_front();
++    return 1;
++}
++
++void NodeService::traceUnderlayWire(
++    uint32_t kind, const struct sockaddr_storage* endpoint,
++    const void* data, unsigned int len, int32_t result,
++    const InetAddress* localEndpoint, const char* interfaceName)
++{
++    if (!_underlayTraceEnabled.load(std::memory_order_relaxed))
++        return;
++    // Skip ZeroTier fragment headers and malformed/short packets. These are
++    // observations at the physical socket boundary, before authentication.
++    if (!data || !endpoint || len < 28)
++        return;
++    const unsigned char* bytes = static_cast<const unsigned char*>(data);
++    if (bytes[13] == 0xff)
++        return;
++    const uint64_t peer = netloopReadWireInteger(bytes + (kind == 5 ? 8 : 13), 5);
++    if (!peer)
++        return;
++
++    char remote[64] = { 0 };
++    reinterpret_cast<const InetAddress*>(endpoint)->toString(remote);
++    std::string sampledPath(remote);
++    if (localEndpoint) {
++        char local[64] = { 0 };
++        localEndpoint->toString(local);
++        sampledPath.append("|");
++        sampledPath.append(local);
++        if (interfaceName) {
++            sampledPath.append("|");
++            sampledPath.append(interfaceName);
++        }
++    }
++    const int64_t now = OSUtils::now();
++    bool logPacket = false;
++    {
++        Mutex::Lock _l(_underlayTrace_m);
++        const uint64_t key = (peer << 1) | (kind == 6 ? 1 : 0);
++        std::map<uint64_t, std::pair<int64_t, std::string> >::iterator last =
++            _underlayWireSamples.find(key);
++        if (last == _underlayWireSamples.end()
++            || last->second.second != sampledPath
++            || now - last->second.first >= 1000
++            || (result < 0 && (now - last->second.first) >= 250)) {
++            if (last == _underlayWireSamples.end() && _underlayWireSamples.size() >= 64)
++                _underlayWireSamples.clear();
++            _underlayWireSamples[key] = std::make_pair(now, sampledPath);
++            logPacket = true;
++        }
++    }
++    if (logPacket) {
++        recordUnderlay(
++            kind, peer, netloopReadWireInteger(bytes, 8),
++            bytes[18], len, result, endpoint, 0, localEndpoint, interfaceName);
++    }
++}
++
++void NodeService::tracePlanetSnapshot()
++{
++    if (!_underlayTraceEnabled.load(std::memory_order_relaxed))
++        return;
++    ZT_PeerList* const peers = _node->peers();
++    unsigned int roots = 0;
++    if (peers) {
++        for (unsigned long i = 0; i < peers->peerCount && roots < 8; ++i) {
++            const ZT_Peer& peer = peers->peers[i];
++            if (peer.role != ZT_PEER_ROLE_PLANET)
++                continue;
++            ++roots;
++            uint64_t newestReceive = 0;
++            const struct sockaddr_storage* newestPath = 0;
++            for (unsigned int p = 0; p < peer.pathCount && p < ZTS_MAX_PEER_NETWORK_PATHS; ++p) {
++                if (peer.paths[p].lastReceive >= newestReceive) {
++                    newestReceive = peer.paths[p].lastReceive;
++                    newestPath = &peer.paths[p].address;
++                }
++            }
++            recordUnderlay(
++                8, peer.address, newestReceive, peer.pathCount, 0,
++                _node->online() ? 1 : 0, newestPath);
++        }
++        _node->freeQueryResult((void*)peers);
++    }
++    if (!roots)
++        recordUnderlay(8, 0, 0, 0, 0, _node->online() ? 1 : 0);
++}
++
++void NodeService::nodeNetLoopCoreTrace(
++    unsigned int kind, uint64_t peerId, uint64_t reference,
++    unsigned int flags, int result, const struct sockaddr_storage* endpoint)
++{
++    if (!_underlayTraceEnabled.load(std::memory_order_relaxed))
++        return;
++    // Distinct event namespace from unverified socket-level wire headers.
++    // No encrypted packet content crosses this callback.
++    if (kind < 10 || kind > 38)
++        return;
++
++    if (kind == 26 || kind == 27) {
++        std::string routeKey = std::to_string(flags);
++        if (endpoint) {
++            char addr[64] = { 0 };
++            reinterpret_cast<const InetAddress*>(endpoint)->toString(addr);
++            routeKey.append("|");
++            routeKey.append(addr);
++        }
++        const int64_t now = OSUtils::now();
++        {
++            Mutex::Lock _l(_underlayTrace_m);
++            const uint64_t sampleKey = (peerId << 6) | kind;
++            const int64_t interval = kind == 26 ? 5000 : 15000;
++            std::map<uint64_t, std::pair<int64_t, std::string> >::iterator previous =
++                _underlayRouteSamples.find(sampleKey);
++            if (previous != _underlayRouteSamples.end()
++                && previous->second.second == routeKey
++                && (now - previous->second.first) < interval)
++                return;
++            if (previous == _underlayRouteSamples.end()
++                && _underlayRouteSamples.size() >= 64)
++                _underlayRouteSamples.clear();
++            _underlayRouteSamples[sampleKey] = std::make_pair(now, routeKey);
++        }
++    }
++    recordUnderlay(kind, peerId, reference, flags, 0, result, endpoint);
++}
++
+ NodeService::ReasonForTermination NodeService::run()
+ {
+     _run = true;
+@@ -250,6 +488,9 @@ NodeService::ReasonForTermination NodeService::run()
+             cb.eventCallback = SnodeEventCallback;
+             cb.pathCheckFunction = SnodePathCheckFunction;
+             cb.pathLookupFunction = SnodePathLookupFunction;
++            cb.netloopTraceFunction =
++                _underlayTraceEnabled.load(std::memory_order_relaxed)
++                    ? SnodeNetLoopTraceCallback : 0;
+             _node = new Node(this, (void*)0, &cb, OSUtils::now());
+         }
+ 
+@@ -359,10 +600,30 @@ NodeService::ReasonForTermination NodeService::run()
+         int64_t lastTapMulticastGroupCheck = 0;
+         int64_t lastBindRefresh = 0;
+         int64_t lastCleanedPeersDb = 0;
+-        int64_t lastLocalInterfaceAddressCheck =
+-            (clockShouldBe - ZT_LOCAL_INTERFACE_CHECK_INTERVAL) + 15000;   // do this in 15s to give portmapper time to
++        int64_t lastPlanetSnapshot = 0;
+         int64_t lastOnline = OSUtils::now();
++#ifdef _WIN32
++        // Native half of the Windows handover episode. Keep the bound IP set
++        // (not UDP ports) from every Binder refresh so a later OS callback
++        // cannot turn a same-address port rebind into a Root HELLO storm.
++        std::vector<InetAddress> previousGlobalV6;
++        std::vector<InetAddress> newlyBoundGlobalV6;
++        bool haveV6Baseline = false;
++        int64_t lastGlobalV6Change = 0;
++        int64_t handoverEpisodeStart = 0;
++        int64_t lastHandoverEpoch = 0;
++        int64_t handoverLastNotification = 0;
++        bool rootV6ProbedInEpisode = false;
++        bool rootV6RetryActive = false;
++        int64_t rootV6RetryStartedAt = 0;
++        int64_t nextRootV6RetryAt = 0;
++        unsigned int rootV6Attempt = 0;
++        int64_t nextDadCheck = 0;
++        int lastDadState = -999;
++#endif
+         for (;;) {
++            bool networkChanged = false;
++            uint64_t handoverEpoch = 0;
+             _run_m.lock();
+             if (! _run) {
+                 _run_m.unlock();
+@@ -372,11 +633,31 @@ NodeService::ReasonForTermination NodeService::run()
+                 break;
+             }
+             else {
++                networkChanged = _networkChangeRequested;
++                _networkChangeRequested = false;
++                handoverEpoch = _networkChangeEpochRequested;
+                 _run_m.unlock();
+             }
+ 
+             const int64_t now = OSUtils::now();
+ 
++#ifdef _WIN32
++            if (networkChanged) {
++                // Mirror the managed episode boundary without delaying the
++                // first event. Later callbacks can extend the same episode.
++                if (handoverEpoch && handoverEpoch != (uint64_t)lastHandoverEpoch) {
++                    lastHandoverEpoch = (int64_t)handoverEpoch;
++                    handoverEpisodeStart = now;
++                    rootV6ProbedInEpisode = false;
++                    rootV6RetryActive = false;
++                    rootV6Attempt = 0;
++                    lastDadState = -999;
++                    nextDadCheck = 0;
++                }
++                handoverLastNotification = now;
++            }
++#endif
++
+             // Attempt to detect sleep/wake events by detecting delay
+             // overruns
+             bool restarted = false;
+@@ -384,22 +665,40 @@ NodeService::ReasonForTermination NodeService::run()
+                 _lastRestart = now;
+                 restarted = true;
+             }
+-
+-            // If secondary port is not configured to a constant value and we've been offline for a while,
+-            // bind a new secondary port. This is a workaround for a "coma" issue caused by buggy NATs that stop
+-            // working on one port after a while.
+-            if (_node->online()) {
+-                lastOnline = now;
+-            }
+-            else if ((_secondaryPort == 0) && ((now - lastOnline) > ZT_PATH_HEARTBEAT_PERIOD)) {
+-                _secondaryPort = _getRandomPort(minPort, maxPort);
+-                lastBindRefresh = 0;
++            if (networkChanged) {
++                _lastRestart = now;
++                restarted = true;
+             }
+ 
+             // Refresh bindings in case device's interfaces have changed,
+             // and also sync routes to update any shadow routes (e.g. shadow
+             // default)
+             if (((now - lastBindRefresh) >= ZT_BINDER_REFRESH_PERIOD) || (restarted)) {
++                // Preserve the reason for this refresh; an OS notification
++                // may coincide with an overdue periodic refresh.
++                uint32_t reason = (networkChanged ? 1U : 0U)
++                    | (restarted && !networkChanged ? 2U : 0U)
++                    | ((now - lastBindRefresh) >= ZT_BINDER_REFRESH_PERIOD ? 4U : 0U)
++                    | (!_node->online() ? 16U : 0U);
++                const unsigned int oldBoundPorts =
++                    _boundUdpPortSnapshot.load(std::memory_order_acquire);
++                const uint16_t oldSecondary = static_cast<uint16_t>(oldBoundPorts & 0xffff);
++                const int64_t binderStart = OSUtils::now();
++                recordUnderlay(2, 0, binderStart, reason, 0, _node->online() ? 1 : 0,
++                               0, oldSecondary);
++                // ZeroTierOne 5542dbcc0 moved secondary-port rotation into the
++                // binder refresh cadence so a node does not keep changing
++                // ports before the new mapping has had a chance to connect.
++                if (_secondaryPort == 0) {
++                    if (_node->online()) {
++                        lastOnline = now;
++                    }
++                    else if (((now - lastOnline) > (ZT_PEER_PING_PERIOD * 2)) || restarted) {
++                        lastOnline = now;
++                        _ports[1] = _getRandomPort(minPort, maxPort);
++                    }
++                }
++
+                 lastBindRefresh = now;
+                 unsigned int p[3] = { 0 };
+                 unsigned int pc = 0;
+@@ -412,10 +711,236 @@ NodeService::ReasonForTermination NodeService::run()
+                     // Only bother binding UDP ports if we aren't forcing TCP-relay mode
+                     _binder.refresh(_phy, p, pc, explicitBind, *this);
+                 }
++
++                // Observe the binder itself: _secondaryPort stays zero for
++                // dynamic rotation and cannot describe the real UDP binding.
++                unsigned int primaryBound = 0;
++                unsigned int secondaryBound = 0;
++                std::vector<InetAddress> bound(_binder.allBoundLocalInterfaceAddresses());
++                for (std::vector<InetAddress>::const_iterator i(bound.begin()); i != bound.end(); ++i) {
++                    const unsigned int port = i->port();
++                    if (port == _ports[0])
++                        primaryBound = port;
++                    if (_ports[1] && port == _ports[1])
++                        secondaryBound = port;
++                }
++                _boundUdpPortSnapshot.store(
++                    ((primaryBound & 0xffff) << 16) | (secondaryBound & 0xffff),
++                    std::memory_order_release);
++                if (oldSecondary != secondaryBound)
++                    reason |= 8U;
++                recordUnderlay(3, 0, binderStart, reason,
++                               static_cast<uint32_t>(bound.size()),
++                               primaryBound ? 1 : 0, 0, oldSecondary);
++
++                // Keep the core's view of local physical interfaces in sync
++                // with the freshly rebound sockets. This mirrors ZeroTierOne
++                // 1.12's faster physical-network-change recovery.
++                _node->clearLocalInterfaceAddresses();
++#ifdef ZT_USE_MINIUPNPC
++                if (_portMapper) {
++                    std::vector<InetAddress> mappedAddresses(_portMapper->get());
++                    for (std::vector<InetAddress>::const_iterator ext(mappedAddresses.begin());
++                         ext != mappedAddresses.end();
++                         ++ext)
++                        _node->addLocalInterfaceAddress(reinterpret_cast<const struct sockaddr_storage*>(&(*ext)));
++                }
++#endif
++                std::vector<InetAddress> boundAddrs(_binder.allBoundLocalInterfaceAddresses());
++                for (std::vector<InetAddress>::const_iterator i(boundAddrs.begin()); i != boundAddrs.end(); ++i)
++                    _node->addLocalInterfaceAddress(reinterpret_cast<const struct sockaddr_storage*>(&(*i)));
++
++#ifdef _WIN32
++                // A public IPv6 surface learned from another Peer does not
++                // guarantee the local Binder has a usable IPv6 socket. Only
++                // an actual change of global bound IPs can arm fast HELLO.
++                // Compare IPs ignoring UDP port and duplicate bound sockets.
++                std::vector<InetAddress> currentGlobalV6;
++                for (std::vector<InetAddress>::const_iterator i(boundAddrs.begin()); i != boundAddrs.end(); ++i) {
++                    if (i->ss_family != AF_INET6 || i->ipScope() != InetAddress::IP_SCOPE_GLOBAL)
++                        continue;
++                    bool alreadyPresent = false;
++                    for (std::vector<InetAddress>::const_iterator prev(currentGlobalV6.begin()); prev != currentGlobalV6.end(); ++prev) {
++                        if (prev->ipsEqual(*i)) {
++                            alreadyPresent = true;
++                            break;
++                        }
++                    }
++                    if (!alreadyPresent)
++                        currentGlobalV6.push_back(*i);
++                }
++                bool ipv6BindingsChanged = haveV6Baseline && previousGlobalV6.size() != currentGlobalV6.size();
++                if (haveV6Baseline && !ipv6BindingsChanged) {
++                    for (std::vector<InetAddress>::const_iterator i(currentGlobalV6.begin()); i != currentGlobalV6.end(); ++i) {
++                        bool found = false;
++                        for (std::vector<InetAddress>::const_iterator prev(previousGlobalV6.begin()); prev != previousGlobalV6.end(); ++prev) {
++                            if (prev->ipsEqual(*i)) {
++                                found = true;
++                                break;
++                            }
++                        }
++                        if (!found) {
++                            ipv6BindingsChanged = true;
++                            break;
++                        }
++                    }
++                }
++                if (ipv6BindingsChanged) {
++                    lastGlobalV6Change = now;
++                    newlyBoundGlobalV6.clear();
++                    for (std::vector<InetAddress>::const_iterator ip(currentGlobalV6.begin());
++                         ip!=currentGlobalV6.end();++ip) {
++                        bool wasPresent = false;
++                        for (std::vector<InetAddress>::const_iterator old(previousGlobalV6.begin());
++                             old!=previousGlobalV6.end();++old) {
++                            if (old->ipsEqual(*ip)) {
++                                wasPresent = true;
++                                break;
++                            }
++                        }
++                        if (!wasPresent)
++                            newlyBoundGlobalV6.push_back(*ip);
++                    }
++                    nextDadCheck = 0;
++                    lastDadState = -999;
++                }
++                previousGlobalV6.swap(currentGlobalV6);
++                haveV6Baseline = true;
++#endif
++
++                if (networkChanged) {
++#ifdef _WIN32
++                    // Snapshot the actual Binder address families after the
++                    // refresh and after syncing interfaces into Core. This
++                    // distinguishes a newly observed public surface from a
++                    // usable local IPv6 binding; no extra socket is opened.
++                    unsigned int binderFamilies = 0;
++                    int globalV6Count = 0;
++                    const InetAddress *firstGlobalV6 = 0;
++                    for (std::vector<InetAddress>::const_iterator i(boundAddrs.begin()); i != boundAddrs.end(); ++i) {
++                        if (i->ss_family == AF_INET)
++                            binderFamilies |= 4U;
++                        else if (i->ss_family == AF_INET6) {
++                            binderFamilies |= 1U;
++                            if (i->ipScope() == InetAddress::IP_SCOPE_GLOBAL) {
++                                binderFamilies |= 2U;
++                                ++globalV6Count;
++                                if (!firstGlobalV6)
++                                    firstGlobalV6 = &*i;
++                            }
++                        }
++                    }
++                    recordUnderlay(34, 0, (uint64_t)now, binderFamilies,
++                                   (uint32_t)boundAddrs.size(), globalV6Count,
++                                   reinterpret_cast<const struct sockaddr_storage*>(firstGlobalV6));
++#endif
++                    // Only an explicit OS physical handover triggers this
++                    // revalidation (never a routine periodic binder refresh).
++                    // Rebind before probing so new sends use current sockets.
++                    const unsigned int peers = ZT_Node_revalidatePeerPathsAfterNetworkChange(
++                        _node, (void*)0, now);
++                    recordUnderlay(30, 0, (uint64_t)now, 3U,
++                                   (uint32_t)boundAddrs.size(), (int32_t)peers);
++                }
++
++#ifdef _WIN32
++                // Address changes arm recovery; Preferred state is checked
++                // below on every I/O loop (DAD may finish without another
++                // Binder refresh or OS notification).
++#endif
++
++                // Older libzt exposes a narrower syncManagedStuff() than
++                // ZeroTierOne 1.12+, but re-running it here is the equivalent
++                // available hook for refreshing the virtual network state
++                // after physical bindings change.
++                {
++                    Mutex::Lock _l(_nets_m);
++                    for (std::map<uint64_t, NetworkState>::iterator n(_nets.begin()); n != _nets.end(); ++n) {
++                        if (n->second.tap)
++                            syncManagedStuff(n->second);
++                    }
++                }
+             }
+ 
++#ifdef _WIN32
++            // First prefer a real, newly bound global IPv6 address that has
++            // passed Windows DAD. A successful bind of a Tentative address
++            // is NOT proof the interface can transmit packets yet.
++            const bool handoverIpv6Pending = !_forceTcpRelay && handoverEpisodeStart
++                && !rootV6ProbedInEpisode && (now - handoverLastNotification <= 30000)
++                && !newlyBoundGlobalV6.empty() && lastGlobalV6Change
++                && (lastGlobalV6Change >= handoverEpisodeStart
++                    || handoverEpisodeStart - lastGlobalV6Change <= 5000);
++            if (handoverIpv6Pending && now >= nextDadCheck) {
++                nextDadCheck = now + 250;
++                InetAddress candidateIp;
++                uint64_t candidateLuid = 0;
++                int dadState = netloopPreferredIpv6DadState(
++                    newlyBoundGlobalV6, &candidateIp, &candidateLuid);
++                if (dadState == (int)IpDadStatePreferred
++                    && _binder.preferredIpv6Socket(candidateIp, candidateLuid) == -1)
++                    dadState = -10; // Preferred OS row but not bound on that LUID
++                if (dadState != lastDadState) {
++                    lastDadState = dadState;
++                    recordUnderlay(37, 0, (uint64_t)now, 8U,
++                                   (uint32_t)newlyBoundGlobalV6.size(), dadState,
++                                   reinterpret_cast<const struct sockaddr_storage*>(&newlyBoundGlobalV6.front()));
++                }
++                if (dadState == (int)IpDadStatePreferred) {
++                    rootV6ProbedInEpisode = true;
++                    rootV6RetryActive = true;
++                    rootV6RetryStartedAt = now;
++                    nextRootV6RetryAt = now;
++                    rootV6Attempt = 0;
++                }
++            }
++
++            // One immediate send, then up to two retries at +500ms and
++            // +1500ms. Core tracks each Root independently and suppresses
++            // retransmission after the exact authenticated OK(HELLO).
++            if (rootV6RetryActive && rootV6Attempt < 3
++                && now >= nextRootV6RetryAt) {
++                // A second physical change or a deprecated/tentative source
++                // must not cause further fast HELLOs on a superseded IPv6.
++                if (newlyBoundGlobalV6.empty()
++                    || now - rootV6RetryStartedAt >= 30000) {
++                    rootV6RetryActive = false;
++                } else {
++                    InetAddress preferredIp;
++                    uint64_t preferredLuid = 0;
++                    const int dadState = netloopPreferredIpv6DadState(
++                        newlyBoundGlobalV6, &preferredIp, &preferredLuid);
++                    const int64_t localSocket = dadState == (int)IpDadStatePreferred
++                        ? _binder.preferredIpv6Socket(preferredIp, preferredLuid) : -1;
++                    if (localSocket == -1) {
++                        // Keep the remaining attempts after transient DAD or
++                        // IP Helper failures, bounded by the episode deadline.
++                        nextRootV6RetryAt = now + 250;
++                    } else {
++                        unsigned int pendingRoots = 0;
++                        const unsigned int submitted = ZT_Node_fastProbeRootIpv6AfterNetworkChange(
++                            _node, (void*)0, now, lastHandoverEpoch, localSocket, &pendingRoots);
++                        recordUnderlay(36, 0, (uint64_t)now, 8U | ((rootV6Attempt + 1) << 8),
++                                       (uint32_t)newlyBoundGlobalV6.size(), (int32_t)submitted,
++                                       reinterpret_cast<const struct sockaddr_storage*>(&preferredIp));
++                        ++rootV6Attempt;
++                        nextRootV6RetryAt = now + (rootV6Attempt == 1 ? 500 : 1000);
++                        if (!pendingRoots || rootV6Attempt >= 3)
++                            rootV6RetryActive = false;
++                    }
++                }
++            }
++#endif
++
+             // Generate callback messages for user application
+             generateSyntheticEvents();
++            // Root-path snapshots are observations, not online policy or
++            // additional connectivity probes. Keep the offline cadence low.
++            if ((networkChanged || now - lastPlanetSnapshot >= 15000)
++                && (!_node->online() || networkChanged)) {
++                tracePlanetSnapshot();
++                lastPlanetSnapshot = now;
++            }
+ 
+             // Run background task processor in core if it's time to do so
+             int64_t dl = _nextBackgroundTaskDeadline;
+@@ -467,27 +992,6 @@ NodeService::ReasonForTermination NodeService::run()
+                 }
+             }
+ 
+-            // Sync information about physical network interfaces
+-            if ((now - lastLocalInterfaceAddressCheck) >= ZT_LOCAL_INTERFACE_CHECK_INTERVAL) {
+-                lastLocalInterfaceAddressCheck = now;
+-
+-                _node->clearLocalInterfaceAddresses();
+-
+-#ifdef ZT_USE_MINIUPNPC
+-                if (_portMapper) {
+-                    std::vector<InetAddress> mappedAddresses(_portMapper->get());
+-                    for (std::vector<InetAddress>::const_iterator ext(mappedAddresses.begin());
+-                         ext != mappedAddresses.end();
+-                         ++ext)
+-                        _node->addLocalInterfaceAddress(reinterpret_cast<const struct sockaddr_storage*>(&(*ext)));
+-                }
+-#endif
+-
+-                std::vector<InetAddress> boundAddrs(_binder.allBoundLocalInterfaceAddresses());
+-                for (std::vector<InetAddress>::const_iterator i(boundAddrs.begin()); i != boundAddrs.end(); ++i)
+-                    _node->addLocalInterfaceAddress(reinterpret_cast<const struct sockaddr_storage*>(&(*i)));
+-            }
+-
+             // Clean peers.d periodically
+             if ((now - lastCleanedPeersDb) >= 3600000) {
+                 lastCleanedPeersDb = now;
+@@ -496,7 +1000,13 @@ NodeService::ReasonForTermination NodeService::run()
+                     now - 2592000000LL);   // delete older than 30 days
+             }
+ 
+-            const unsigned long delay = (dl > now) ? (unsigned long)(dl - now) : 100;
++            unsigned long delay = (dl > now) ? (unsigned long)(dl - now) : 100;
++#ifdef _WIN32
++            // Wake locally to recheck DAD and bounded retry deadlines; this
++            // adds no periodic network traffic or global timer changes.
++            if (handoverIpv6Pending || rootV6RetryActive)
++                delay = std::min<unsigned long>(delay, 250UL);
++#endif
+             clockShouldBe = now + (uint64_t)delay;
+             _phy.poll(delay);
+         }
+@@ -566,6 +1076,28 @@ void NodeService::terminate()
+     _phy.whack();
+ }
+ 
++void NodeService::networkChanged(uint64_t handoverEpoch)
++{
++    {
++        Mutex::Lock _l(_run_m);
++        if (! _run) {
++            return;
++        }
++        _networkChangeRequested = true;
++        _networkChangeEpochRequested = handoverEpoch;
++        _nextBackgroundTaskDeadline = 0;
++    }
++    recordUnderlay(1, 0, handoverEpoch);
++    _phy.whack();
++}
++
++void NodeService::setUnderlayTraceEnabled(bool enabled)
++{
++    // Called once after native initialization and before node_start.
++    // The Core callback is installed only when this flag is enabled.
++    _underlayTraceEnabled.store(enabled, std::memory_order_release);
++}
++
+ void NodeService::syncManagedStuff(NetworkState& n)
+ {
+     char ipbuf[64] = { 0 };
+@@ -651,6 +1183,13 @@ void NodeService::phyOnDatagram(
+         data,
+         len,
+         &_nextBackgroundTaskDeadline);
++    InetAddress receiveBinding;
++    char receiveInterface[64] = { 0 };
++    const bool receiveKnown = _binder.describeUdpSocket(sock, receiveBinding, receiveInterface);
++    traceUnderlayWire(
++        6, reinterpret_cast<const struct sockaddr_storage*>(from), data,
++        static_cast<unsigned int>(len), static_cast<int32_t>(rc),
++        receiveKnown ? &receiveBinding : 0, receiveKnown ? receiveInterface : 0);
+     if (ZT_ResultCode_isFatal(rc)) {
+         char tmp[256] = { 0 };
+         OSUtils::ztsnprintf(tmp, sizeof(tmp), "fatal error code from processWirePacket: %d", (int)rc);
+@@ -942,6 +1481,9 @@ void NodeService::nodeEventCallback(enum ZT_Event event, const void* metaData)
+             break;
+     }
+     if (event_code) {
++        if (event == ZT_EVENT_ONLINE || event == ZT_EVENT_OFFLINE)
++            recordUnderlay(7, 0, _lastDirectReceiveFromGlobal,
++                           event == ZT_EVENT_ONLINE ? 1U : 0U, 0, event_code);
+         sendEventToUser(event_code, NULL);
+     }
+ }
+@@ -1054,11 +1596,30 @@ void NodeService::sendEventToUser(unsigned int zt_event_code, const void* obj, u
+         case ZTS_EVENT_PEER_UNREACHABLE:
+         case ZTS_EVENT_PEER_PATH_DISCOVERED:
+         case ZTS_EVENT_PEER_PATH_DEAD: {
+-            pr = new zts_peer_info_t();
++            // ZT_Peer and zts_peer_info_t are different ABI layouts. Copy
++            // individual fields rather than memcpy-ing the vendor structure:
++            // ZeroTierOne's bonding fields precede pathCount and its physical
++            // path structure is larger than the public libzt path structure.
++            pr = new zts_peer_info_t{};
+             ZT_Peer* peer = (ZT_Peer*)obj;
+-            memcpy(pr, peer, sizeof(zts_peer_info_t));
+-            for (unsigned int j = 0; j < peer->pathCount; j++) {
++            pr->peer_id = peer->address;
++            pr->ver_major = peer->versionMajor;
++            pr->ver_minor = peer->versionMinor;
++            pr->ver_rev = peer->versionRev;
++            pr->latency = peer->latency;
++            pr->role = static_cast<zts_peer_role_t>(peer->role);
++            pr->path_count = peer->pathCount < ZTS_MAX_PEER_NETWORK_PATHS
++                ? peer->pathCount : ZTS_MAX_PEER_NETWORK_PATHS;
++            for (unsigned int j = 0; j < pr->path_count; j++) {
+                 native_ss_to_zts_ss(&(pr->paths[j].address), &(peer->paths[j].address));
++                pr->paths[j].last_tx = peer->paths[j].lastSend;
++                pr->paths[j].last_rx = peer->paths[j].lastReceive;
++                pr->paths[j].trusted_path_id = peer->paths[j].trustedPathId;
++                pr->paths[j].latency = peer->paths[j].latencyMean;
++                pr->paths[j].expired = peer->paths[j].expired;
++                pr->paths[j].preferred = peer->paths[j].preferred;
++                // The source interface name belongs to the transient
++                // ZT_PeerList. Do not expose a dangling char* in this event.
+             }
+             objptr = (void*)pr;
+             break;
+@@ -1306,6 +1867,34 @@ int NodeService::getAddrAtIdx(uint64_t net_id, unsigned int idx, char* dst, unsi
+     return ZTS_ERR_OK;
+ }
+ 
++int NodeService::getAddrCidrAtIdx(uint64_t net_id, unsigned int idx, char* dst, unsigned int len)
++{
++    if (!dst || len < ZTS_IP_MAX_STR_LEN + 5)
++        return ZTS_ERR_ARG;
++    std::map<uint64_t, NetworkState>::const_iterator n(_nets.find(net_id));
++    if (n == _nets.end())
++        return ZTS_ERR_NO_RESULT;
++    if (idx >= n->second.config.assignedAddressCount)
++        return ZTS_ERR_ARG;
++    memset(dst, 0, len);
++    const int result = getAddrAtIdx(net_id, idx, dst, len);
++    if (result != ZTS_ERR_OK)
++        return result;
++    const struct sockaddr* sa = (const struct sockaddr*)&n->second.config.assignedAddresses[idx];
++    unsigned int prefix = 0;
++    if (sa->sa_family == AF_INET)
++        prefix = Utils::ntoh(((const struct sockaddr_in*)sa)->sin_port);
++    else if (sa->sa_family == AF_INET6)
++        prefix = Utils::ntoh(((const struct sockaddr_in6*)sa)->sin6_port);
++    else
++        return ZTS_ERR_ARG;
++    if (prefix > (sa->sa_family == AF_INET ? 32u : 128u))
++        return ZTS_ERR_ARG;
++    const size_t offset = strlen(dst);
++    snprintf(dst + offset, len - offset, "/%u", prefix);
++    return ZTS_ERR_OK;
++}
++
+ int NodeService::getRouteAtIdx(
+     uint64_t net_id,
+     unsigned int idx,
+@@ -1355,6 +1944,35 @@ int NodeService::getRouteAtIdx(
+     return ZTS_ERR_OK;
+ }
+ 
++int NodeService::getRouteCidrAtIdx(
++    uint64_t net_id, unsigned int idx, char* target, char* via,
++    unsigned int len, uint16_t* flags, uint16_t* metric)
++{
++    if (!target || !via || !flags || !metric || len < ZTS_IP_MAX_STR_LEN + 5)
++        return ZTS_ERR_ARG;
++    std::map<uint64_t, NetworkState>::const_iterator n(_nets.find(net_id));
++    if (n == _nets.end())
++        return ZTS_ERR_NO_RESULT;
++    if (idx >= n->second.config.routeCount)
++        return ZTS_ERR_ARG;
++    const int result = getRouteAtIdx(net_id, idx, target, via, len, flags, metric);
++    if (result != ZTS_ERR_OK)
++        return result;
++    const struct sockaddr* sa = (const struct sockaddr*)&n->second.config.routes[idx].target;
++    unsigned int prefix = 0;
++    if (sa->sa_family == AF_INET)
++        prefix = Utils::ntoh(((const struct sockaddr_in*)sa)->sin_port);
++    else if (sa->sa_family == AF_INET6)
++        prefix = Utils::ntoh(((const struct sockaddr_in6*)sa)->sin6_port);
++    else
++        return ZTS_ERR_ARG;
++    if (prefix > (sa->sa_family == AF_INET ? 32u : 128u))
++        return ZTS_ERR_ARG;
++    const size_t offset = strlen(target);
++    snprintf(target + offset, len - offset, "/%u", prefix);
++    return ZTS_ERR_OK;
++}
++
+ int NodeService::getMulticastSubAtIdx(uint64_t net_id, unsigned int idx, uint64_t* mac, uint32_t* adi)
+ {
+     std::map<uint64_t, NetworkState>::const_iterator n(_nets.find(net_id));
+@@ -1797,17 +2415,33 @@ int NodeService::nodeWirePacketSendFunction(
+     // working we can instantly "fail forward" to it and stop using TCP
+     // proxy fallback, which is slow.
+ 
++    int sent = -1;
+     if ((localSocket != -1) && (localSocket != 0) && (_binder.isUdpSocketValid((PhySocket*)((uintptr_t)localSocket)))) {
+         if ((ttl) && (addr->ss_family == AF_INET))
+             _phy.setIp4UdpTtl((PhySocket*)((uintptr_t)localSocket), ttl);
+         const bool r = _phy.udpSend((PhySocket*)((uintptr_t)localSocket), (const struct sockaddr*)addr, data, len);
+         if ((ttl) && (addr->ss_family == AF_INET))
+             _phy.setIp4UdpTtl((PhySocket*)((uintptr_t)localSocket), 255);
+-        return ((r) ? 0 : -1);
++        sent = r ? 0 : -1;
++        InetAddress sendBinding;
++        char sendInterface[64] = { 0 };
++        const bool known = _binder.describeUdpSocket(
++            (PhySocket*)((uintptr_t)localSocket), sendBinding, sendInterface);
++        traceUnderlayWire(5, addr, data, len, sent,
++                          known ? &sendBinding : 0, known ? sendInterface : 0);
++    }
++    else if ((localSocket != -1) && (localSocket != 0)) {
++        // A Core call that names a concrete local UDP socket must never
++        // silently fan out from unrelated interfaces after a Binder refresh.
++        // The caller can select a new socket on its next bounded retry.
++        sent = -1;
+     }
+     else {
+-        return ((_binder.udpSendAll(_phy, addr, data, len, ttl)) ? 0 : -1);
++        // Instrument each *actual* outgoing Binder socket independently;
++        // a broadcast may use different IPv4/IPv6 interfaces and ports.
++        sent = _binder.udpSendAll(_phy, addr, data, len, ttl, *this) ? 0 : -1;
+     }
++    return sent;
+ }
+ 
+ void NodeService::nodeVirtualNetworkFrameFunction(
+@@ -1843,6 +2477,7 @@ int NodeService::nodePathCheckFunction(
+                 std::vector<InetAddress> ips(n->second.tap->ips());
+                 for (std::vector<InetAddress>::const_iterator i(ips.begin()); i != ips.end(); ++i) {
+                     if (i->containsAddress(*(reinterpret_cast<const InetAddress*>(remoteAddr)))) {
++                        recordUnderlay(4, ztaddr, 0, 0, 0, 0, remoteAddr);
+                         return 0;
+                     }
+                 }
+@@ -1874,6 +2509,7 @@ int NodeService::nodePathCheckFunction(
+         if (l) {
+             for (std::vector<InetAddress>::const_iterator a(l->begin()); a != l->end(); ++a) {
+                 if (a->containsAddress(*reinterpret_cast<const InetAddress*>(remoteAddr))) {
++                    recordUnderlay(4, ztaddr, 0, 0, 0, 0, remoteAddr);
+                     return 0;
+                 }
+             }
+@@ -1882,10 +2518,12 @@ int NodeService::nodePathCheckFunction(
+     if (gbl) {
+         for (std::vector<InetAddress>::const_iterator a(gbl->begin()); a != gbl->end(); ++a) {
+             if (a->containsAddress(*reinterpret_cast<const InetAddress*>(remoteAddr))) {
++                recordUnderlay(4, ztaddr, 0, 0, 0, 0, remoteAddr);
+                 return 0;
+             }
+         }
+     }
++    recordUnderlay(4, ztaddr, 0, 0, 0, 1, remoteAddr);
+     return 1;
+ }
+ 
+diff --git a/src/NodeService.hpp b/src/NodeService.hpp
+index c600bbc..2c76d2f 100644
+--- a/src/NodeService.hpp
++++ b/src/NodeService.hpp
+@@ -31,6 +31,9 @@
+ #include "version.h"
+ 
+ #include <string>
++#include <atomic>
++#include <deque>
++#include <map>
+ #include <vector>
+ 
+ #define ZTS_SERVICE_THREAD_NAME        "ZTServiceThread"
+@@ -193,8 +196,21 @@ class NodeService {
+      * build.
+      */
+     unsigned int _ports[3] = { 0 };
++    // Atomic snapshot: primary high 16 bits, secondary low 16 bits.
++    // Never read the mutable _ports from the managed callback thread.
++    std::atomic<unsigned int> _boundUdpPortSnapshot{ 0 };
+     Binder _binder;
+ 
++    // Bounded native trace queue; no managed logging on native I/O callbacks.
++    Mutex _underlayTrace_m;
++    std::atomic<bool> _underlayTraceEnabled{ false };
++    std::deque<zts_netloop_underlay_event_t> _underlayTrace;
++    uint64_t _underlayTraceDropped = 0;
++    std::map<uint64_t, std::pair<int64_t, std::string> > _underlayWireSamples;
++    // Switch::_trySend runs for every overlay frame. Only queue a new
++    // decision when routing changes or every five seconds per destination.
++    std::map<uint64_t, std::pair<int64_t, std::string> > _underlayRouteSamples;
++
+     // Time we last received a packet from a global address
+     uint64_t _lastDirectReceiveFromGlobal;
+ 
+@@ -210,6 +226,7 @@ class NodeService {
+ 
+     // Last potential sleep/wake event
+     uint64_t _lastRestart;
++    bool _networkChangeRequested;
+ 
+     // Deadline for the next background task service function
+     volatile int64_t _nextBackgroundTaskDeadline;
+@@ -291,6 +308,11 @@ class NodeService {
+     /** Stop the node and service */
+     void terminate();
+ 
++    /** Notify the service that the host physical network changed. */
++    void networkChanged(uint64_t handoverEpoch);
++    uint64_t _networkChangeEpochRequested = 0;
++    void setUnderlayTraceEnabled(bool enabled);
++
+     /** Apply or update managed IPs for a configured network */
+     void syncManagedStuff(NetworkState& n);
+ 
+@@ -312,6 +334,23 @@ class NodeService {
+ 
+     void nodeEventCallback(enum ZT_Event event, const void* metaData);
+ 
++    void nodeNetLoopCoreTrace(
++        unsigned int kind, uint64_t peerId, uint64_t reference,
++        unsigned int flags, int result, const struct sockaddr_storage* endpoint);
++
++    void recordUnderlay(
++        uint32_t kind, uint64_t peerId = 0, uint64_t reference = 0,
++        uint32_t flags = 0, uint32_t byteCount = 0, int32_t result = 0,
++        const struct sockaddr_storage* endpoint = 0,
++        uint16_t previousSecondary = 0, const InetAddress* localEndpoint = 0,
++        const char* interfaceName = 0);
++    void traceUnderlayWire(
++        uint32_t kind, const struct sockaddr_storage* endpoint,
++        const void* data, unsigned int len, int32_t result,
++        const InetAddress* localEndpoint = 0, const char* interfaceName = 0);
++    void tracePlanetSnapshot();
++    int pollUnderlayEvent(zts_netloop_underlay_event_t* event, uint64_t* droppedTotal);
++
+     zts_net_info_t* prepare_network_details_msg(const NetworkState& n);
+ 
+     void generateSyntheticEvents();
+@@ -346,6 +385,7 @@ class NodeService {
+     int pathCount(uint64_t peer_id) const;
+ 
+     int getAddrAtIdx(uint64_t net_id, unsigned int idx, char* dst, unsigned int len);
++    int getAddrCidrAtIdx(uint64_t net_id, unsigned int idx, char* dst, unsigned int len);
+ 
+     int getRouteAtIdx(
+         uint64_t net_id,
+@@ -355,6 +395,9 @@ class NodeService {
+         unsigned int len,
+         uint16_t* flags,
+         uint16_t* metric);
++    int getRouteCidrAtIdx(
++        uint64_t net_id, unsigned int idx, char* target, char* via,
++        unsigned int len, uint16_t* flags, uint16_t* metric);
+ 
+     int getMulticastSubAtIdx(uint64_t net_id, unsigned int idx, uint64_t* mac, uint32_t* adi);
+ 
+@@ -433,6 +476,8 @@ class NodeService {
+     /** Get the primary port */
+     unsigned short getPrimaryPort() const;
+ 
++    /** Get actually bound physical UDP ports, not configured port values. */
++
+     /** Allow or disallow port-mapping */
+     int allowPortMapping(unsigned int allowed);
+ 

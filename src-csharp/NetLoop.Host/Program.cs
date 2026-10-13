@@ -91,7 +91,8 @@ internal static class Program
         CancellationToken shutdownToken)
     {
         await using var node = new LibztNode(
-            options.NetworkId, options.StateDirectory, options.StartupTimeout);
+            options.NetworkId, options.StateDirectory, options.StartupTimeout,
+            enableNativeTrace: options.NativeTraceEnabled);
         await using var owner = new RuntimeOwner(node, options);
 
         owner.StatusChanged += status => {
