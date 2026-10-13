@@ -109,14 +109,9 @@ jobs:
         id: native-key
         shell: pwsh
         run: |
-          $libzt = (git ls-tree HEAD external/libzt).Split()[2]
-          $cmake = git hash-object CMakeLists.txt
-          $script = git hash-object tools/build_csharp.py
-          $patch = git hash-object patches/libzt/0001-host-network-change-refresh.patch
-          $peerEventPatch = git hash-object patches/libzt/0003-peer-event-details.patch
-          $cidrPatch = git hash-object patches/libzt/0004-network-cidr-queries.patch
-          $portsPatch = git hash-object patches/libzt/0005-underlay-port-diagnostics.patch
-          "key=libzt-pinvoke-win-x64-$libzt-$cmake-$script-$patch-$peerEventPatch-$cidrPatch-$portsPatch" >> $env:GITHUB_OUTPUT
+          $fingerprint = python tools/native_cache_key.py --platform windows --arch x64
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to hash native cache inputs' }
+          "key=libzt-pinvoke-win-x64-$fingerprint" >> $env:GITHUB_OUTPUT
 
       - name: Restore compiled libzt bundle
         id: native-cache
@@ -288,16 +283,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          libzt="$(git ls-tree HEAD external/libzt | awk '{print $3}')"
-          cmake="$(git hash-object CMakeLists.txt)"
-          script="$(git hash-object tools/build_android_native.py)"
-          patch1="$(git hash-object patches/libzt/0001-host-network-change-refresh.patch)"
-          patch2="$(git hash-object patches/libzt/0002-android-pinvoke.patch)"
-          patch3="$(git hash-object patches/libzt/0003-peer-event-details.patch)"
-          patch4="$(git hash-object patches/libzt/0004-network-cidr-queries.patch)"
-          patch5="$(git hash-object patches/libzt/0005-underlay-port-diagnostics.patch)"
           ndk_revision="$(awk -F= '/Pkg.Revision/ {gsub(/ /, "", $2); print $2}' "$ANDROID_NDK_HOME/source.properties")"
-          echo "key=libzt-pinvoke-android-arm64-${ndk_revision}-${libzt}-${cmake}-${script}-${patch1}-${patch2}-${patch3}-${patch4}-${patch5}" >> "$GITHUB_OUTPUT"
+          fingerprint="$(python tools/native_cache_key.py --platform android --arch arm64-v8a --ndk-revision "$ndk_revision")"
+          echo "key=libzt-pinvoke-android-arm64-${fingerprint}" >> "$GITHUB_OUTPUT"
 
       - name: Restore compiled Android libzt bundle
         id: native-cache

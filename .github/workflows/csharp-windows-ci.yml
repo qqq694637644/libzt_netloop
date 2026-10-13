@@ -47,30 +47,7 @@ jobs:
         id: native-key
         shell: pwsh
         run: |
-          $libzt = (git ls-tree HEAD external/libzt).Split()[2]
-          $cmake = git hash-object CMakeLists.txt
-          $script = git hash-object tools/build_csharp.py
-          $networkRefreshPatch = git hash-object patches/libzt/0001-host-network-change-refresh.patch
-          $peerEventPatch = git hash-object patches/libzt/0003-peer-event-details.patch
-          $cidrPatch = git hash-object patches/libzt/0004-network-cidr-queries.patch
-          $portsPatch = git hash-object patches/libzt/0005-underlay-port-diagnostics.patch
-          $nativeTracePatch = git hash-object patches/libzt/0006-native-underlay-trace.patch
-          $socketTracePatch = git hash-object patches/libzt/0007-core-underlay-socket-trace.patch
-          $coreTracePatch = git hash-object patches/zerotierone/0001-netloop-core-path-trace.patch
-          $recoveryPatch = git hash-object patches/libzt/0008-recovery-decision-trace.patch
-          $coreRecoveryPatch = git hash-object patches/zerotierone/0002-netloop-recovery-decision-trace.patch
-          $handoverPatch = git hash-object patches/libzt/0009-handover-peer-revalidation.patch
-          $coreHandoverPatch = git hash-object patches/zerotierone/0003-netloop-handover-peer-revalidation.patch
-          $whoisTracePatch = git hash-object patches/libzt/0010-handover-whois-decision-trace.patch
-          $coreWhoisTracePatch = git hash-object patches/zerotierone/0004-handover-whois-decision-trace.patch
-          $rootProbeTracePatch = git hash-object patches/libzt/0011-handover-root-probe-decision-trace.patch
-          $coreRootProbeTracePatch = git hash-object patches/zerotierone/0005-handover-root-probe-decision-trace.patch
-          $fastRootHelloPatch = git hash-object patches/libzt/0012-handover-fast-root-ipv6-hello.patch
-          $coreFastRootHelloPatch = git hash-object patches/zerotierone/0006-handover-fast-root-ipv6-hello.patch
-          $rootPreferredRetryPatch = git hash-object patches/libzt/0013-handover-preferred-ipv6-root-retry.patch
-          $coreAckRetryPatch = git hash-object patches/zerotierone/0007-handover-root-ipv6-hello-ack-retry.patch
-          $allInputs = @($libzt, $cmake, $script, $networkRefreshPatch, $peerEventPatch, $cidrPatch, $portsPatch, $nativeTracePatch, $socketTracePatch, $coreTracePatch, $recoveryPatch, $coreRecoveryPatch, $handoverPatch, $coreHandoverPatch, $whoisTracePatch, $coreWhoisTracePatch, $rootProbeTracePatch, $coreRootProbeTracePatch, $fastRootHelloPatch, $coreFastRootHelloPatch, $rootPreferredRetryPatch, $coreAckRetryPatch) -join ':'
-          $fingerprint = $allInputs | git hash-object --stdin
+          $fingerprint = python tools/native_cache_key.py --platform windows --arch x64
           if ($LASTEXITCODE -ne 0) { throw 'Failed to hash native cache inputs' }
           "key=libzt-pinvoke-win-x64-$fingerprint" >> $env:GITHUB_OUTPUT
 
@@ -82,7 +59,6 @@ jobs:
           key: ${{ steps.native-key.outputs.key }}
 
       - name: Set up MSVC environment
-        if: steps.native-cache.outputs.cache-hit != 'true'
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
@@ -114,6 +90,18 @@ jobs:
 
       - name: Validate native underlay trace ABI (no Node start)
         run: python ci/test_native_underlay_trace.py native-cache/libzt.dll
+
+      - name: Test native stale-socket fallback, DAD and Root ACK policy
+        shell: pwsh
+        run: |
+          # A cached DLL need not have initialized source submodules.
+          # Replaying the pinned Core patch makes the test use production policy.
+          python -c "import sys; sys.path.insert(0, 'tools'); import build_csharp as b; b.ensure_submodules(); b.apply_zerotierone_patches()"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cl.exe /nologo /std:c++17 /EHsc /W4 /Fe:native-handover-policy.exe ci/test_native_handover_policy.cpp
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\native-handover-policy.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Save compiled libzt bundle immediately
         if: steps.native-cache.outputs.cache-hit != 'true'

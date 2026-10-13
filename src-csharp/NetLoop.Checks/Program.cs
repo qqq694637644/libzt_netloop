@@ -31,7 +31,6 @@ internal static class Program
             Check("UDP response peer set is bounded and expires entries", UdpResponsePeers);
             Check("TCP capacity occupancy classified by phase and source", TcpSessionPhases);
             await CheckAsync("TCP permit shutdown and concurrent exits reconcile", TcpSessionPermitShutdown);
-            Check("Underlay port and Peer path timeline uses observed events", UnderlayTimeline);
             Check("Native underlay trace ABI and event kinds are fixed", NativeUnderlayTraceAbi);
             Check("SOCKS5 UDP datagram logical source", UdpPacketRoundTrip);
             Check("Shared UDP byte budget", UdpBudget);
@@ -40,6 +39,10 @@ internal static class Program
             await CheckAsync("UDP Factory concurrent disposal", UdpFactoryDisposal);
             await CheckAsync("Startup processes physical events while Node waits", StartupPhysicalRefresh);
             Check("Rapid physical events retain the final network notification", RapidPhysicalEventDelivery);
+            Check("Physical egress defines epochs across rapid switches and startup retries", HandoverEpochSequence);
+            await CheckAsync("Physical event entry preserves two exits inside 250ms", ImmediatePhysicalCapture);
+            await CheckAsync("Failed egress capture recovers without a second OS callback", PhysicalCaptureRecovery);
+            Check("Separate IPv4 and IPv6 default interfaces distinguish egress", IndependentPhysicalRoutes);
             await CheckAsync("Peer dialing is bounded across simultaneous SOCKS requests", PeerDialAdmission);
             await CheckAsync("Peer dialing releases canceled waiters and isolates different peers", PeerDialCancellation);
             await CheckAsync("Peer failure backoff does not hold established TCP", PeerDialCooldown);
@@ -51,6 +54,7 @@ internal static class Program
             await CheckAsync("UDP cleanup errors never leak association capacity", UdpFaultyCleanup);
             await CheckAsync("Overlay UDP returns queued bytes after failed Dispose", OverlayFaultyCleanup);
             Check("Removed --status-file CLI is rejected", RemovedStatusOption);
+            Check("Removed --reset-debounce-ms CLI is rejected", RemovedResetDebounceOption);
             Check("CLI log level defaults and invalid values are validated", LogLevelOption);
             await CheckAsync("JSONL none and error levels suppress unwanted output", JsonLogLevels);
             await CheckAsync("JSONL consumer survives an output failure", JsonLogConsumerSurvives);
@@ -360,52 +364,6 @@ internal static class Program
         Require(usage.Total == 0 && usage.Sources.Count == 0
                 && capacity.CurrentCount == maxConnections,
             "Concurrent exits leaked or over-released TCP slots or left stale session metrics");
-    }
-
-    private static void UnderlayTimeline()
-    {
-        long now = 1_000;
-        var observations = new LibztUnderlayDiagnostics(() => now);
-        var firstPorts = observations.ObservePorts(9993, 34000);
-        Require(firstPorts is { PreviousSecondary: null },
-            "Initial native port snapshot was not accepted");
-        Require(observations.ObservePorts(9993, 34000) is null,
-            "Unchanged ports should not produce a new log record");
-        observations.RecordPhysicalRefresh();
-        now += 250;
-        var changed = observations.ObservePorts(9993, 34100);
-        Require(changed is {
-            PreviousSecondary: 34000,
-            Secondary: 34100,
-            SinceRefreshMs: 250
-        }, "Observed native secondary port rotation was not recorded");
-
-        observations.ObservePeer(LibztNative.EventPeerRelay, 0x12345);
-        now += 91_000;
-        var peer = observations.ObservePeer(
-            LibztNative.EventPeerDirect, 0x12345);
-        Require(peer is { ElapsedMs: 91_000, Previous: "RELAY" },
-            "Native RELAY to DIRECT observation was not timed");
-        Require(observations.ObservePeer(
-            LibztNative.EventPeerDirect, 0x12345) is null,
-            "Repeated DIRECT is not another recovery");
-
-        observations.ObserveNode(LibztNative.EventNodeOnline);
-        now += 156_000;
-        var offline = observations.ObserveNode(
-            LibztNative.EventNodeOffline);
-        Require(offline is { LastPhaseDurationMs: 156_000 },
-            "NODE_OFFLINE did not capture prior online duration");
-        now += 70_000;
-        var online = observations.ObserveNode(
-            LibztNative.EventNodeOnline);
-        Require(online is { LastPhaseDurationMs: 70_000 },
-            "NODE_ONLINE did not capture offline interval");
-        now += 156_000;
-        offline = observations.ObserveNode(
-            LibztNative.EventNodeOffline);
-        Require(offline is { TimeSincePreviousOfflineMs: 226_000 },
-            "226-second NODE_OFFLINE cycle cannot be measured");
     }
 
     private static async Task PeerDialAdmission()
@@ -719,6 +677,213 @@ internal static class Program
             "Startup should coalesce rapid notifications without losing the refresh");
     }
 
+    private static void HandoverEpochSequence()
+    {
+        var wifi = Egress("nic-wifi", "192.168.1.10", "192.168.1.1", "20010DB800000001");
+        var hotspot = Egress("nic-mobile", "192.168.43.10", "192.168.43.1", "20010DB800000002");
+        var sameAdapterNewRoute = Egress("nic-wifi", "10.0.0.27", "10.0.0.1", "20010DB800000003");
+
+        var episodes = new PhysicalHandoverEpisode();
+        episodes.Seed(wifi);
+        Require(!episodes.Observe(wifi) && episodes.Epoch == 0,
+            "Repeated same-outlet address notification reset an established runtime");
+        Require(!episodes.Observe(PhysicalEgressIdentity.CaptureFailed)
+                && episodes.Epoch == 0,
+            "Transient IP Helper failure must not invent a network disconnect");
+        Require(episodes.Observe(null, reportedUnavailable: true) && episodes.Epoch == 1,
+            "Physical disconnect must start a destructive handover");
+        Require(!episodes.Observe(null, reportedUnavailable: true) && episodes.Epoch == 1,
+            "Duplicate disconnect notifications must share an epoch");
+        Require(!episodes.Observe(hotspot) && episodes.Epoch == 1,
+            "Reconnect after the disconnect belongs to its existing epoch");
+        Require(!episodes.Observe(hotspot) && episodes.Epoch == 1,
+            "Duplicate hotspot callbacks must not reset twice");
+        Require(episodes.Observe(wifi) && episodes.Epoch == 2,
+            "Hotspot-to-Wi-Fi switch in under six seconds must get a NEW epoch");
+        Require(episodes.Observe(sameAdapterNewRoute) && episodes.Epoch == 3,
+            "Same Wi-Fi adapter with a new gateway/source is a different exit");
+        var bssidA = Egress("nic-wifi", "192.168.1.10", "192.168.1.1",
+            "20010DB800000001", "02:11:22:33:44:55");
+        var bssidB = Egress("nic-wifi", "192.168.1.10", "192.168.1.1",
+            "20010DB800000001", "02:11:22:33:44:66");
+        var accessPoints = new PhysicalHandoverEpisode();
+        accessPoints.Seed(bssidA);
+        Require(accessPoints.Observe(bssidB) && accessPoints.Epoch == 1,
+            "Different Wi-Fi BSSIDs with identical DHCP settings are separate exits");
+        Require(!accessPoints.Observe(bssidB) && accessPoints.Epoch == 1,
+            "Repeated callback from same BSSID must not reset");
+
+        var delayedV6 = new PhysicalHandoverEpisode();
+        delayedV6.Seed(Egress("nic-wifi", "10.0.0.27", "10.0.0.1", ""));
+        Require(!delayedV6.Observe(sameAdapterNewRoute) && delayedV6.Epoch == 0,
+            "IPv6 DAD becoming available cannot split one physical handover");
+        Require(delayedV6.Observe(Egress("nic-wifi", "10.0.0.27", "10.0.0.1",
+                "20010DB800000099")) && delayedV6.Epoch == 1,
+            "Real IPv6 prefix change must identify a new physical exit");
+        var unknownSeed = new PhysicalHandoverEpisode();
+        unknownSeed.Seed(PhysicalEgressIdentity.CaptureFailed);
+        Require(unknownSeed.Observe(wifi) && unknownSeed.Epoch == 1,
+            "An unavailable initial snapshot must not poison the first valid egress");
+
+        // Model Runtime creation: multiple events are consumed while the
+        // Node is unavailable; a pending Native refresh retains its epoch
+        // even when the physical network changes again before Runtime Ready.
+        var waiting = new PhysicalHandoverEpisode();
+        waiting.Seed(wifi);
+        var events = Channel.CreateUnbounded<RuntimeOwner.Event>();
+        bool pending = false;
+        RuntimeOwner.Event? deferred = null;
+        bool nativeReady = false;
+        var delivered = new List<ulong>();
+        bool Notify()
+        {
+            delivered.Add(waiting.Epoch);
+            return nativeReady;
+        }
+
+        RuntimeOwner.QueuePhysicalNetworkRefresh(events.Writer, "network_unavailable");
+        RuntimeOwner.QueuePhysicalNetworkRefresh(events.Writer, "network_available", hotspot);
+        RuntimeOwner.DrainPendingWaitingEvents(
+            events.Reader, Notify, ref pending, ref deferred,
+            notification => waiting.Observe(
+                notification.Egress, notification.Reason == "network_unavailable"));
+        Require(pending && waiting.Epoch == 1
+                && delivered.SequenceEqual(new ulong[] { 1 }),
+            "Combined waiting notifications must share epoch 1");
+
+        nativeReady = true;
+        Require(RuntimeOwner.TryDeliverPendingPhysicalRefresh(
+                    ref pending, Notify)
+                && !pending && delivered[^1] == 1,
+            "Native startup retry must deliver the same epoch");
+
+        RuntimeOwner.QueuePhysicalNetworkRefresh(events.Writer, "network_address_changed", hotspot);
+        RuntimeOwner.DrainPendingWaitingEvents(
+            events.Reader, Notify, ref pending, ref deferred,
+            notification => waiting.Observe(notification.Egress));
+        Require(!pending && waiting.Epoch == 1 && delivered[^1] == 1,
+            "Binder refresh after startup must keep the original epoch");
+
+        RuntimeOwner.QueuePhysicalNetworkRefresh(events.Writer, "network_address_changed", wifi);
+        RuntimeOwner.DrainPendingWaitingEvents(
+            events.Reader, Notify, ref pending, ref deferred,
+            notification => waiting.Observe(notification.Egress));
+        Require(!pending && waiting.Epoch == 2 && delivered[^1] == 2,
+            "A later physical handover must allocate and deliver epoch 2");
+    }
+
+    private static PhysicalEgressIdentity Egress(
+        string nic, string ipv4, string gateway, string prefix, string bssid = "")
+        => new(new PhysicalRouteIdentity(nic, ipv4, gateway, "", bssid),
+            new PhysicalRouteIdentity(nic, "", "", prefix, bssid));
+
+    private static async Task ImmediatePhysicalCapture()
+    {
+        var wifi = Egress("wifi", "10.0.0.2", "10.0.0.1", "20010DB800000001");
+        var hotspot = Egress("hotspot", "172.20.10.2", "172.20.10.1", "20010DB800000002");
+        var captured = new Queue<PhysicalEgressIdentity?>([hotspot, wifi]);
+        var observed = new List<(string Reason, PhysicalEgressIdentity? Route)>();
+        await using var monitor = new RuntimeResetMonitor(null,
+            (reason, route) => observed.Add((reason, route)),
+            () => captured.Dequeue());
+
+        // Exactly the production callback path, invoked back-to-back with no
+        // clock sleep; the old 250ms cancellation would drop the first exit.
+        monitor.NotifyPhysicalNetworkChange("network_address_changed");
+        monitor.NotifyPhysicalNetworkChange("network_address_changed");
+        Require(observed.Count == 2
+                && ReferenceEquals(observed[0].Route, hotspot)
+                && ReferenceEquals(observed[1].Route, wifi),
+            "Two distinct physical exits before 250ms must both reach the owner");
+        var episode = new PhysicalHandoverEpisode();
+        episode.Seed(wifi);
+        Require(episode.Observe(observed[0].Route) && episode.Epoch == 1,
+            "First fast switch was swallowed before epoch allocation");
+        Require(episode.Observe(observed[1].Route) && episode.Epoch == 2,
+            "Fast return switch was merged into the first episode");
+
+        // Concurrent arrivals are serialized and never dispose a CTS still
+        // being read by another callback.
+        var all = new ConcurrentQueue<string>();
+        await using var parallel = new RuntimeResetMonitor(null,
+            (reason, _) => all.Enqueue(reason), () => wifi);
+        await Task.WhenAll(Enumerable.Range(0, 64)
+            .Select(_ => Task.Run(() =>
+                parallel.NotifyPhysicalNetworkChange("network_address_changed"))));
+        Require(all.Count == 64,
+            "Concurrent network callbacks must be delivered without CTS disposal races");
+    }
+
+    private static async Task PhysicalCaptureRecovery()
+    {
+        var wifi = Egress("wifi", "10.0.0.2", "10.0.0.1", "20010DB800000001");
+        var hotspot = Egress("hotspot", "172.20.10.2", "172.20.10.1", "20010DB800000002");
+        var captures = new Queue<PhysicalEgressIdentity?>(
+            [PhysicalEgressIdentity.CaptureFailed, PhysicalEgressIdentity.CaptureFailed, hotspot]);
+        var gates = Channel.CreateUnbounded<TaskCompletionSource>();
+        var events = new ConcurrentQueue<(string Reason, PhysicalEgressIdentity? Route)>();
+        long now = 0;
+        Task Pause(TimeSpan _, CancellationToken token)
+        {
+            var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            gates.Writer.TryWrite(tcs);
+            return tcs.Task.WaitAsync(token);
+        }
+
+        await using var monitor = new RuntimeResetMonitor(null,
+            (reason, route) => events.Enqueue((reason, route)),
+            () => captures.Dequeue(), Pause, () => now);
+
+        monitor.NotifyPhysicalNetworkChange("network_address_changed");
+        Require(events.Count == 1 && events.TryPeek(out var first)
+                && first.Route?.IsCaptureFailed == true,
+            "Transient capture failure must still deliver the native refresh notification");
+
+        now = 200;
+        (await gates.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2)))
+            .TrySetResult();
+        now = 400;
+        (await gates.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2)))
+            .TrySetResult();
+
+        var until = Environment.TickCount64 + 2_000;
+        while (events.Count < 2 && Environment.TickCount64 < until)
+            await Task.Delay(5);
+        Require(events.Count == 2 && events.Last().Reason == "network_address_rechecked"
+                && ReferenceEquals(events.Last().Route, hotspot),
+            "Successful bounded recapture must reissue the event without any new OS notification");
+
+        var epoch = new PhysicalHandoverEpisode();
+        epoch.Seed(wifi);
+        foreach (var evt in events)
+            epoch.Observe(evt.Route);
+        Require(epoch.Epoch == 1,
+            "A later valid recapture must reveal and recover the actual physical change");
+    }
+
+    private static void IndependentPhysicalRoutes()
+    {
+        var ethernet = new PhysicalInterfaceCandidate("ethernet", 4, 44,
+            "192.168.50.10", "192.168.50.1", "", "");
+        var wifi = new PhysicalInterfaceCandidate("wifi", 8, 88,
+            "10.0.0.2", "10.0.0.1", "20010DB800000001", "02:11:22:33:44:55");
+        var hotspot = new PhysicalInterfaceCandidate("hotspot", 9, 99,
+            "172.20.10.2", "172.20.10.1", "20010DB800000002", "02:11:22:33:44:66");
+        var initial = PhysicalEgressIdentity.SelectEffectiveRoutes([ethernet, wifi], 4, 88)!;
+        var switched = PhysicalEgressIdentity.SelectEffectiveRoutes([ethernet, hotspot], 4, 99)!;
+        Require(initial.IPv4?.InterfaceId == "ethernet"
+                && initial.IPv6?.InterfaceId == "wifi",
+            "IPv4 and IPv6 must use independent Windows best-route indices");
+        Require(initial.IPv4 == switched.IPv4 && initial.IPv6 != switched.IPv6
+                && initial.DiffersFrom(switched),
+            "IPv6 hotspot switch must be visible even if Ethernet IPv4 never changes");
+        var delayedPrefix = initial with {
+            IPv6 = initial.IPv6! with { Prefix = "" }
+        };
+        Require(!initial.DiffersFrom(delayedPrefix),
+            "IPv6 DAD temporarily lacking a prefix must not create a fake new exit");
+    }
+
     private static async Task StartupPhysicalRefresh()
     {
         var notifications = Channel.CreateUnbounded<RuntimeOwner.Event>();
@@ -1000,6 +1165,18 @@ internal static class Program
             "Removed --status-file is still advertised in --help");
     }
 
+    private static void RemovedResetDebounceOption()
+    {
+        Throws<ArgumentException>(() => HostOptions.Parse([
+            "--network", "123456789abcdef0",
+            "--state-dir", "state",
+            "--default-exit", "10.70.0.2",
+            "--reset-debounce-ms", "250"
+        ]));
+        Require(!HostOptions.Usage.Contains("--reset-debounce-ms", StringComparison.Ordinal),
+            "Removed Windows debounce CLI is still advertised");
+    }
+
     private static void LogLevelOption()
     {
         string[] common = [
@@ -1009,6 +1186,16 @@ internal static class Program
         ];
         Require(HostOptions.Parse(common).LogLevel == JsonLogLevel.Info,
             "Default log level must preserve existing JSONL behavior");
+        Require(!HostOptions.Parse(common).NativeTraceEnabled,
+            "Native traces must be disabled by default");
+        Require(HostOptions.Parse([..common, "--native-trace"]).NativeTraceEnabled,
+            "Explicit --native-trace must enable native diagnostics");
+        Throws<ArgumentException>(() => HostOptions.Parse([
+            ..common, "--log-level", "none", "--native-trace"
+        ]));
+        Throws<ArgumentException>(() => HostOptions.Parse([
+            ..common, "--log-level", "error", "--native-trace"
+        ]));
         foreach (var (name, level) in new[] {
             ("none", JsonLogLevel.None),
             ("error", JsonLogLevel.Error),

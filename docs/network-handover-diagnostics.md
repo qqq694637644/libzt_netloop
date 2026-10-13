@@ -47,15 +47,14 @@ A 可通过 Controller 直连 C 的 SOCKS5 Agent。以下只解释新的诊断�
 - **物理路径刷新失败**：Node Ready 期间
   `zts_node_network_changed` 返回失败，会在原本的单一
   `RuntimeOwner` 中保留并每 500ms 重试，直到成功接受；
-  **不会因为物理网络变化本身重建 Node/Runtime**。
-- **ZeroTier 原生层的只读日志**：新增匹配本仓库固定 native ABI 的
-  `0005-underlay-port-diagnostics.patch`。它从实际 Binder 地址集合
-  采样主/副 UDP 端口，不把 `_secondaryPort=0` 当成真实端口。
-  `libzt_udp_bound_ports_changed` 包含前后端口及自上次刷新以来
-  的采样间隔；`libzt_peer_recovery_observed` 记录由
-  `PEER_RELAY` 或 `PEER_UNREACHABLE` 转到 `PEER_DIRECT` 的事件
-  观察间隔；`libzt_node_cycle_observed` 记录 NODE_ONLINE/OFFLINE
-  的前一阶段持续时间与连续 OFFLINE 事件间隔。
+  **不重启 libzt Node**；Windows PR #5+ 的确认切网属于破坏式
+  业务 Runtime episode，一轮最多重建一次。
+- **Native 取证日志（显式启用）**：PR #7 已删除过时的托管
+  `libzt_udp_bound_ports_changed`、`libzt_peer_recovery_observed`
+  和 `libzt_node_cycle_observed` 统计器。需要分析 Binder 端口、
+  Peer 路径及 NODE_ONLINE/OFFLINE 时，启用
+  `--native-trace --log-level info` 并使用
+  `libzt_native_underlay_trace` 事件中的实际 Native 时间戳。
 
 这些 native 事件不是外部 SOCKS 成功凭证：Peer 可能被判 DIRECT 却仍
 无法访问 C:3389；端口日志是采样时刻（周期 Controller 查询通常 30 秒），

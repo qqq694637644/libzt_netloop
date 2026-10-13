@@ -13,14 +13,8 @@ from build_csharp import ZERO_TIER_ONE_PATCHES, apply_zerotierone_patches
 
 ROOT = Path(__file__).resolve().parents[1]
 PATCHES = [
-    ROOT / "patches" / "libzt" / "0001-host-network-change-refresh.patch",
+    ROOT / "patches" / "libzt" / "0001-netloop-native.patch",
     ROOT / "patches" / "libzt" / "0002-android-pinvoke.patch",
-    ROOT / "patches" / "libzt" / "0003-peer-event-details.patch",
-    ROOT / "patches" / "libzt" / "0004-network-cidr-queries.patch",
-    ROOT / "patches" / "libzt" / "0005-underlay-port-diagnostics.patch",
-    ROOT / "patches" / "libzt" / "0006-native-underlay-trace.patch",
-    ROOT / "patches" / "libzt" / "0007-core-underlay-socket-trace.patch",
-    ROOT / "patches" / "libzt" / "0008-recovery-decision-trace.patch",
 ]
 
 

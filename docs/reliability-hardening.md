@@ -94,9 +94,10 @@ Windows/Linux CLI 可选择：
 
 ## 原生构建缓存保护
 
-Windows/Linux/Android 的 native cache key 新增了
-`0004-network-cidr-queries.patch`、`0005-underlay-port-diagnostics.patch`
-内容哈希。后者是只读 Binder 端口快照 ABI，不能与旧 native 包混用。
+Windows/Linux/Android 的 Native cache key 由
+`tools/native_cache_key.py` 自动根据平台、固定 libzt gitlink、
+CMake/构建脚本和**实际应用的 libzt/ZeroTierOne 补丁内容**
+计算，不再在三个 workflow 中手工维护补丁清单。
 Windows/Linux managed 打包之前，验证 native library
 manifest 对应的 libzt submodule SHA、CMake、build script、
 全部 native 补丁哈希与当前 checkout 相同；缺失或不一致则

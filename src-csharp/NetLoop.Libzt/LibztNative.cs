@@ -105,13 +105,13 @@ internal static class LibztNative
         LibraryName,
         EntryPoint = "zts_node_network_changed",
         CallingConvention = CallingConvention.Cdecl)]
-    internal static extern int NodeNetworkChanged();
+    internal static extern int NodeNetworkChanged(ulong handoverEpoch);
 
     [DllImport(
         LibraryName,
-        EntryPoint = "zts_netloop_get_bound_udp_ports",
+        EntryPoint = "zts_netloop_set_underlay_trace_enabled",
         CallingConvention = CallingConvention.Cdecl)]
-    internal static extern int GetBoundUdpPorts(out ushort primary, out ushort secondary);
+    internal static extern int SetUnderlayTraceEnabled(int enabled);
 
     // NetLoop native diagnostics: fixed v2 240-byte POD ABI, no callback
     // into managed code from libzt's physical I/O thread.

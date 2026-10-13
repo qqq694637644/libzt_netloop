@@ -10,7 +10,7 @@ libzt 的 `zts_net_info_t` 提供分配地址、掩码、Managed Routes、网关
 配置修订号。上游现有的 `zts_core_query_addr` /
 `zts_core_query_route` 查询接口却只返回 IP 字符串，会丢失地址
 和路由的掩码；因此本仓库提供
-`patches/libzt/0004-network-cidr-queries.patch`，增加两个很小的
+`patches/libzt/0001-netloop-native.patch`，其中包含两个很小的
 原生查询函数：
 
 - `zts_netloop_query_addr_cidr` → 原始地址及掩码（如 `10.42.7.2/23`）

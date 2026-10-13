@@ -71,7 +71,7 @@ match the node ID. The peer diagnostics require the updated `libzt.dll` (or
  managed DLL.
 
 Dynamic ZeroTier routing additionally requires the matching native
-`0004-network-cidr-queries.patch`: **deploy both** the new NetLoop .NET
+CIDR query ABI in `patches/libzt/0001-netloop-native.patch`: **deploy both** the new NetLoop .NET
 assemblies and the rebuilt native libzt library on every node.
 
 Peer TCP connects are initiated with nonblocking `zts_bsd_connect` and
@@ -167,6 +167,10 @@ completely with `--log-level none` (omit `> A_client.log 2>&1` and
 queued or written by the JSONL logger. `none` also ignores any supplied
 `--log-file`, but **does not** disable necessary libzt Node identity/state
 persistence in `--state-dir` or suppress an external process's logs.
+Detailed Native UDP/Core event tracing is **off by default even with info**.
+Add `--native-trace --log-level info` only for A/B network forensics;
+`--log-level error` or `none` cannot enable it. Ordinary Root IPv6 handover
+recovery is unaffected by the trace setting.
 
 Logging uses a bounded asynchronous queue. If overloaded, look for
 `json_log_records_dropped`. See the

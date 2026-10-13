@@ -59,8 +59,7 @@ internal sealed class ControlledRuntimeConfig
             UpstreamPassword = null,
             StartupTimeout = TimeSpan.FromSeconds(120),
             ConnectTimeout = TimeSpan.FromSeconds(20),
-            UdpIdleTimeout = TimeSpan.FromSeconds(60),
-            ResetEventDebounce = TimeSpan.FromMilliseconds(250)
+            UdpIdleTimeout = TimeSpan.FromSeconds(60)
         };
 
     internal bool IsEquivalentTo(ControlledRuntimeConfig other)

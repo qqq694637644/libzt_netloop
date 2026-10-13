@@ -114,7 +114,8 @@ public sealed class NetLoopService : Service
         NetLoopRuntimeController.ReportRuntimeStarting();
 
         await using var node = new LibztNode(
-            options.NetworkId, options.StateDirectory, options.StartupTimeout);
+            options.NetworkId, options.StateDirectory, options.StartupTimeout,
+            enableNativeTrace: options.NativeTraceEnabled);
         await using var owner = new RuntimeOwner(node, options);
         Volatile.Write(ref _owner, owner);
 
@@ -148,7 +149,7 @@ public sealed class NetLoopService : Service
 
         await using var networkMonitor = new AndroidNetworkMonitor(
             this,
-            options.ResetEventDebounce,
+            TimeSpan.FromMilliseconds(250),
             reason => owner.RequestPhysicalNetworkRefresh(reason));
 
         try

@@ -12,7 +12,7 @@ public sealed class LibztNode : IAsyncDisposable
     private readonly string _stateDirectory;
     private readonly TimeSpan _startupTimeout;
     private readonly LibztNative.EventCallback _eventCallback;
-    private readonly LibztUnderlayDiagnostics _underlayDiagnostics = new();
+    private readonly bool _enableNativeTrace;
     private readonly TaskCompletionSource _nodeUp = new(
         TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly object _stateSync = new();
@@ -31,15 +31,17 @@ public sealed class LibztNode : IAsyncDisposable
     private int _configAvailable;
     private int _joinRequested;
     private long _failedPhysicalRefreshAttempts;
-    private int _boundUdpPortPair;
     private bool _started;
     private bool _freed;
 
-    public LibztNode(ulong networkId, string stateDirectory, TimeSpan startupTimeout)
+    public LibztNode(
+        ulong networkId, string stateDirectory, TimeSpan startupTimeout,
+        bool enableNativeTrace = false)
     {
         _networkId = networkId;
         _stateDirectory = Path.GetFullPath(stateDirectory);
         _startupTimeout = startupTimeout;
+        _enableNativeTrace = enableNativeTrace;
         _eventCallback = OnNativeEvent;
     }
 
@@ -47,10 +49,6 @@ public sealed class LibztNode : IAsyncDisposable
 
     public LibztNetworkState? State => Volatile.Read(ref _state);
     public bool NetworkConfigurationAvailable => Volatile.Read(ref _configAvailable) != 0;
-    public ushort BoundUdpPrimaryPort
-        => (ushort)((uint)Volatile.Read(ref _boundUdpPortPair) >> 16);
-    public ushort BoundUdpSecondaryPort
-        => (ushort)(Volatile.Read(ref _boundUdpPortPair) & 0xffff);
 
     /// <summary>
     /// Raised on the background config worker, never from the native event
@@ -84,15 +82,19 @@ public sealed class LibztNode : IAsyncDisposable
         ThrowIfError("zts_init_from_storage", LibztNative.InitFromStorage(_stateDirectory));
         ThrowIfError("zts_init_allow_peer_cache", LibztNative.InitAllowPeerCache(0));
         ThrowIfError("zts_init_set_event_handler", LibztNative.InitSetEventHandler(_eventCallback));
+        // Install the Core trace callback only for explicit information-level
+        // logging; normal/none mode never samples or queues Native packets.
+        ThrowIfError("zts_netloop_set_underlay_trace_enabled",
+            LibztNative.SetUnderlayTraceEnabled(_enableNativeTrace ? 1 : 0));
         _networkConfigWorker = Task.Run(
             () => ProcessNetworkConfigEventsAsync(_networkConfigStop.Token));
         try
         {
             ThrowIfError("zts_node_start", LibztNative.NodeStart());
             Volatile.Write(ref _started, true);
-            _underlayTraceWorker = Task.Run(
-                () => ProcessUnderlayTraceAsync(_networkConfigStop.Token));
-            SampleBoundUdpPorts("node_started");
+            if (_enableNativeTrace)
+                _underlayTraceWorker = Task.Run(
+                    () => ProcessUnderlayTraceAsync(_networkConfigStop.Token));
             return await JoinAndWaitAsync(cancellationToken).ConfigureAwait(false);
         }
         catch
@@ -125,18 +127,7 @@ public sealed class LibztNode : IAsyncDisposable
         }
     }
 
-    public void NotifyPhysicalNetworkChanged()
-    {
-        if (!Volatile.Read(ref _started))
-            throw new InvalidOperationException("libzt node has not been started.");
-
-        ThrowIfError(
-            "zts_node_network_changed",
-            LibztNative.NodeNetworkChanged());
-        LogPhysicalNetworkRefreshRequested();
-    }
-
-    public bool TryNotifyPhysicalNetworkChanged()
+    public bool TryNotifyPhysicalNetworkChanged(ulong handoverEpoch)
     {
         // A NodeStart return does not imply NetJoin has been submitted.
         // Keep the owner's pending refresh until native network join begins,
@@ -145,7 +136,7 @@ public sealed class LibztNode : IAsyncDisposable
             || Volatile.Read(ref _joinRequested) == 0)
             return false;
 
-        var result = LibztNative.NodeNetworkChanged();
+        var result = LibztNative.NodeNetworkChanged(handoverEpoch);
         if (result != LibztNative.Ok)
         {
             // A down native service might reject a refresh repeatedly. Keep
@@ -162,56 +153,17 @@ public sealed class LibztNode : IAsyncDisposable
         }
 
         Interlocked.Exchange(ref _failedPhysicalRefreshAttempts, 0);
-        LogPhysicalNetworkRefreshRequested();
+        LogPhysicalNetworkRefreshRequested(handoverEpoch);
         return true;
     }
 
-    private void LogPhysicalNetworkRefreshRequested()
+    private void LogPhysicalNetworkRefreshRequested(ulong handoverEpoch)
     {
-        _underlayDiagnostics.RecordPhysicalRefresh();
-        SampleBoundUdpPorts("before_native_path_refresh");
         JsonLog.Info("libzt_physical_network_refresh_requested", new {
             network = _networkId.ToString("x16"),
-            node = State?.NodeId.ToString("x10")
+            node = State?.NodeId.ToString("x10"),
+            handover_epoch = handoverEpoch
         });
-    }
-
-    private void SampleBoundUdpPorts(string source)
-    {
-        if (!Volatile.Read(ref _started))
-            return;
-
-        // The patched native ABI reads a single atomic pair published by the
-        // binder thread. It reports ports in its actual bound address set,
-        // including a rotating secondary port, not configured defaults.
-        var rc = LibztNative.GetBoundUdpPorts(
-            out var primary, out var secondary);
-        if (rc != LibztNative.Ok)
-        {
-            JsonLog.Error("libzt_udp_binding_query_failed", new {
-                network = _networkId.ToString("x16"),
-                api_rc = rc,
-                source
-            });
-            return;
-        }
-
-        Volatile.Write(
-            ref _boundUdpPortPair, (primary << 16) | secondary);
-        var change = _underlayDiagnostics.ObservePorts(primary, secondary);
-        if (change is not null)
-            JsonLog.Info("libzt_udp_bound_ports_changed", new {
-                network = _networkId.ToString("x16"),
-                source,
-                primary_port = change.Primary,
-                secondary_port = change.Secondary,
-                previous_primary_port = change.PreviousPrimary,
-                previous_secondary_port = change.PreviousSecondary,
-                since_network_refresh_ms = change.SinceRefreshMs,
-                // Observed on this sample, not necessarily at the instant
-                // the native binder made the change.
-                observation = "sampled_native_bound_ports"
-            });
     }
 
     private async Task<LibztNetworkState> JoinAndWaitAsync(CancellationToken cancellationToken)
@@ -428,7 +380,6 @@ public sealed class LibztNode : IAsyncDisposable
                         await Task.Delay(50, cancellationToken).ConfigureAwait(false);
 
                     var state = RefreshNetworkState();
-                    SampleBoundUdpPorts("native_config_worker");
                     JsonLog.Info("libzt_network_config_refreshed", new {
                         network = _networkId.ToString("x16"),
                         event_code = eventCode,
@@ -631,29 +582,14 @@ public sealed class LibztNode : IAsyncDisposable
         try
         {
             var native = Marshal.PtrToStructure<LibztNative.EventMessage>(message);
-            if (LibztPeerEvent.IsPeerEvent(native.EventCode))
+            if (JsonLog.IsEnabled(JsonLogLevel.Info)
+                && LibztPeerEvent.IsPeerEvent(native.EventCode))
             {
                 try
                 {
                     var peer = LibztPeerEvent.Decode(
                         native.EventCode, _networkId, native.Peer, native.Length);
                     JsonLog.Info("libzt_peer_status", peer);
-                    var peerId = LibztPeerEvent.ReadPeerId(
-                        native.Peer, native.Length);
-                    if (peerId is { } id)
-                    {
-                        var recovery = _underlayDiagnostics.ObservePeer(
-                            native.EventCode, id);
-                        if (recovery is not null)
-                            JsonLog.Info("libzt_peer_recovery_observed", new {
-                                network = _networkId.ToString("x16"),
-                                peer_id = recovery.PeerId.ToString("x10"),
-                                previous = recovery.Previous,
-                                elapsed_ms = recovery.ElapsedMs,
-                                since_network_refresh_ms = recovery.SinceRefreshMs,
-                                observation = "native_peer_event_not_socks_connectivity"
-                            });
-                    }
                 }
                 catch (Exception ex)
                 {
@@ -664,23 +600,10 @@ public sealed class LibztNode : IAsyncDisposable
                     JsonLog.Info("libzt_event", new { event_code = native.EventCode });
                 }
             }
-            else
+            else if (JsonLog.IsEnabled(JsonLogLevel.Info)
+                     && !LibztPeerEvent.IsPeerEvent(native.EventCode))
             {
                 JsonLog.Info("libzt_event", new { event_code = native.EventCode });
-                var nodeChange = _underlayDiagnostics.ObserveNode(
-                    native.EventCode);
-                if (nodeChange is not null)
-                {
-                    JsonLog.Info("libzt_node_cycle_observed", new {
-                        network = _networkId.ToString("x16"),
-                        phase = nodeChange.Phase,
-                        last_phase_duration_ms = nodeChange.LastPhaseDurationMs,
-                        interval_between_offline_events_ms =
-                            nodeChange.TimeSincePreviousOfflineMs,
-                        since_network_refresh_ms = nodeChange.SinceRefreshMs
-                    });
-                    SampleBoundUdpPorts("native_node_status");
-                }
             }
             if (native.EventCode == LibztNative.EventNodeUp)
                 _nodeUp.TrySetResult();

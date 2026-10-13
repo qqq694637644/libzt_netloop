@@ -91,8 +91,11 @@ internal static class Program
         CancellationToken shutdownToken)
     {
         await using var node = new LibztNode(
-            options.NetworkId, options.StateDirectory, options.StartupTimeout);
+            options.NetworkId, options.StateDirectory, options.StartupTimeout,
+            enableNativeTrace: options.NativeTraceEnabled);
         await using var owner = new RuntimeOwner(node, options);
+        if (OperatingSystem.IsWindows())
+            owner.SeedPhysicalEgress(PhysicalEgressIdentity.Capture());
 
         owner.StatusChanged += status => {
             JsonLog.Info("runtime_phase", new {
@@ -107,17 +110,16 @@ internal static class Program
             });
         };
 
-        void OnMonitorEvent(string reason)
+        void OnMonitorEvent(string reason, PhysicalEgressIdentity? egress)
         {
             if (reason.StartsWith("network_", StringComparison.Ordinal))
-                owner.RequestPhysicalNetworkRefresh(reason);
+                owner.RequestPhysicalNetworkRefresh(reason, egress);
             else
                 owner.RequestManualReset(reason);
         }
 
         await using var resetMonitor = new RuntimeResetMonitor(
             options.ResetCommandFile,
-            options.ResetEventDebounce,
             OnMonitorEvent);
         resetMonitor.Start();
 
