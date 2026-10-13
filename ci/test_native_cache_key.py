@@ -32,6 +32,18 @@ class NativeCacheKeyTests(unittest.TestCase):
         self.assertEqual(ANDROID_PATCHES[0], LIBZT_PATCHES[0])
         self.assertEqual(len({p.name for p in LIBZT_PATCHES}), len(LIBZT_PATCHES))
 
+    def test_consolidated_core_patch_carries_private_new_headers(self) -> None:
+        # Node.hpp includes this build-specific policy. If a patch is built
+        # using 'git diff' without intent-to-add, the header silently drops
+        # out of the consolidated patch and every native platform fails.
+        core_patch = ZERO_TIER_ONE_PATCHES[0].read_text(encoding="utf-8")
+        self.assertIn(
+            "diff --git a/node/NetloopHandoverPolicy.hpp b/node/NetloopHandoverPolicy.hpp",
+            core_patch,
+        )
+        self.assertIn("+inline UdpSendMode udpSendMode", core_patch)
+        self.assertIn("+struct RootBindingIdentity", core_patch)
+
     def test_release_native_cache_steps_match_regular_ci(self) -> None:
         """A release must not hash deleted patches after a patch-chain squash."""
         workflows = ROOT / ".github" / "workflows"

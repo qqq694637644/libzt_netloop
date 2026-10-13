@@ -167,6 +167,152 @@ index a5dd770..9fc8ba5 100644
  		}
  	}
  
+diff --git a/node/NetloopHandoverPolicy.hpp b/node/NetloopHandoverPolicy.hpp
+new file mode 100644
+index 0000000..bfbe71d
+--- /dev/null
++++ b/node/NetloopHandoverPolicy.hpp
+@@ -0,0 +1,140 @@
++/*
++ * NetLoop private, side-effect-free Windows handover policies.
++ * Used by Node/Peer and libzt NodeService; directly tested in CI.
++ */
++#ifndef ZT_NETLOOP_HANDOVER_POLICY_HPP
++#define ZT_NETLOOP_HANDOVER_POLICY_HPP
++
++#include <stdint.h>
++#include <string.h>
++
++namespace ZeroTier {
++namespace NetloopHandoverPolicy {
++
++struct RootBindingIdentity {
++    uint64_t epoch;
++    uint64_t luid;
++    unsigned char address[16];
++
++    RootBindingIdentity() : epoch(0), luid(0)
++    {
++        memset(address, 0, sizeof(address));
++    }
++
++    bool matches(uint64_t otherEpoch, uint64_t otherLuid,
++                 const void* otherAddress) const
++    {
++        return otherAddress && epoch == otherEpoch && luid == otherLuid
++            && memcmp(address, otherAddress, sizeof(address)) == 0;
++    }
++
++    void set(uint64_t newEpoch, uint64_t newLuid, const void* newAddress)
++    {
++        epoch = newEpoch;
++        luid = newLuid;
++        memcpy(address, newAddress, sizeof(address));
++    }
++};
++
++enum UdpSendMode {
++    SEND_SPECIFIED_SOCKET,
++    FALLBACK_TO_BINDER,
++    REJECT_STALE_ROOT_SOCKET
++};
++
++inline UdpSendMode udpSendMode(bool strictRoot, bool boundSocketValid)
++{
++    if (boundSocketValid)
++        return SEND_SPECIFIED_SOCKET;
++    return strictRoot ? REJECT_STALE_ROOT_SOCKET : FALLBACK_TO_BINDER;
++}
++
++enum RootRetryMode {
++    ROOT_RETRY_STOP,
++    ROOT_RETRY_DEFER,
++    ROOT_RETRY_SEND
++};
++
++inline unsigned int rootEndpointIndex(unsigned int attempt, unsigned int count)
++{
++    return attempt > 0 && count > 0 ? (attempt - 1) % count : 0;
++}
++
++inline RootRetryMode rootRetryMode(
++    unsigned int attempts, int64_t startedAt, int64_t now,
++    bool dadPreferred, bool socketMatchesPreferredInterface)
++{
++    if (attempts >= 3 || now < startedAt || now - startedAt >= 30000)
++        return ROOT_RETRY_STOP;
++    if (!dadPreferred || !socketMatchesPreferredInterface)
++        return ROOT_RETRY_DEFER;
++    return ROOT_RETRY_SEND;
++}
++
++// Root identity -> per-target packet state, with a six-send per-epoch cap.
++// Exact locally received socket is required for authentication success.
++struct RootHelloAttemptState {
++    uint64_t packetIds[3];
++    int64_t localSockets[3];
++    unsigned int attempts;
++    unsigned int totalAttempts;
++    uint64_t targetId;
++    bool authenticated;
++
++    RootHelloAttemptState()
++        : attempts(0), totalAttempts(0), targetId(0), authenticated(false)
++    {
++        packetIds[0] = packetIds[1] = packetIds[2] = 0;
++        localSockets[0] = localSockets[1] = localSockets[2] = -1;
++    }
++
++    unsigned int beginAttempt(uint64_t newTargetId)
++    {
++        if (!newTargetId)
++            return 0;
++        if (targetId != newTargetId) {
++            targetId = newTargetId;
++            attempts = 0;
++            authenticated = false;
++            packetIds[0] = packetIds[1] = packetIds[2] = 0;
++            localSockets[0] = localSockets[1] = localSockets[2] = -1;
++        }
++        if (authenticated || attempts >= 3 || totalAttempts >= 6)
++            return 0;
++        ++totalAttempts;
++        return ++attempts;
++    }
++
++    void registerPacket(uint64_t packetId, int64_t physicalSocket)
++    {
++        if (!authenticated && packetId && physicalSocket > 0
++            && attempts && attempts <= 3) {
++            packetIds[attempts - 1] = packetId;
++            localSockets[attempts - 1] = physicalSocket;
++        }
++    }
++
++    bool acknowledge(uint64_t packetId, int64_t receiveSocket)
++    {
++        if (!packetId || receiveSocket <= 0 || authenticated)
++            return false;
++        for (unsigned int i = 0; i < attempts; ++i) {
++            if (packetIds[i] && packetIds[i] == packetId
++                && localSockets[i] == receiveSocket) {
++                authenticated = true;
++                return true;
++            }
++        }
++        return false;
++    }
++
++    bool pending() const
++    {
++        return !authenticated && attempts < 3 && totalAttempts < 6;
++    }
++};
++
++} // namespace NetloopHandoverPolicy
++} // namespace ZeroTier
++
++#endif
 diff --git a/node/Node.cpp b/node/Node.cpp
 index 4913d1a..0f8763f 100644
 --- a/node/Node.cpp
