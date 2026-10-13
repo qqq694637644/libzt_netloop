@@ -10,6 +10,13 @@
 - **Root 重试更健壮**：每 Root 最多三次实际尝试，按真实认证 OK(HELLO) 停止；DAD/接口查询瞬态失败只延迟下次检查，不消耗剩余尝试，但最多等待 30 秒。Root 状态锁不包裹 Topology 查询或底层 send callback。
 - **缓存指纹单一事实源**：`tools/native_cache_key.py` 直接读取两份 build 脚本的补丁顺序，结合 Git 固定的 libzt gitlink、CMake/构建脚本和 NDK 修订版生成短哈希；不再在三个 GitHub workflow 手工列出补丁哈希。
 
+## 审查后修复：普通 UDP fallback 与真正关闭 Trace 热路径
+
+- **P1 原生 UDP 回退语义已恢复**：普通 ZeroTier Peer、ECHO 和既有路径发包带着已失效 `localSocket` 时，继续退回 `Binder::udpSendAll()`。仅 `fastProbeRootIpv6AfterNetworkChange` 生成的专用 Root HELLO 会携带私有 Socket 标记；该 Socket 失效时直接拒绝发送，不能转移至其他 IPv6 接口。标记只用于同步 Core→libzt wire callback，不改变通用 Core/Socket API 语义。
+- **Native Trace 关闭时不碰诊断性 Binder 查询**：UDP RX/TX 的 `describeUdpSocket()`、发送侧采样回调及绑定端口遍历都受 Native 开关保护；端口快照仅在开启 Trace 后更新。Binder 地址读取仍保留一次，用于必要的 Core 本地接口同步，不属于诊断冗余。
+- **DAD 与 Root 重试**：在 Windows IP Helper 的多个 Preferred IPv6 中寻找真正具有同一 LUID 的当前 Binder socket；查询失败、Tentative 或已失效 Socket 推迟尝试，并在 30 秒截止后停止。认证 ACK 的 Root 状态记录提取为无 I/O 的私有策略，以便检验乱序到达和每 Root 的三次上限。
+- **可重复测试**：`ci/test_native_handover_policy.cpp` 在 Windows CI 中使用实际 Core 私有策略头文件，模拟普通失效 Socket fallback、专用 Root Socket 拒绝回退、DAD 从 Tentative→Preferred/失败、ACK 乱序；C# `PhysicalHandoverEpisode` 使用注入的单调时钟，覆盖 Runtime 创建等待、Native 刷新重试、6 秒/2 秒分组和新 epoch 传递。
+
 ## 不改变的产品行为
 
 - Windows 确认物理切网：旧 SOCKS/TCP/UDP Runtime 连接破坏式终止，重新创建业务 Runtime；不重启 ZeroTier Node、不重新 join。

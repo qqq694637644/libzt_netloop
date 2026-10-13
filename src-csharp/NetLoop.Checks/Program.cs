@@ -39,6 +39,7 @@ internal static class Program
             await CheckAsync("UDP Factory concurrent disposal", UdpFactoryDisposal);
             await CheckAsync("Startup processes physical events while Node waits", StartupPhysicalRefresh);
             Check("Rapid physical events retain the final network notification", RapidPhysicalEventDelivery);
+            Check("One Windows handover epoch survives notifications and startup refresh retries", HandoverEpochSequence);
             await CheckAsync("Peer dialing is bounded across simultaneous SOCKS requests", PeerDialAdmission);
             await CheckAsync("Peer dialing releases canceled waiters and isolates different peers", PeerDialCancellation);
             await CheckAsync("Peer failure backoff does not hold established TCP", PeerDialCooldown);
@@ -670,6 +671,76 @@ internal static class Program
             () => { refreshes++; return true; }, ref pending, ref deferred);
         Require(refreshes == 1 && !pending && deferred is null,
             "Startup should coalesce rapid notifications without losing the refresh");
+    }
+
+    private static void HandoverEpochSequence()
+    {
+        long now = 10_000;
+        var episodes = new PhysicalHandoverEpisode(() => now);
+        Require(episodes.Epoch == 0 && episodes.Observe() && episodes.Epoch == 1,
+            "First Windows network notification must allocate epoch 1");
+        now += 1_000;
+        Require(!episodes.Observe() && episodes.Epoch == 1,
+            "Nearby network notifications must not split an episode");
+        now += 4_500;
+        Require(!episodes.Observe() && episodes.Epoch == 1,
+            "Notifications inside six seconds still share epoch 1");
+        now += 500;
+        Require(!episodes.Observe() && episodes.Epoch == 1,
+            "Six seconds elapsed is insufficient without two seconds of quiet");
+        now += 2_000;
+        Require(episodes.Observe() && episodes.Epoch == 2,
+            "New episode must start only after both minimum and quiet periods");
+        now += 100;
+        Require(!episodes.Observe() && episodes.Epoch == 2,
+            "Late Binder notification within same episode changed the epoch");
+
+        // Model Runtime creation: multiple events are consumed while the
+        // Node is unavailable; a pending Native refresh retains its epoch.
+        long startupClock = 0;
+        var waiting = new PhysicalHandoverEpisode(() => startupClock);
+        var events = Channel.CreateUnbounded<RuntimeOwner.Event>();
+        bool pending = false;
+        RuntimeOwner.Event? deferred = null;
+        bool nativeReady = false;
+        var delivered = new List<ulong>();
+        bool Notify()
+        {
+            delivered.Add(waiting.Epoch);
+            return nativeReady;
+        }
+
+        RuntimeOwner.QueuePhysicalNetworkRefresh(events.Writer, "wifi_down");
+        RuntimeOwner.QueuePhysicalNetworkRefresh(events.Writer, "wifi_connecting");
+        RuntimeOwner.DrainPendingWaitingEvents(
+            events.Reader, Notify, ref pending, ref deferred,
+            () => waiting.Observe());
+        Require(pending && waiting.Epoch == 1
+                && delivered.SequenceEqual(new ulong[] { 1 }),
+            "Combined waiting notifications must share epoch 1");
+
+        nativeReady = true;
+        startupClock = 250;
+        Require(RuntimeOwner.TryDeliverPendingPhysicalRefresh(
+                    ref pending, Notify)
+                && !pending && delivered[^1] == 1,
+            "Native startup retry must deliver the same epoch");
+
+        startupClock = 4_000;
+        RuntimeOwner.QueuePhysicalNetworkRefresh(events.Writer, "wifi_preferred");
+        RuntimeOwner.DrainPendingWaitingEvents(
+            events.Reader, Notify, ref pending, ref deferred,
+            () => waiting.Observe());
+        Require(!pending && waiting.Epoch == 1 && delivered[^1] == 1,
+            "Binder refresh after startup must keep the original epoch");
+
+        startupClock = 8_000;
+        RuntimeOwner.QueuePhysicalNetworkRefresh(events.Writer, "next_wifi_handover");
+        RuntimeOwner.DrainPendingWaitingEvents(
+            events.Reader, Notify, ref pending, ref deferred,
+            () => waiting.Observe());
+        Require(!pending && waiting.Epoch == 2 && delivered[^1] == 2,
+            "A later physical handover must allocate and deliver epoch 2");
     }
 
     private static async Task StartupPhysicalRefresh()

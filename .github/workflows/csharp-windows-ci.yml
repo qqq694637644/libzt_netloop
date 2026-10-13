@@ -59,7 +59,6 @@ jobs:
           key: ${{ steps.native-key.outputs.key }}
 
       - name: Set up MSVC environment
-        if: steps.native-cache.outputs.cache-hit != 'true'
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
@@ -91,6 +90,18 @@ jobs:
 
       - name: Validate native underlay trace ABI (no Node start)
         run: python ci/test_native_underlay_trace.py native-cache/libzt.dll
+
+      - name: Test native stale-socket fallback, DAD and Root ACK policy
+        shell: pwsh
+        run: |
+          # A cached DLL need not have initialized source submodules.
+          # Replaying the pinned Core patch makes the test use production policy.
+          python -c "import sys; sys.path.insert(0, 'tools'); import build_csharp as b; b.ensure_submodules(); b.apply_zerotierone_patches()"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cl.exe /nologo /std:c++17 /EHsc /W4 /Fe:native-handover-policy.exe ci/test_native_handover_policy.cpp
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\native-handover-policy.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Save compiled libzt bundle immediately
         if: steps.native-cache.outputs.cache-hit != 'true'
